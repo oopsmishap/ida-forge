@@ -1,0 +1,6 @@
+{
+    "python.analysis.extraPaths": [
+        "C:/Program Files/IDA Professional 9.0/python",
+        "C:/Program Files/IDA Professional 9.0/python/lib-dynload",
+    ]
+}
