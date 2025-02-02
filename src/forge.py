@@ -1,5 +1,6 @@
+import sys
 import ida_hexrays
-import ida_idaapi
+import idaapi
 from ida_idp import IDP_INTERFACE_VERSION
 
 import forge
@@ -9,51 +10,47 @@ from forge.util.logging import *
 from forge.util.versions import is_ida_version_supported, is_python_version_supported
 from forge.util.reload import recursive_reload
 
-global forge_plugin_instance
-forge_plugin_instance = None
 
 def PLUGIN_ENTRY():
     return ForgePlugin()
 
 
-class ForgePlugin(ida_idaapi.plugin_t):
+class ForgePlugin(idaapi.plugin_t):
     """IDAPython plugin structure."""
+
     version: int = IDP_INTERFACE_VERSION
-    flags: int = ida_idaapi.PLUGIN_KEEP
+    flags: int = idaapi.PLUGIN_KEEP
     comment: str = PLUGIN_COMMENT
     help: str = PLUGIN_HELP
     wanted_name: str = PLUGIN_NAME
-    wanted_hotkey: str = ''
+    wanted_hotkey: str = ""
 
     _core: Core = None
 
     def init(self):
-        global forge_plugin_instance
         if not is_python_version_supported():
             log_warning("Unsupported Python version")
-            return ida_idaapi.PLUGIN_SKIP
-        
+            return idaapi.PLUGIN_SKIP
+
         if not is_ida_version_supported():
             log_warning("Unsupported IDA version")
-            return ida_idaapi.PLUGIN_SKIP
+            return idaapi.PLUGIN_SKIP
 
         if not ida_hexrays.init_hexrays_plugin():
             log_warning("Failed to initialize Hex-Rays SDK")
-            return ida_idaapi.PLUGIN_SKIP
-        
-        recursive_reload(forge)
+            return idaapi.PLUGIN_SKIP
+
         self._core = Core()
         self._core.load()
 
-        log_debug(f'{self.wanted_name} loaded successfully!')
-        
-        # Register the plugin instance globally
-        forge_plugin_instance = self
+        sys.modules["__main__"].forge = self
 
-        return ida_idaapi.PLUGIN_KEEP
+        log_debug(f"{self.wanted_name} loaded successfully!")
 
-    def run():
-        log_warning(f'This plugin cannot be ran as a script')
+        return idaapi.PLUGIN_KEEP
+
+    def run(self, arg):
+        log_warning(f"This plugin cannot be ran as a script")
 
     def term(self):
         self._core.unload()
@@ -65,12 +62,12 @@ class ForgePlugin(ida_idaapi.plugin_t):
         :return: The core instance.
         """
         return self._core
-    
+
     def reload(self):
         """
         Hot-reloads the plugin.
         """
-        log_debug(f'Reloading {self.wanted_name}')
+        log_debug(f"Reloading {self.wanted_name}")
 
         self._core.unload()
         del self._core
@@ -78,9 +75,8 @@ class ForgePlugin(ida_idaapi.plugin_t):
         recursive_reload(forge)
 
         from forge.core import ForgeCore as Core
+
         self._core = Core()
         self._core.load()
 
-        log_debug(f'{self.wanted_name} reloaded successfully!')
-
-
+        log_debug(f"{self.wanted_name} reloaded successfully!")

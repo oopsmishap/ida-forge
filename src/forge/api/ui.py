@@ -5,8 +5,13 @@ from PyQt5 import QtWidgets, QtCore
 
 
 class Choose(ida_kernwin.Choose):
-    def __init__(self, items, title, cols, icon=-1):
-        super().__init__(title, cols, flags=ida_kernwin.Choose.CH_MODAL, icon=icon)
+    title = ""
+    cols = []
+    icon = -1
+    flags = ida_kernwin.Choose.CH_MODAL
+
+    def __init__(self, items):
+        super().__init__(self.title, self.cols, flags=self.flags, icon=self.icon)
         self.items = items
 
     def OnClose(self):

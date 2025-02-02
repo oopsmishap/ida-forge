@@ -3,10 +3,11 @@ from typing import Dict, Tuple
 
 import ida_ida
 import ida_typeinf
+import idc
 
 from forge.api.config import ForgeConfig
 from forge.util.util import DocIntEnum
-from forge.util.logging import log_debug
+from forge.util.logging import log_debug, log_error
 
 
 # leimurr — Today at 5:11 PM
@@ -223,10 +224,13 @@ class Types:
         return out_type
 
     def get_ptr(self):
+        return self.get_ptr_type().ptr
+        
+    def get_ptr_type(self):
         if self.width == 8:
-            return self._type_cache["u64"].ptr
+            return self._type_cache["u64"]
         elif self.width == 4:
-            return self._type_cache["u32"].ptr
+            return self._type_cache["u32"]
         else:
             raise Exception("Unsupported architecture")
 
@@ -250,3 +254,35 @@ class Types:
 
 
 types = Types()
+
+
+def create_type(name: str, declaration: str) -> bool:
+    """
+    Creates a new type in the IDA database.
+
+    :param str name: The name of the type to create.
+    :param str declaration: The declaration of the type to create.
+    :return bool: True if the type was created successfully, False otherwise.
+    """
+    tif = ida_typeinf.tinfo_t()
+    if tif.get_named_type(None, name):
+        log_error(f"Type with name '{name}' already exists")
+        return False
+    ida_typeinf.idc_parse_types(declaration, 0)
+    if not tif.get_named_type(None, name):
+        log_error(f"Failed to create type '{name}'")
+        return False
+    return True
+
+
+def import_type(name):
+    """
+    Imports a type from a library into the IDA database.
+
+    :param str name: The name of the type to import.
+    :return int: The ordinal number of the imported type.
+    """
+    last_ordinal = ida_typeinf.get_ordinal_count(ida_typeinf.get_idati())
+    type_id = idc.import_type(-1, name)  # tid_t
+    if type_id != ida_typeinf.BADORD:
+        return last_ordinal

@@ -34,11 +34,14 @@ def decompile(ea: int):
     try:
         # https://hex-rays.com/products/ida/news/8_2sp1/
         # seems like they've finally fixed the issue of needing to check both exception and return value
+        log_debug(f"Decompiling {to_hex(ea)} @ {to_function_offset_str(ea)}")
         cfunc = ida_hexrays.decompile(ea)
         if cfunc is not None:
             return cfunc
     except ida_hexrays.DecompilationFailure as e:
-        log_error(f"Decompilation failed at 0x{ea:X}: {e}")
+        log_error(
+            f"Decompilation failed at {to_hex(ea)} @ {to_function_offset_str(ea)}: {e}"
+        )
 
 
 def get_line(ctree: ida_hexrays.ctree_parentee_t, cfunc) -> str:
@@ -91,7 +94,7 @@ def get_argument(
     :param idx: The index of the argument to get.
     :return: The argument at the specified index.
     """
-    assert idx < len(cfunc.argidx), f"Argument index {idx} is out of range"
+    assert idx < len(cfunc.argidx), f"Argument index [{idx}] is out of range"
     # arguments are not guaranteed to be in lvar order, so we need to find the correct index from argidx
     arg_idx = cfunc.argidx[idx]
     lvars = cfunc.get_lvars()
@@ -193,7 +196,7 @@ def ctype_to_str(t):
 
 def create_udt_padding_member(offset, size):
     udt_member = ida_typeinf.udt_member_t()
-    udt_member.name = f"padding_{offset:x}"
+    udt_member.name = f"gap_{offset:x}"
     udt_member.offset = offset
     udt_member.size = size
 
@@ -202,7 +205,7 @@ def create_udt_padding_member(offset, size):
     else:
         if size < 1 or size > 0xFFFFFFFF:
             raise ValueError(
-                f"Size is out of u32 range offset: 0x{offset:x} size: 0x{size:x}"
+                f"Size is out of u32 range offset: {to_hex(offset)} size: {to_hex(size)}"
             )
         array_data = ida_typeinf.array_type_data_t()
         array_data.base = 0
@@ -214,6 +217,19 @@ def create_udt_padding_member(offset, size):
     return udt_member
 
 
+def to_function_offset_str(ea: int) -> str:
+    """
+    Converts an address to a nice string representation using the function name and offset.
+
+    :param int ea: the address to convert
+    :return: the nice string representation of the address
+    """
+    func_start_ea = idc.get_func_attr(ea, idc.FUNCATTR_START)
+    func_name = idc.get_name(func_start_ea)
+    offset = ea - func_start_ea
+    return f"{func_name}+{offset:#x}"
+
+
 # Enums
 
 
@@ -223,6 +239,7 @@ class e_mopt(DocIntEnum):
     """
     Instruction operand types
     """
+
     z = 0, "none"
     r = 1, "register (they exist until MMAT_LVARS)"
     n = 2, "immediate number constant"
@@ -248,6 +265,7 @@ class ctype(DocIntEnum):
     Ctree item code. At the beginning of this list there are expression
     codes (cot_...), followed by statement codes (cit_...).
     """
+
     empty = 0, "empty"
     comma = 1, "x, y"
     asg = 2, "x = y"

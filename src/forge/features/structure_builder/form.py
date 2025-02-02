@@ -12,7 +12,7 @@ from forge.api.structure import Structure
 from forge.api.ui import set_row_background_color, set_row_foreground_color
 from forge.util.logging import *
 from .config import config
-
+from forge.api.members import AbstractMember
 
 class column(IntEnum):
     offset = 0
@@ -178,20 +178,25 @@ class StructureBuilderForm(ida_kernwin.PluginForm):
 
             self.ui.tbl_structure.setRowCount(len(self.current_structure.members))
             for row, member in enumerate(self.current_structure.members):
+                # Offset
                 self.ui.tbl_structure.setItem(
                     row,
                     column.offset,
                     QTableWidgetItem(f"0x{member.offset:04X} [{hex(member.size)}]"),
                 )
+                # Type name
                 self.ui.tbl_structure.setItem(
                     row, column.type, QTableWidgetItem(member.type_name)
                 )
+                # Member name
                 self.ui.tbl_structure.setItem(
                     row, column.name, QTableWidgetItem(member.name)
                 )
+                # Type score
                 self.ui.tbl_structure.setItem(
-                    row, column.score, QTableWidgetItem(member.score)
+                    row, column.score, QTableWidgetItem(f"{member.score}")
                 )
+                # Comment
                 self.ui.tbl_structure.setItem(
                     row, column.comment, QTableWidgetItem(member.comment)
                 )
@@ -278,22 +283,19 @@ class StructureBuilderForm(ida_kernwin.PluginForm):
 
         row = item.row()
 
-        self.ui.action_enable.triggered.connect(
-            lambda: self.structure_table_enable_row(row)
-        )
-        self.ui.action_disable.triggered.connect(
-            lambda: self.structure_table_disable_row(row)
-        )
-
         menu = QMenu()
 
-        menu.addAction(self.structure_table_enable_row)
-        menu.addAction(self.structure_table_disable_row)
-        menu.addAction(self.structure_table_resolve)
-        menu.addAction(self.structure_table_finalize)
+        enable_action = menu.addAction("Enable")
+        enable_action.triggered.connect(lambda: self.structure_table_enable_row(row))
 
-        if item is not None:
-            pass
+        disable_action = menu.addAction("Disable")
+        disable_action.triggered.connect(lambda: self.structure_table_disable_row(row))
+
+        resolve_action = menu.addAction("Resolve")
+        resolve_action.triggered.connect(self.structure_table_resolve)
+
+        finalize_action = menu.addAction("Finalize")
+        finalize_action.triggered.connect(self.structure_table_finalize)
 
         menu.exec_(self.ui.tbl_structure.viewport().mapToGlobal(point))
 

@@ -3,18 +3,21 @@ import itertools
 
 import ida_typeinf
 import idaapi
+import idc
 from PyQt5 import QtWidgets
 
 from forge.api.hexrays import create_udt_padding_member
 from forge.api.members import VirtualTable, AbstractMember
 from forge.util.logging import *
 
+import forge.api.types as forge_types
+
 
 class Structure:
     def __init__(self, name: str):
         self.name = name
         self.main_offset = 0
-        self.members = []
+        self.members: AbstractMember = []
         self.collisions = []
 
     @staticmethod
@@ -271,20 +274,29 @@ class Structure:
         return self.set_cdecl(cdecl, origin)
 
     def set_cdecl(self, cdecl, origin=0):
-        result = ida_typeinf.idc_parse_decl(
-            ida_typeinf.cvar.idati, cdecl, ida_typeinf.PT_TYP
-        )
+        """
+        Sets the cdecl for the given structure and applies it to the scanned variables.
+        
+        :param cdecl: The cdecl to set.
+        :param origin: The origin for the scanned variables.
+        :return: The created tinfo if successful, None otherwise.
+        """
+        result = idaapi.idc_parse_decl(idaapi.get_idati(), cdecl, idaapi.PT_TYP)
         if result is None:
             log_warning("Failed to parse type definition", True)
             return
-
+        
         structure_name = result[0]
 
-        previous_ordinal = ida_typeinf.get_type_ordinal(
-            ida_typeinf.cvar.idati, structure_name
-        )
-
-        if previous_ordinal:
+        if forge_types.create_type(structure_name, cdecl):
+            log_debug(f"Created type {structure_name}")
+            tinfo = idaapi.create_typedef(structure_name)
+            ptr_tinfo = idaapi.tinfo_t()
+            ptr_tinfo.create_ptr(tinfo)
+            for var in self.get_unique_scanned_variables(origin):
+                var.apply_type(ptr_tinfo)
+            return tinfo
+        else:
             reply = QtWidgets.QMessageBox.question(
                 None,
                 "Overwrite existing type?",
@@ -292,27 +304,16 @@ class Structure:
                 QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
             )
             if reply == QtWidgets.QMessageBox.Yes:
-                ida_typeinf.del_numbered_type(ida_typeinf.cvar.idati, previous_ordinal)
-                ordinal = ida_typeinf.idc_set_local_type(
-                    previous_ordinal, cdecl, ida_typeinf.PT_TYP
-                )
-            else:
-                return
-        else:
-            ordinal = ida_typeinf.idc_set_local_type(-1, cdecl, ida_typeinf.PT_TYP)
-
-        if ordinal:
-            tid = ida_typeinf.import_type(ida_typeinf.cvar.idati, -1, structure_name)
-            if tid:
-                log_debug(f"Created type {structure_name} with ordinal {ordinal}")
-                tinfo = idaapi.create_typedef(structure_name)
-                ptr_tinfo = ida_typeinf.tinfo_t()
-                ptr_tinfo.create_ptr(tinfo)
-                for var in self.get_unique_scanned_variables(origin):
-                    var.apply_type(ptr_tinfo)
-                return tinfo
-        else:
+                ida_typeinf.del_named_type(idaapi.get_idati(), structure_name)
+                if forge_types.create_type(structure_name, cdecl):
+                    log_debug(f"Created type {structure_name}")
+                    tinfo = idaapi.create_typedef(structure_name)
+                    ptr_tinfo = idaapi.tinfo_t()
+                    ptr_tinfo.create_ptr(tinfo)
+                    for var in self.get_unique_scanned_variables(origin):
+                        var.apply_type(ptr_tinfo)
+                    return tinfo
             log_error(
-                f"Strucutre {structure_name} probably already exists. Please check manually.",
+                f"Structure {structure_name} probably already exists. Please check manually.",
                 True,
             )

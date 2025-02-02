@@ -21,6 +21,7 @@ from forge.api.visitor import FunctionTouchVisitor
 from forge.util.cxx_to_c_name import demangled_name_to_c_str
 from forge.util.logging import *
 
+import forge.api.types as forge_types
 
 class AbstractMember:
     def __init__(self, offset: int, scanned_variable, origin: int, tinfo=None):
@@ -87,9 +88,9 @@ class AbstractMember:
             if self.is_simple_type():
                 score -= 1
             elif self.tinfo.is_funcptr():
-                score += 0x1000 + len(self.tinfo.dstr())
+                score += 1000 + len(self.tinfo.dstr())
             elif "struct " in self.tinfo.dstr():
-                score -= 0x10
+                score -= 10
             else:
                 score += 1
 
@@ -186,7 +187,6 @@ class Member(AbstractMember):
     ):
         super().__init__(offset, scanned_variable, origin, tinfo)
         self.name = f"{self.type_alias}_{self.offset:x}"
-        self.comment = f"{self.score}"
 
     def get_udt_member(self, array_size: int = 0, offset: int = 0):
         udt_member = ida_typeinf.udt_member_t()
@@ -459,7 +459,7 @@ class VirtualTable(AbstractMember):
             )
         else:
             log_info(f"Virtual table {self.vtable_name} added to local types")
-            return idaapi.import_type(idaapi.cvar.idati, -1, self.vtable_name)
+            return forge_types.import_type(self.vtable_name)
 
     def get_udt_member(self, offset=0):
         udt_member = ida_typeinf.udt_member_t()
@@ -557,7 +557,9 @@ class VirtualTable(AbstractMember):
         name = (
             demangled_name_to_c_str(demangled_name)
             .replace("const_", "")
+            .replace("const ", "")
             .replace("::_vftable", "_vtbl")
+            .replace("::`vftable'", "_vtbl")
         )
 
         return name, True

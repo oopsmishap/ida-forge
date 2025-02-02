@@ -48,10 +48,12 @@ class ShallowScanAction(StructureBuilderAction):
 
     def activate(self, ctx):
         if structure_form.current_structure is None:
+            # TODO: Allow user to create a new structure instead of warnning them
             log_warning(
                 "No structure selected!\n Please select a structure first within the structure builder form.",
                 True,
             )
+            return
 
         hx_view: ida_hexrays.vdui_t = ida_hexrays.get_widget_vdui(ctx.widget)
         cfunc = hx_view.cfunc
@@ -74,10 +76,12 @@ class DeepScanAction(StructureBuilderAction):
 
     def activate(self, ctx):
         if structure_form.current_structure is None:
+            # TODO: Allow user to create a new structure instead of warnning them
             log_warning(
                 "No structure selected!\n Please select a structure first within the structure builder form.",
                 True,
             )
+            return
 
         hx_view = ida_hexrays.get_widget_vdui(ctx.widget)
         cfunc = hx_view.cfunc
@@ -88,7 +92,7 @@ class DeepScanAction(StructureBuilderAction):
             if FunctionTouchVisitor(cfunc).process():
                 hx_view.refresh_view(True)
             visitor = NewDeepScanVisitor(
-                cfunc, origin, obj, structure_form.current_structure
+                hx_view.cfunc, origin, obj, structure_form.current_structure
             )
             visitor.process()
             structure_form.update_structure_fields()

@@ -120,11 +120,7 @@ class VariableObject(ScanObject):
         self.index = index
         self.id = ObjectType.local_variable
         log_debug(f"Creating VariableObject {self.name}, {self.tinfo.dstr()}")
-        # try:
-        #     x=1/0
-        # except Exception as e:
-        #     log_debug(f"Error creating VariableObject {e}")
-        #     log_debug(''.join(traceback.format_stack()))
+
 
     def is_target(self, cexpr: ida_hexrays.cexpr_t) -> bool:
         """
@@ -320,7 +316,7 @@ class MemoryAllocationObject(ScanObject):
             return None
 
         func_name = ida_name.get_short_name(call_expr.x.obj_ea)
-        if "malloc" in func_name or "operator new" in func_name:
+        if "malloc" in func_name or "operator new" in func_name or "operator_new" in func_name:
             # if we find `malloc` or `new` we get the size of the allocation
             size_expr = call_expr.a[0]
             # ensure the value is a number, if not set size to zero
