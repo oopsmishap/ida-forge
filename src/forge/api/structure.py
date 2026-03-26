@@ -1,193 +1,182 @@
+from __future__ import annotations
+
 import bisect
 import itertools
+import re
+from dataclasses import dataclass
+from typing import Iterator, Sequence
 
+import ida_kernwin
 import ida_typeinf
-import idaapi
 from PyQt5 import QtWidgets
 
+import forge.api.types as forge_types
 from forge.api.hexrays import create_udt_padding_member
-from forge.api.members import VirtualTable, AbstractMember
-from forge.util.logging import *
+from forge.api.members import AbstractMember, VirtualTable
+from forge.util.logging import log_debug, log_error, log_warning
+
+
+@dataclass(frozen=True)
+class StructureStats:
+    total_members: int
+    enabled_members: int
+    collision_count: int
+    scanned_variable_count: int
+    origin_offset: int
 
 
 class Structure:
     def __init__(self, name: str):
         self.name = name
         self.main_offset = 0
-        self.members = []
-        self.collisions = []
-
-    @staticmethod
-    def create():
-        pass
+        self.members: list[AbstractMember] = []
+        self.collisions: list[bool] = []
 
     def add_member(self, member: AbstractMember) -> None:
-        """
-        Add a member to the structure
-        :param member: Member to add
-        :return: None
-        """
+        """Insert a member while keeping the structure ordered by offset/type."""
         if member in self.members:
             return
         bisect.insort(self.members, member)
+        self.refresh_collisions()
 
     def has_collision(self, index: int) -> bool:
-        """
-        Check if member at `index` has a collision with another member
-
-        :param index: Index of member to check
-        :return: True if member at `index` has a collision, False otherwise
-        """
-        return self.collisions[index]
+        return 0 <= index < len(self.collisions) and self.collisions[index]
 
     def refresh_collisions(self) -> None:
-        """
-        Check for collisions between member items and update `self.collisions` list.
-
-        :return: None
-        """
-        # Initialize self.collisions list with False values
         self.collisions = [False] * len(self.members)
-
-        # Find the first enabled item to start comparison
         current_index = next(
-            (i for i, item in enumerate(self.members) if item.enabled), None
+            (index for index, member in enumerate(self.members) if member.enabled),
+            None,
         )
+        if current_index is None:
+            return
 
-        # If at least two enabled members are present, compare them for collisions
-        if current_index is not None:
-            for next_index in range(current_index + 1, len(self.members)):
-                if self.members[next_index].enabled:
-                    # Check for overlap between current_index and next_index
-                    if (
-                        self.members[current_index].offset
-                        + self.members[current_index].size
-                        > self.members[next_index].offset
-                    ):
-                        self.collisions[current_index] = True
-                        self.collisions[next_index] = True
+        for next_index in range(current_index + 1, len(self.members)):
+            next_member = self.members[next_index]
+            if not next_member.enabled:
+                continue
 
-                        # If current item overlaps more than next item, update current_index to point to next_index
-                        current_item_end = (
-                            self.members[current_index].offset
-                            + self.members[current_index].size
-                        )
-                        next_item_end = (
-                            self.members[next_index].offset
-                            + self.members[next_index].size
-                        )
+            current_member = self.members[current_index]
+            if current_member.offset + current_member.size > next_member.offset:
+                self.collisions[current_index] = True
+                self.collisions[next_index] = True
 
-                        if current_item_end < next_item_end:
-                            current_index = next_index
-                    else:
-                        current_index = next_index
+                current_end = current_member.offset + current_member.size
+                next_end = next_member.offset + next_member.size
+                if current_end < next_end:
+                    current_index = next_index
+            else:
+                current_index = next_index
 
     def get_next_enabled(self, index: int) -> int:
-        """
-        Get the index of the next enabled item after `index`
-
-        :param index: Index of item to start search from
-        :return: Index of next enabled item, -1 if no enabled item is found
-        """
-        for i in range(index + 1, len(self.members)):
-            if self.members[i].enabled:
-                return i
+        for candidate in range(index + 1, len(self.members)):
+            if self.members[candidate].enabled:
+                return candidate
         return -1
 
-    def calculate_array_size(self, idx) -> int:
-        """
-        Calculate the size of the array at `idx`
-
-        :param idx: Index of array item
-        :return: Size of array at `idx`
-        """
-        next_enabled = self.get_next_enabled(idx)
+    def calculate_array_size(self, index: int) -> int:
+        next_enabled = self.get_next_enabled(index)
         if next_enabled == -1:
             return 0
-        return (
-            self.members[next_enabled].offset
-            - self.members[idx].offset // self.members[idx].size
-        )
 
-    def get_name(self):
-        """
-        Returns the name of the structure. If there is a single VirtualTable in the `members` attribute with a nice
-        vtable name, then the vtable name with the "_vtbl" suffix removed is returned. Otherwise, the original
-        name of the structure is returned.
+        member = self.members[index]
+        if member.size <= 0:
+            return 0
 
-        :return: A string containing the name of the structure.
-        :rtype: str
-        """
+        span = self.members[next_enabled].offset - member.offset
+        if span <= member.size:
+            return 0
+        return span // member.size
+
+    def clear_members(self) -> None:
+        self.members.clear()
+        self.collisions.clear()
+        self.main_offset = 0
+
+    def set_main_offset(self, offset: int) -> None:
+        self.main_offset = offset
+
+    def get_main_offset_index(self) -> int:
+        for index, member in enumerate(self.members):
+            if member.offset >= self.main_offset:
+                return index
+        return 0
+
+    def get_name(self) -> str:
         virtual_tables = [
-            field
-            for field in self.members
-            if isinstance(field, VirtualTable) and field.has_nice_vtable_name
+            member
+            for member in self.members
+            if isinstance(member, VirtualTable) and member.has_nice_vtable_name
         ]
 
         if len(virtual_tables) == 1:
             return virtual_tables[0].vtable_name.replace("_vtbl", "")
 
-        elif len(virtual_tables) > 1:
+        if len(virtual_tables) > 1:
             log_warning(
-                f"Multiple candidates for structure name: "
+                "Multiple candidates for structure name: "
                 f"{[vt.vtable_name for vt in virtual_tables]}. Setting to {self.name}."
             )
-
         return self.name
 
-    # def get_unique_scanned_variables(self, origin=0):
-    #     scan_objects = itertools.chain.from_iterable(
-    #         [list(member.scanned_variables) for member in self.members if member.origin == origin])
-    #     return list(dict(((item.function_name, item.name), item) for item in scan_objects).values())
-
-    def get_unique_scanned_variables(self, origin=0):
-        """Return a list of unique scanned variables, optionally filtered by origin."""
+    def get_unique_scanned_variables(self, origin: int = 0) -> list:
         scan_objects = itertools.chain.from_iterable(
-            [
-                list(member.scanned_variables)
-                for member in self.members
-                if member.origin == origin
-            ]
+            member.scanned_variables
+            for member in self.members
+            if member.origin == origin
         )
-        return list(
-            dict(((obj.function_name, obj.name), obj) for obj in scan_objects).values()
+        unique_scan_objects = {}
+        for scan_object in scan_objects:
+            key = (
+                getattr(scan_object, "func_ea", None),
+                getattr(scan_object, "ea", None),
+                getattr(scan_object, "id", None),
+                scan_object.name,
+            )
+            unique_scan_objects[key] = scan_object
+        return list(unique_scan_objects.values())
+
+    def get_stats(self) -> StructureStats:
+        self.refresh_collisions()
+        return StructureStats(
+            total_members=len(self.members),
+            enabled_members=sum(1 for member in self.members if member.enabled),
+            collision_count=sum(1 for has_collision in self.collisions if has_collision),
+            scanned_variable_count=len(
+                self.get_unique_scanned_variables(self.main_offset)
+            ),
+            origin_offset=self.main_offset,
         )
 
-    def disable_members(self, indices):
+    def disable_members(self, indices: int | Sequence[int]) -> None:
         if isinstance(indices, int):
             indices = [indices]
         for index in indices:
-            self.members[index].enabled = False
+            if 0 <= index < len(self.members):
+                self.members[index].set_enabled(False)
         self.refresh_collisions()
 
-    def enable_members(self, indices):
+    def enable_members(self, indices: int | Sequence[int]) -> None:
         if isinstance(indices, int):
             indices = [indices]
         for index in indices:
-            self.members[index].enabled = True
+            if 0 <= index < len(self.members):
+                self.members[index].set_enabled(True)
         self.refresh_collisions()
 
-    def remove_members(self, indices):
+    def remove_members(self, indices: int | Sequence[int]) -> None:
         if isinstance(indices, int):
             indices = [indices]
-        for index in sorted(indices, reverse=True):
-            del self.members[index]
+        for index in sorted(set(indices), reverse=True):
+            if 0 <= index < len(self.members):
+                removed_member = self.members[index]
+                del self.members[index]
+                if removed_member.offset == self.main_offset:
+                    self.main_offset = self.members[0].offset if self.members else 0
         self.refresh_collisions()
 
-    def auto_resolve(self):
-        """
-        Automatically resolve member collisions by disabling lower-scoring members.
-
-        This method will iterate through each enabled member of the struct, comparing it to the current highest-scoring
-        member.
-        If a member has a collision with the current member, the member with the lower score will be disabled.
-        If a member has a higher score than the current highest-scoring member, the current highest-scoring member will
-        be disabled.
-
-        :return: None
-        """
+    def auto_resolve(self) -> None:
         current_member = None
-
         for member in self.members:
             if not member.enabled:
                 continue
@@ -200,49 +189,73 @@ class Structure:
                 if member.score <= current_member.score:
                     member.set_enabled(False)
                     continue
-                elif member.score > current_member.score:
-                    current_member.set_enabled(False)
+                current_member.set_enabled(False)
 
             current_member = member
 
         self.refresh_collisions()
 
-    def pack_structure(self, start=0, end=None):
-        """
-        Pack the structure by removing all disabled members and reordering the remaining members
-        :return: None
-        """
-        self.refresh_collisions()
+    def iter_packable_members(
+        self, start: int | None = None
+    ) -> Iterator[tuple[int, AbstractMember]]:
+        start_index = self.get_main_offset_index() if start is None else start
+        origin = (
+            self.members[start_index].offset if start_index < len(self.members) else 0
+        )
+        for index in range(start_index, len(self.members)):
+            member = self.members[index]
+            if member.enabled and member.offset >= origin:
+                yield index, member
 
+    def pack_structure(self, start: int | None = None, end: int | None = None):
+        if not self.members:
+            log_warning("Structure is empty", True)
+            return None
+
+        self.refresh_collisions()
         struct_name = self.get_name()
         if not struct_name:
             struct_name = ida_kernwin.ask_str("", ida_kernwin.HIST_TYPE, "Struct name:")
             if not struct_name:
-                return
+                return None
+
+        start_index = self.get_main_offset_index() if start is None else start
+        origin = (
+            self.members[start_index].offset if start_index < len(self.members) else 0
+        )
+        packable_members = list(self.iter_packable_members(start_index))
+        if end is not None:
+            packable_members = [
+                (index, member)
+                for index, member in packable_members
+                if index <= end
+            ]
+        if not packable_members:
+            log_warning("No enabled members are available to create a type.", True)
+            return None
 
         log_debug(f"Packing structure {struct_name}")
 
         final_tinfo = ida_typeinf.tinfo_t()
         udt_data = ida_typeinf.udt_type_data_t()
-        origin = self.members[start].offset if start else 0
-        offset = origin
+        current_offset = origin
 
-        for idx, member in enumerate(self.members):
-            if member.enabled is False:
-                continue
-            gap_size = member.offset - offset
-            if gap_size:
-                udt_data.push_back(create_udt_padding_member(offset - origin, gap_size))
-            if member.is_array:
-                array_size = self.calculate_array_size(
-                    bisect.bisect_left(self.members, member)
+        for index, member in packable_members:
+            gap_size = member.offset - current_offset
+            if gap_size > 0:
+                udt_data.push_back(
+                    create_udt_padding_member(current_offset - origin, gap_size)
                 )
-                if array_size:
+
+            if member.is_array:
+                array_size = self.calculate_array_size(index)
+                if array_size > 1:
                     udt_data.push_back(member.get_udt_member(array_size, offset=origin))
-                    offset = member.offset + member.size * array_size
+                    current_offset = member.offset + member.size * array_size
                     continue
+
             udt_data.push_back(member.get_udt_member(offset=origin))
-            offset = member.offset + member.size
+            current_offset = member.offset + member.size
 
         final_tinfo.create_udt(udt_data, ida_typeinf.BTF_STRUCT)
         cdecl = ida_typeinf.print_tinfo(
@@ -256,63 +269,74 @@ class Structure:
             struct_name,
             None,
         )
-
         if not cdecl:
-            raise Exception("Failed to generate C declaration")
+            raise RuntimeError("Failed to generate C declaration")
 
-        cdecl = ida_kernwin.ask_text(
+        edited_cdecl = ida_kernwin.ask_text(
             0x10000,
-            "#pragma pack(push, 1)\n" + cdecl,
+            f"#pragma pack(push, 1)\n{cdecl}",
             "The following new type will be created",
         )
-        if not cdecl:
+        if not edited_cdecl:
             log_warning("No type definition was provided", True)
+            return None
+        return self.set_cdecl(edited_cdecl, origin)
 
-        return self.set_cdecl(cdecl, origin)
+    @staticmethod
+    def _extract_type_name(cdecl: str) -> str | None:
+        match = re.search(r"\b(struct|union|enum)\s+([A-Za-z_]\w*)", cdecl)
+        if match:
+            return match.group(2)
+        return None
 
-    def set_cdecl(self, cdecl, origin=0):
-        result = ida_typeinf.idc_parse_decl(
-            ida_typeinf.cvar.idati, cdecl, ida_typeinf.PT_TYP
+    @staticmethod
+    def _load_named_type(name: str) -> ida_typeinf.tinfo_t | None:
+        tinfo = ida_typeinf.tinfo_t()
+        if tinfo.get_named_type(ida_typeinf.get_idati(), name):
+            return tinfo
+        return None
+
+    def _apply_scanned_variable_types(
+        self, structure_name: str, origin: int
+    ) -> ida_typeinf.tinfo_t | None:
+        tinfo = self._load_named_type(structure_name)
+        if tinfo is None:
+            log_error(f"Created type {structure_name}, but failed to load it back.")
+            return None
+
+        ptr_tinfo = ida_typeinf.tinfo_t()
+        ptr_tinfo.create_ptr(tinfo)
+        for scan_object in self.get_unique_scanned_variables(origin):
+            scan_object.apply_type(ptr_tinfo)
+        return tinfo
+
+    def set_cdecl(self, cdecl: str, origin: int = 0):
+        structure_name = self._extract_type_name(cdecl)
+        if not structure_name:
+            log_warning("Failed to determine type name from the declaration.", True)
+            return None
+
+        if forge_types.create_type(structure_name, cdecl):
+            log_debug(f"Created type {structure_name}")
+            return self._apply_scanned_variable_types(structure_name, origin)
+
+        reply = QtWidgets.QMessageBox.question(
+            None,
+            "Overwrite existing type?",
+            f"Type {structure_name} already exists. Overwrite?",
+            QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
         )
-        if result is None:
-            log_warning("Failed to parse type definition", True)
-            return
-
-        structure_name = result[0]
-
-        previous_ordinal = ida_typeinf.get_type_ordinal(
-            ida_typeinf.cvar.idati, structure_name
-        )
-
-        if previous_ordinal:
-            reply = QtWidgets.QMessageBox.question(
-                None,
-                "Overwrite existing type?",
-                f"Type {structure_name} already exists. Overwrite?",
-                QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
-            )
-            if reply == QtWidgets.QMessageBox.Yes:
-                ida_typeinf.del_numbered_type(ida_typeinf.cvar.idati, previous_ordinal)
-                ordinal = ida_typeinf.idc_set_local_type(
-                    previous_ordinal, cdecl, ida_typeinf.PT_TYP
-                )
-            else:
-                return
-        else:
-            ordinal = ida_typeinf.idc_set_local_type(-1, cdecl, ida_typeinf.PT_TYP)
-
-        if ordinal:
-            tid = ida_typeinf.import_type(ida_typeinf.cvar.idati, -1, structure_name)
-            if tid:
-                log_debug(f"Created type {structure_name} with ordinal {ordinal}")
-                tinfo = idaapi.create_typedef(structure_name)
-                ptr_tinfo = ida_typeinf.tinfo_t()
-                ptr_tinfo.create_ptr(tinfo)
-                for var in self.get_unique_scanned_variables(origin):
-                    var.apply_type(ptr_tinfo)
-                return tinfo
-        else:
+        if reply != QtWidgets.QMessageBox.Yes:
             log_error(
-                f"Strucutre {structure_name} probably already exists. Please check manually.",
+                f"Structure {structure_name} probably already exists. Please check manually.",
                 True,
             )
+            return None
+
+        ida_typeinf.del_named_type(ida_typeinf.get_idati(), structure_name)
+        if not forge_types.create_type(structure_name, cdecl):
+            log_error(f"Failed to recreate type {structure_name}", True)
+            return None
+
+        log_debug(f"Created type {structure_name}")
+        return self._apply_scanned_variable_types(structure_name, origin)

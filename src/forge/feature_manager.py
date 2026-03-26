@@ -1,8 +1,10 @@
+from __future__ import annotations
+
 import importlib
 import sys
 from pathlib import Path
 from types import ModuleType
-from typing import Dict
+from typing import Iterator
 
 from forge.util.logging import log_debug
 
@@ -12,24 +14,22 @@ class FeatureManager:
     Manages dynamic loading, unloading, and reloading of feature modules.
     """
 
-    def __init__(self, folder: str = "features"):
-        """
-        Initializes the FeatureManager with a folder containing features.
-
-        :param folder: Directory name where features are stored. Defaults to 'features'.
-        """
-        self._features: Dict[str, ModuleType] = {}
-        self._feature_root: Path = Path(__file__).resolve().parent / folder
+    def __init__(self, root: Path | None = None):
+        """Initialize the feature manager."""
+        self._features: dict[str, ModuleType] = {}
+        self._feature_root = root or Path(__file__).resolve().parent / "features"
 
     def load_features(self) -> None:
-        """
-        Loads all features from the specified feature directory.
-        """
+        """Load every feature module discovered under the feature root."""
         log_debug(f'Loading features from: "{self._feature_root}"')
-        for feature_path in self._feature_root.iterdir():
-            if feature_path.is_dir() and "__pycache__" not in feature_path.parts:
-                module_name = f"forge.features.{feature_path.stem}"
-                self.load_feature(module_name)
+        for module_name in self.iter_feature_module_names():
+            self.load_feature(module_name)
+
+    def iter_feature_module_names(self) -> Iterator[str]:
+        """Yield importable feature module names in deterministic order."""
+        for feature_path in sorted(self._feature_root.iterdir()):
+            if feature_path.is_dir() and feature_path.name != "__pycache__":
+                yield f"forge.features.{feature_path.stem}"
 
     def load_feature(self, name: str) -> None:
         """
@@ -75,8 +75,6 @@ class FeatureManager:
         :param name: The module name of the feature to reload.
         :raises ValueError: If the feature is not loaded.
         """
-        if name not in self._features:
-            raise ValueError(f"Feature '{name}' is not loaded.")
-        module = self._features[name]
-        importlib.reload(module)
+        module = self.get_feature(name)
+        self._features[name] = importlib.reload(module)
         log_debug(f'Reloaded feature: "{name}"')

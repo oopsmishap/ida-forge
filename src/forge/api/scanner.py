@@ -1,4 +1,7 @@
-from typing import Optional, List
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Optional
 
 import ida_bytes
 import ida_funcs
@@ -6,54 +9,103 @@ import ida_hexrays
 import idaapi
 import ida_typeinf
 
-from forge.api.hexrays import is_legal_type, find_expr_address, is_code, decompile, ctype, get_func_argument_info, \
-    get_funcs_calling_address, ctype_to_str, to_hex
+from forge.api.hexrays import (
+    ctype,
+    ctype_to_str,
+    decompile,
+    find_expr_address,
+    get_func_argument_info,
+    get_funcs_calling_address,
+    is_code,
+    is_legal_type,
+    to_hex,
+)
 from forge.api.scan_object import ScanObject, ObjectType
 from forge.api.types import types
-from forge.api.visitor import ObjectVisitor, DownwardsObjectVisitor, RecursiveDownwardsObjectVisitor
-from forge.util.logging import *
+from forge.api.visitor import (
+    DownwardsObjectVisitor,
+    ObjectVisitor,
+    RecursiveDownwardsObjectVisitor,
+)
+from forge.util.logging import log_debug, log_warning
 
 
-class ScannedObject(object):
-    def __init__(self, name: str, expression_address: int, origin: int, applicable: bool = True):
+@dataclass
+class ParentExpressionContext:
+    expressions: list[ida_hexrays.cexpr_t]
+
+    @property
+    def ops(self) -> list[ctype]:
+        return [expression.op for expression in self.expressions]
+
+    def expr_at(self, index: int) -> Optional[ida_hexrays.cexpr_t]:
+        return self.expressions[index] if index < len(self.expressions) else None
+
+    def op_at(self, index: int) -> Optional[ctype]:
+        ops = self.ops
+        return ops[index] if index < len(ops) else None
+
+    def pop_front(self, count: int = 1) -> None:
+        del self.expressions[:count]
+
+
+class ScannedObject:
+    def __init__(
+        self,
+        name: str,
+        expression_address: int,
+        origin: int,
+        applicable: bool = True,
+    ):
         self.name = name
         self.ea = expression_address
-        self.func_ea = ida_funcs.get_func(self.ea).start_ea
+        self.func_ea = self._get_function_start(expression_address)
         self.origin = origin
         self._applicable = applicable
 
-    def apply_type(self, tinfo: ida_typeinf.tinfo_t):
+    @staticmethod
+    def _get_function_start(ea: int) -> int:
+        func = ida_funcs.get_func(ea)
+        return func.start_ea if func is not None else idaapi.BADADDR
+
+    def apply_type(self, tinfo: ida_typeinf.tinfo_t) -> None:
         raise NotImplementedError
 
     @staticmethod
-    def create(obj, expression_address, origin, applicable=True):
+    def create(
+        obj: ScanObject,
+        expression_address: int,
+        origin: int,
+        applicable: bool = True,
+    ) -> "ScannedObject":
         if obj.id == ObjectType.global_object:
-            return ScannedGlobalObject(obj.ea, obj.name, expression_address, origin, applicable)
-        elif obj.id == ObjectType.local_variable:
-            return ScannedVariableObject(obj.lvar, obj.name, expression_address, origin, applicable)
-        elif obj.id in (ObjectType.structure_pointer, ObjectType.structure_reference):
-            return ScannedStructureMemberObject(obj.struct_name, obj.name, expression_address, origin, applicable)
-        else:
-            return AssertionError
+            return ScannedGlobalObject(
+                obj.object_ea, obj.name, expression_address, origin, applicable
+            )
+        if obj.id == ObjectType.local_variable:
+            return ScannedVariableObject(
+                obj.lvar, obj.name, expression_address, origin, applicable
+            )
+        if obj.id in (ObjectType.structure_pointer, ObjectType.structure_reference):
+            return ScannedStructureMemberObject(
+                obj.struct_name, obj.name, expression_address, origin, applicable
+            )
+        raise AssertionError(f"Unsupported scan object type: {obj.id}")
 
     @property
     def function_name(self) -> str:
+        if self.func_ea == idaapi.BADADDR:
+            return "<unknown>"
         return ida_funcs.get_func_name(self.func_ea)
 
-    def to_list(self):
-        """ Creates list that is acceptable to MyChoose2 viewer """
+    def to_list(self) -> list[str]:
+        """Return a row suitable for an IDA chooser widget."""
         return [
             f"0x{self.origin:04X}",
             self.function_name,
             self.name,
-            to_hex(self.ea)
+            to_hex(self.ea),
         ]
-
-    # def __eq__(self, other: 'ScannedObject'):
-    #     log_debug(f"Comparing {self} to {other}")
-    #     return self.func_ea == other.func_ea and\
-    #            self.name == other.name and \
-    #            self.ea == other.ea
 
     def __hash__(self):
         return hash((self.func_ea, self.name, self.ea))
@@ -63,22 +115,34 @@ class ScannedObject(object):
 
 
 class ScannedGlobalObject(ScannedObject):
-    def __init__(self, obj_ea: int, name: str, expression_address: int, origin: int, applicable: bool = True):
+    def __init__(
+        self,
+        obj_ea: int,
+        name: str,
+        expression_address: int,
+        origin: int,
+        applicable: bool = True,
+    ):
         super().__init__(name, expression_address, origin, applicable)
         self._obj_ea = obj_ea
 
-    def apply_type(self, tinfo: ida_typeinf.tinfo_t):
-        ida_typeinf.apply_tinfo(self._obj_ea, tinfo)
+    def apply_type(self, tinfo: ida_typeinf.tinfo_t) -> None:
+        ida_typeinf.apply_tinfo(self._obj_ea, tinfo, ida_typeinf.TINFO_DEFINITE)
 
 
 class ScannedVariableObject(ScannedObject):
-    def __init__(self, lvar: ida_hexrays.lvar_t, name: str, expression_address: int, origin: int,
-                 applicable: bool = True):
-
+    def __init__(
+        self,
+        lvar: ida_hexrays.lvar_t,
+        name: str,
+        expression_address: int,
+        origin: int,
+        applicable: bool = True,
+    ):
         super().__init__(name, expression_address, origin, applicable)
         self._lvar = ida_hexrays.lvar_locator_t(lvar.location, lvar.defea)
 
-    def apply_type(self, tinfo: ida_typeinf.tinfo_t):
+    def apply_type(self, tinfo: ida_typeinf.tinfo_t) -> None:
         if not self._applicable:
             return
 
@@ -91,29 +155,106 @@ class ScannedVariableObject(ScannedObject):
                 log_debug("Successful")
                 hx_view.set_lvar_type(lvar[0], tinfo)
             else:
-                log_warning("Failed to find previously scanned local variable {} from {}".format(
-                    self.name, to_hex(self.ea)))
+                log_warning(
+                    "Failed to find previously scanned local variable "
+                    f"{self.name} from {to_hex(self.ea)}"
+                )
+
 
 class ScannedStructureMemberObject(ScannedObject):
-    def __init__(self, struct_name, struct_offset, name, expression_address, origin, applicable=True):
+    def __init__(
+        self,
+        struct_name,
+        struct_offset,
+        name,
+        expression_address,
+        origin,
+        applicable=True,
+    ):
         super().__init__(name, expression_address, origin, applicable)
         self._name = struct_name
         self._offset = struct_offset
 
-    def apply_type(self, tinfo: ida_typeinf.tinfo_t):
+    def apply_type(self, tinfo: ida_typeinf.tinfo_t) -> None:
         if not self._applicable:
             return
         # TODO: implement changing structure member types
-        log_warning(f"Changing structure member types is not supported yet. Address - {hex(self.ea)}")
+        log_warning(
+            "Changing structure member types is not supported yet. "
+            f"Address - {hex(self.ea)}"
+        )
 
 
 class ScanVisitor(ObjectVisitor):
-    def __init__(self, cfunc: ida_hexrays.cfunc_t, origin: int, obj: ScanObject, structure):
+    def __init__(
+        self,
+        cfunc: ida_hexrays.cfunc_t,
+        origin: int,
+        obj: ScanObject,
+        structure,
+    ):
         super().__init__(cfunc, obj, None, True)
         self._origin = origin
         self._structure = structure
 
-    def _manipulate(self, cexpr: ida_hexrays.cexpr_t, obj: ScanObject):
+    @staticmethod
+    def _describe_tinfo(tinfo: Optional[ida_typeinf.tinfo_t]) -> str:
+        return "<none>" if tinfo is None else tinfo.dstr()
+
+    @staticmethod
+    def _is_unknown_tinfo(tinfo: Optional[ida_typeinf.tinfo_t]) -> bool:
+        return (
+            tinfo is None
+            or tinfo.dstr() == "?"
+            or tinfo.get_size() == ida_typeinf.BADSIZE
+        )
+
+    @staticmethod
+    def _create_byte_array_tinfo(size: int) -> ida_typeinf.tinfo_t:
+        if size <= 1:
+            return ida_typeinf.tinfo_t(types["u8"].type)
+
+        array_data = ida_typeinf.array_type_data_t()
+        array_data.base = 0
+        array_data.elem_type = ida_typeinf.tinfo_t(types["u8"].type)
+        array_data.nelems = size
+
+        array_tinfo = ida_typeinf.tinfo_t()
+        array_tinfo.create_array(array_data)
+        return array_tinfo
+
+    def _infer_data_object_tinfo(
+        self,
+        obj_ea: int,
+        current_tinfo: Optional[ida_typeinf.tinfo_t],
+    ) -> Optional[ida_typeinf.tinfo_t]:
+        if not self._is_unknown_tinfo(current_tinfo):
+            return current_tinfo
+
+        guessed_tinfo = ida_typeinf.tinfo_t()
+        if ida_typeinf.guess_tinfo(guessed_tinfo, obj_ea):
+            if not self._is_unknown_tinfo(guessed_tinfo):
+                log_debug(
+                    f"Inferred object type from {to_hex(obj_ea)}: {guessed_tinfo.dstr()}"
+                )
+                return guessed_tinfo
+
+        item_size = ida_bytes.get_item_size(obj_ea)
+        if item_size > 0:
+            fallback_tinfo = self._create_byte_array_tinfo(item_size)
+            log_debug(
+                f"Falling back to sized byte array for {to_hex(obj_ea)}: "
+                f"{fallback_tinfo.dstr()}"
+            )
+            return fallback_tinfo
+
+        return current_tinfo
+
+    def _get_parent_context(self) -> ParentExpressionContext:
+        expressions = [parent.cexpr for parent in list(self.parents)[:0:-1]]
+        return ParentExpressionContext(expressions)
+
+    def _manipulate(self, cexpr: ida_hexrays.cexpr_t, obj: ScanObject) -> None:
         super()._manipulate(cexpr, obj)
 
         member = None
@@ -134,21 +275,17 @@ class ScanVisitor(ObjectVisitor):
             log_debug(f"\tCreating member {member}")
             self._structure.add_member(member)
 
-    def _get_member(self, offset: int, cexpr: ida_hexrays.cexpr_t, obj: ScanObject, tinfo: ida_typeinf.tinfo_t,
-                    obj_ea: int = None):
-        """
-        Extracts a member from a given expression.
-
-        :param offset: The offset of the member from the beginning of the object.
-        :param cexpr: The expression containing the member.
-        :param obj: The object containing the member.
-        :param tinfo: The t information of the object.
-        :param obj_ea: The effective address of the object.
-        :return: The extracted AbstracMember.
-        """
+    def _get_member(
+        self,
+        offset: int,
+        cexpr: ida_hexrays.cexpr_t,
+        obj: ScanObject,
+        tinfo: Optional[ida_typeinf.tinfo_t],
+        obj_ea: Optional[int] = None,
+    ):
+        """Build a structure member from the expression/type context."""
         expr_ea = find_expr_address(cexpr, self.parents)
 
-        # Ensure that the offset is positive
         if offset < 0:
             log_warning(f"Considered to be impossible: offset: {offset}, obj: {to_hex(expr_ea)}")
             raise AssertionError
@@ -165,21 +302,21 @@ class ScanVisitor(ObjectVisitor):
             if is_code(obj_ea):
                 func = decompile(obj_ea)
                 if func:
-                    tinfo = func.type
-                    tinfo.create_ptr(tinfo)
+                    func_tinfo = ida_typeinf.tinfo_t(func.type)
+                    tinfo = ida_typeinf.tinfo_t()
+                    tinfo.create_ptr(func_tinfo)
                 else:
-                    tinfo = types["func_t"].type
-                    # tinfo = const.DUMMY_FUNC
+                    tinfo = ida_typeinf.tinfo_t(types["func_t"].type)
                 from forge.api.members import Member
                 return Member(offset, tinfo, scan_obj, self._origin)
 
-        tinfo.clr_const()
+            tinfo = self._infer_data_object_tinfo(obj_ea, tinfo)
 
+        if tinfo is not None:
+            tinfo = ida_typeinf.tinfo_t(tinfo)
+            tinfo.clr_const()
+            tinfo = types.convert_to_simple_type(tinfo)
 
-        # convert `unsigned int` -> `u32` / `int` -> `i32`, etc.
-        tinfo = types.convert_to_simple_type(tinfo)
-
-        # Check if the t information is void
         if not tinfo or tinfo.equals_to(types["void"].type):
             from forge.api.members import VoidMember
             return VoidMember(offset, scan_obj, self._origin)
@@ -188,147 +325,153 @@ class ScanVisitor(ObjectVisitor):
         return Member(offset, tinfo, scan_obj, self._origin)
 
     def _extract_member_from_ptr(self, cexpr: ida_hexrays.cexpr_t, obj: ScanObject):
-        """
-        Extracts an AbstractMember from the given pointer expression and a ScanObject.
+        """Extract a member from a pointer expression."""
+        context = self._get_parent_context()
+        first_parent = context.expr_at(0)
+        second_parent = context.expr_at(1)
 
-        :param cexpr: The expression of the pointer.
-        :param obj: The object containing the member.
-        :return: The extracted member or None if the extraction fails.
-        """
-        parents_type = [x.cexpr.op for x in list(self.parents)[:0:-1]]
-        parents = [x.cexpr for x in list(self.parents)[:0:-1]]
+        if first_parent is None:
+            return self._extract_member(cexpr, obj, 0, context)
 
-        # Extracting offset and removing expression parents making this offset
-        if parents[0].op in (ctype.idx, ctype.add):
+        if first_parent.op in (ctype.idx, ctype.add):
             # `expr[idx]`
             # `(TYPE*) + x`
-            if parents[0].y.op != ctype.num:
-                # cannot handle non-constant offsets
+            if first_parent.y.op != ctype.num:
                 return None
 
-            offset = parents[0].y.numval() * cexpr.type.get_ptrarr_objsize()
+            offset = first_parent.y.numval() * cexpr.type.get_ptrarr_objsize()
             cexpr = self.parent_expr()
-            if parents_type[0] == ctype.add:
-                parents_type.pop(0)
-                parents.pop(0)
-
-        elif parents_type[0:2] == [ctype.cast, ctype.add]:
+            if first_parent.op == ctype.add:
+                context.pop_front()
+        elif context.op_at(0) == ctype.cast and context.op_at(1) == ctype.add and second_parent is not None:
             # `(TYPE*)expr + offset`
             # `(TYPE)expr + offset`
-            if parents[1].y.op != ctype.num:
-                # cannot handle non-constant offsets
+            if second_parent.y.op != ctype.num:
                 return None
-            elif parents[0].type.is_ptr():
-                size = parents[0].type.get_ptrarr_objsize()
+            if first_parent.type.is_ptr():
+                size = first_parent.type.get_ptrarr_objsize()
             else:
                 size = 1
 
-            offset = parents[1].theother(parents[0]).numval() * size
-            cexpr = parents[1]
-            del parents_type[0:2]
-            del parents[0:2]
+            offset = second_parent.theother(first_parent).numval() * size
+            cexpr = second_parent
+            context.pop_front(2)
         else:
             offset = 0
 
-        return self._extract_member(cexpr, obj, offset, parents, parents_type)
+        return self._extract_member(cexpr, obj, offset, context)
 
     def _extract_member_from_expr(self, cexpr: ida_hexrays.cexpr_t, obj: ScanObject):
-        """
-        Extracts an AbstractMember from an expression and a ScanObject.
+        """Extract a member from a non-pointer expression."""
+        context = self._get_parent_context()
 
-        :param cexpr: the expression from which to extract the member
-        :param obj: the ScanObject to which the member belongs
-        :return: the extracted AbstractMember or None if it couldn't be extracted
-        """
-        parents_type = [x.cexpr.op for x in list(self.parents)[:0:-1]]
-        parents = [x.cexpr for x in list(self.parents)[:0:-1]]
+        log_debug(
+            "Extracting member from expression: "
+            f"{obj.name}, parents: '{ctype_to_str(context.ops)}'"
+        )
 
-        log_debug(f"Extracting member from expression: {obj.name}, parents: '{ctype_to_str(parents_type)}'")
-
-        # If the parent expression is a sum (i.e. `obj + offset`) then offset should be
-        # the second operand of the parent expression, and we delete the parent's `ctype.add`
-        # and its other operand
-        if parents_type and parents_type[0] == ctype.add:
-            if parents[0].theother(cexpr).op != ctype.num:
-                # Cannot handle non-constant offsets
+        first_parent = context.expr_at(0)
+        if context.op_at(0) == ctype.add and first_parent is not None:
+            other = first_parent.theother(cexpr)
+            if other.op != ctype.num:
                 return None
 
-            offset = parents[0].theother(cexpr).numval()
+            offset = other.numval()
             cexpr = self.parent_expr()
-            parents_type.pop(0)
-            parents.pop(0)
+            context.pop_front()
         else:
             offset = 0
 
-        # Extract the member using the expression and the parents
-        return self._extract_member(cexpr, obj, offset, parents, parents_type)
+        if offset == 0 and (
+            first_parent is None or first_parent.op >= ctype.cit_empty
+        ):
+            log_debug(
+                f"Skipping bare expression {obj.name} with no member access context"
+            )
+            return None
 
-    def _extract_member(self, cexpr: ida_hexrays.cexpr_t, obj: ScanObject, offset: int,
-                        parents: List[ida_hexrays.cexpr_t], parents_type: List[ctype]):
+        return self._extract_member(cexpr, obj, offset, context)
 
-        log_debug(f"Extracting member: {obj.name}, parents: '{ctype_to_str(parents_type)}'")
+    def _extract_member(
+        self,
+        cexpr: ida_hexrays.cexpr_t,
+        obj: ScanObject,
+        offset: int,
+        context: ParentExpressionContext,
+    ):
+        log_debug(
+            f"Extracting member: {obj.name}, parents: '{ctype_to_str(context.ops)}'"
+        )
 
-        # Clear and store cast type
-        if parents_type[0] == ctype.cast:
+        if context.op_at(0) == ctype.cast and context.expr_at(0) is not None:
             # `(TYPE)expr`
-            tinfo = parents[0].type
-            cexpr = parents[0]
-            parents_type.pop(0)
-            parents.pop(0)
+            tinfo = context.expr_at(0).type
+            cexpr = context.expr_at(0)
+            context.pop_front()
         else:
             tinfo = types.get_ptr()
 
-        log_debug(f"1st default_tinfo: {tinfo.dstr()}")
+        log_debug(f"1st default_tinfo: {self._describe_tinfo(tinfo)}")
 
-        if parents_type[0] in (ctype.idx, ctype.ptr):
-            # Clear and store cast type
-            if parents_type[1] == ctype.cast:
+        if context.op_at(0) in (ctype.idx, ctype.ptr):
+            if context.op_at(1) == ctype.cast and context.expr_at(1) is not None:
                 # `*(TYPE*)expr`
                 # `*(TYPE*)expr[idx]`
-                tinfo = parents[1].type
-                cexpr = parents[0]
-                parents_type.pop(0)
-                parents.pop(0)
+                tinfo = context.expr_at(1).type
+                cexpr = context.expr_at(0)
+                context.pop_front()
             else:
                 tinfo = self._deref_tinfo(tinfo)
 
-            log_debug(f"2nd default_tinfo: {tinfo.dstr()}")
+            log_debug(f"2nd default_tinfo: {self._describe_tinfo(tinfo)}")
 
-            if parents_type[1] == ctype.asg:
-                if parents[1].x == parents[0]:
+            second_expr = context.expr_at(1)
+            first_expr = context.expr_at(0)
+
+            if context.op_at(1) == ctype.asg and second_expr is not None and first_expr is not None:
+                if second_expr.x == first_expr:
                     # `*((TYPE*)expr + x) = ...`
-                    obj_ea = self._extract_obj_ea(parents[1].y)
+                    obj_ea = self._extract_obj_ea(second_expr.y)
                     log_debug(f"pointer assignment to object")
-                    return self._get_member(offset, cexpr, obj, parents[1].y.type, obj_ea)
+                    return self._get_member(offset, cexpr, obj, second_expr.y.type, obj_ea)
                 else:
                     # `*(TYPE*)expr = ...`
                     log_debug(f"cast assignment to object")
-                    return self._get_member(offset, cexpr, obj, parents[1].x.type)
-            elif parents_type[1] == ctype.call:
-                log_debug(f"pointer passed as argument to function at {hex(parents[1].ea)}")
-                if parents[1].x == parents[0]:
+                    return self._get_member(offset, cexpr, obj, second_expr.x.type)
+            elif context.op_at(1) == ctype.call and second_expr is not None and first_expr is not None:
+                log_debug(f"pointer passed as argument to function at {hex(second_expr.ea)}")
+                if second_expr.x == first_expr:
                     # ((void (__some_call*)(..., expr[idx], ...)
                     # ((void (__some_call*)(..., *(TYPE*)(expr + x), ...)
-                    log_debug(f"object passed as argument to function at {hex(parents[1].ea)}")
-                    return self._get_member(offset, cexpr, obj, parents[0].type)
-                _, tinfo = get_func_argument_info(parents[1], parents[0])
+                    log_debug(f"object passed as argument to function at {hex(second_expr.ea)}")
+                    return self._get_member(offset, cexpr, obj, first_expr.type)
+                _, tinfo = get_func_argument_info(second_expr, first_expr)
                 if tinfo is None:
-                    log_warning(f"Failed to get function argument info for {parents[1]}, ea: {hex(parents[1].ea)}")
+                    log_warning(
+                        f"Failed to get function argument info for {second_expr}, "
+                        f"ea: {hex(second_expr.ea)}"
+                    )
                     tinfo = types["u8"].ptr
                 return self._get_member(offset, cexpr, obj, tinfo)
             return self._get_member(offset, cexpr, obj, tinfo)
 
-        elif parents_type[0] == ctype.call:
+        if context.op_at(0) == ctype.call and context.expr_at(0) is not None:
             # `void (__some_call*)(..., (TYPE)(expr + x), ...)`
-            log_debug(f'function call with cast, parent: {parents[0].type.dstr()} {parents[0].dstr()}, cexpr: {cexpr.type.dstr()} {cexpr.dstr()}')
-            tinfo = self._parse_call(parents[0], cexpr)
+            call_parent = context.expr_at(0)
+            log_debug(
+                "function call with cast, parent: "
+                f"{call_parent.type.dstr()} {call_parent.dstr()}, "
+                f"cexpr: {cexpr.type.dstr()} {cexpr.dstr()}"
+            )
+            tinfo = self._parse_call(call_parent, cexpr)
             return self._get_member(offset, cexpr, obj, tinfo)
 
-        elif parents_type[0] == ctype.asg:
+        if context.op_at(0) == ctype.asg and context.expr_at(0) is not None:
             # `TYPE parent.x = expr(...);`
             log_debug(f"assignment to object")
-            if parents[0].x == cexpr:
-                tinfo = parents[0].x.type
+            assignment_parent = context.expr_at(0)
+            if assignment_parent.x == cexpr:
+                tinfo = assignment_parent.x.type
                 return self._get_member(offset, cexpr, obj, tinfo)
 
         return self._get_member(offset, cexpr, obj, self._deref_tinfo(tinfo))
@@ -343,6 +486,9 @@ class ScanVisitor(ObjectVisitor):
         :return: The pointed object tinfo or None if it is not a valid pointer t.
         :rtype: Optional[ida_typeinf.tinfo_t]
         """
+        if tinfo is None:
+            return None
+
         log_debug(f"Dereferencing tinfo: {tinfo.dstr()}")
 
         if not tinfo.is_ptr():
@@ -375,19 +521,21 @@ class ScanVisitor(ObjectVisitor):
             if cexpr.obj_ea != idaapi.BADADDR:
                 return cexpr.obj_ea
 
-    def _parse_call(self, call_cexpr: ida_hexrays.cexpr_t, arg_cexpr: ida_hexrays.cexpr_t) -> ida_typeinf.tinfo_t:
-        """
-        Parse call and argument expressions to get t information.
-
-        :param call_cexpr: Call expression to parse.
-        :param arg_cexpr: Argument expression to parse.
-        :return: Type information.
-        """
+    def _parse_call(
+        self,
+        call_cexpr: ida_hexrays.cexpr_t,
+        arg_cexpr: ida_hexrays.cexpr_t,
+    ) -> Optional[ida_typeinf.tinfo_t]:
+        """Infer the argument type used at a call site."""
         idx, tinfo = get_func_argument_info(call_cexpr, arg_cexpr)
-        log_debug(f"Argument {idx} type: {tinfo.dstr()}")
-        if tinfo:
+        if tinfo is not None:
+            log_debug(f"Argument {idx} type: {tinfo.dstr()}")
             return self._deref_tinfo(tinfo)
-        # TODO: Find example with UTF-16 strings
+
+        log_warning(
+            "Could not infer argument type from call expression; "
+            f"falling back to char for argument {idx} at {to_hex(call_cexpr.ea)}"
+        )
         return types["char"].type
 
     def _parse_left_assignee(self, x, offset):
@@ -400,7 +548,13 @@ class NewShallowScanVisitor(ScanVisitor, DownwardsObjectVisitor):
 
 
 class NewDeepScanVisitor(ScanVisitor, RecursiveDownwardsObjectVisitor):
-    def __init__(self, cfunc: ida_hexrays.cfunc_t, origin: int, obj: ScanObject, structure):
+    def __init__(
+        self,
+        cfunc: ida_hexrays.cfunc_t,
+        origin: int,
+        obj: ScanObject,
+        structure,
+    ):
         super().__init__(cfunc, origin, obj, structure)
 
 

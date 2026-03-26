@@ -1,15 +1,15 @@
 import re
 
 
-def demangled_name_to_c_str(name):
+def bad_c_name_pattern(name):
     """
     Removes or replaces characters from demangled symbol so that it was possible to create legal C structure from it
     """
-    bad_c_name_pattern = re.compile(
+    bad_c_name_pattern_re = re.compile(
         ":::+|(?=:(?=[^:]))(?=(?<=[^:]):):|^:[^:]|[^:]:$|^:$|[^a-zA-Z_0-9:]"
     )
 
-    if not bad_c_name_pattern.findall(name):
+    if not bad_c_name_pattern_re.findall(name):
         return name
 
     # filter `vtable and `typeinfo
@@ -68,16 +68,14 @@ def demangled_name_to_c_str(name):
     for op, replacement in operator_replacements.items():
         name = name.replace("operator" + op, "operator_" + replacement)
 
-    return name
+    # name = name.replace("public:", "")
+    # name = name.replace("protected:", "")
+    # name = name.replace("private:", "")
+    # name = name.replace("~", "destructor_")
+    # name = name.replace("*", "ptr_")
+    # name = name.replace("<", "t_")
+    # name = name.replace(">", "t_")
 
-    name = name.replace("public:", "")
-    name = name.replace("protected:", "")
-    name = name.replace("private:", "")
-    name = name.replace("~", "destructor_")
-    name = name.replace("*", "ptr_")
-    name = name.replace("<", "t_")
-    name = name.replace(">", "t_")
-
-    name = "_".join(filter(None, bad_c_name_pattern.split(name)))
+    # name = "_".join(filter(None, bad_c_name_pattern(name).split(name)))
 
     return name

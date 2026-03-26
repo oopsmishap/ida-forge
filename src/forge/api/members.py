@@ -1,11 +1,14 @@
+from __future__ import annotations
+
 import re
 from collections import defaultdict
+from typing import Optional
 
 import ida_auto
 import ida_bytes
 import ida_funcs
 import ida_hexrays
-import idaapi
+import ida_kernwin
 import ida_name
 import ida_segment
 import ida_typeinf
@@ -21,6 +24,139 @@ from forge.api.visitor import FunctionTouchVisitor
 from forge.util.cxx_to_c_name import demangled_name_to_c_str
 from forge.util.logging import *
 
+import forge.api.types as forge_types
+
+
+TYPE_DECL_ALIASES = {
+    "_BYTE": "u8",
+    "BYTE": "u8",
+    "byte": "u8",
+    "_WORD": "u16",
+    "WORD": "u16",
+    "word": "u16",
+    "_DWORD": "u32",
+    "DWORD": "u32",
+    "dword": "u32",
+    "_QWORD": "u64",
+    "QWORD": "u64",
+    "qword": "u64",
+    "_OWORD": "u128",
+    "OWORD": "u128",
+    "oword": "u128",
+    "BOOL": "bool",
+    "BOOLEAN": "bool",
+    "CHAR": "char",
+    "UCHAR": "u8",
+    "uchar": "u8",
+    "unsigned char": "u8",
+    "unsigned short": "u16",
+    "unsigned int": "u32",
+    "unsigned __int64": "u64",
+    "unsigned long long": "u64",
+}
+
+
+def normalize_type_declaration(declaration: str) -> str:
+    normalized = declaration.strip()
+    for source, target in TYPE_DECL_ALIASES.items():
+        normalized = re.sub(rf"\b{re.escape(source)}\b", target, normalized)
+    return normalized
+
+
+def _parse_decl_attempt(declaration: str) -> Optional[ida_typeinf.tinfo_t]:
+    tinfo = ida_typeinf.tinfo_t()
+    flags = ida_typeinf.PT_TYP | ida_typeinf.PT_SIL
+    if ida_typeinf.parse_decl(tinfo, None, declaration, flags):
+        return tinfo
+    return None
+
+
+def _parse_idc_decl_attempt(declaration: str) -> Optional[ida_typeinf.tinfo_t]:
+    result = idaapi.idc_parse_decl(ida_typeinf.get_idati(), declaration, idaapi.PT_TYP)
+    if result is None:
+        return None
+
+    _, type_bytes, field_bytes = result
+    tinfo = ida_typeinf.tinfo_t()
+    tinfo.deserialize(ida_typeinf.get_idati(), type_bytes, field_bytes, None)
+    return tinfo
+
+
+def _build_pointer_tinfo(base_declaration: str, pointer_depth: int) -> Optional[ida_typeinf.tinfo_t]:
+    base_tinfo = parse_user_tinfo(base_declaration)
+    if base_tinfo is None:
+        return None
+
+    resolved_tinfo = ida_typeinf.tinfo_t(base_tinfo)
+    for _ in range(pointer_depth):
+        pointer_tinfo = ida_typeinf.tinfo_t()
+        pointer_tinfo.create_ptr(resolved_tinfo)
+        resolved_tinfo = pointer_tinfo
+    return resolved_tinfo
+
+
+def _build_array_tinfo(base_declaration: str, element_count: int) -> Optional[ida_typeinf.tinfo_t]:
+    if element_count <= 0:
+        return None
+
+    base_tinfo = parse_user_tinfo(base_declaration)
+    if base_tinfo is None:
+        return None
+
+    array_data = ida_typeinf.array_type_data_t()
+    array_data.base = 0
+    array_data.elem_type = ida_typeinf.tinfo_t(base_tinfo)
+    array_data.nelems = element_count
+    array_tinfo = ida_typeinf.tinfo_t()
+    if array_tinfo.create_array(array_data):
+        return array_tinfo
+    return None
+
+
+def _parse_named_like_type(normalized: str) -> Optional[ida_typeinf.tinfo_t]:
+    array_match = re.fullmatch(
+        r"(?P<base>.+?)\s*\[\s*(?P<count>0x[0-9a-fA-F]+|\d+)\s*\]",
+        normalized,
+    )
+    if array_match:
+        return _build_array_tinfo(
+            array_match.group("base"),
+            int(array_match.group("count"), 0),
+        )
+
+    pointer_match = re.fullmatch(r"(?P<base>.+?)(?P<pointers>(?:\s*\*\s*)+)", normalized)
+    if pointer_match:
+        pointer_depth = pointer_match.group("pointers").count("*")
+        return _build_pointer_tinfo(pointer_match.group("base").strip(), pointer_depth)
+
+    named_type = ida_typeinf.tinfo_t()
+    if named_type.get_named_type(ida_typeinf.get_idati(), normalized):
+        return named_type
+    return None
+
+
+def parse_user_tinfo(declaration: str) -> Optional[ida_typeinf.tinfo_t]:
+    normalized = normalize_type_declaration(declaration)
+    attempts = [
+        normalized,
+        f"{normalized};",
+        f"{normalized} __forge_member;",
+    ]
+    for attempt in attempts:
+        tinfo = _parse_decl_attempt(attempt)
+        if tinfo is not None:
+            return tinfo
+
+    named_like_tinfo = _parse_named_like_type(normalized)
+    if named_like_tinfo is not None:
+        return named_like_tinfo
+
+    for attempt in attempts:
+        tinfo = _parse_idc_decl_attempt(attempt)
+        if tinfo is not None:
+            return tinfo
+
+    return None
 
 class AbstractMember:
     def __init__(self, offset: int, scanned_variable, origin: int, tinfo=None):
@@ -33,18 +169,23 @@ class AbstractMember:
         self.scanned_variables = {scanned_variable} if scanned_variable else set()
         self.tinfo: ida_typeinf.tinfo_t = tinfo
 
+    def invalidate_score(self) -> None:
+        self._score = 0
+
     def type_equals_to(self, tinfo: ida_typeinf.tinfo_t) -> bool:
         return self.tinfo.equals_to(tinfo)
 
     def switch_array_flag(self):
         self.is_array ^= True
+        self.invalidate_score()
 
     def activate(self):
-        pass
+        raise NotImplementedError
 
     def set_enabled(self, enabled):
         self.enabled = enabled
         self.is_array = False
+        self.invalidate_score()
 
     def has_collision(self, other):
         if self.offset <= other.offset:
@@ -87,9 +228,9 @@ class AbstractMember:
             if self.is_simple_type():
                 score -= 1
             elif self.tinfo.is_funcptr():
-                score += 0x1000 + len(self.tinfo.dstr())
+                score += 1000 + len(self.tinfo.dstr())
             elif "struct " in self.tinfo.dstr():
-                score -= 0x10
+                score -= 10
             else:
                 score += 1
 
@@ -157,6 +298,7 @@ class AbstractMember:
     def __eq__(self, other):
         if self.offset == other.offset and self.type_name == other.type_name:
             self.scanned_variables |= other.scanned_variables
+            self.invalidate_score()
             return True
         return False
 
@@ -186,7 +328,6 @@ class Member(AbstractMember):
     ):
         super().__init__(offset, scanned_variable, origin, tinfo)
         self.name = f"{self.type_alias}_{self.offset:x}"
-        self.comment = f"{self.score}"
 
     def get_udt_member(self, array_size: int = 0, offset: int = 0):
         udt_member = ida_typeinf.udt_member_t()
@@ -196,28 +337,37 @@ class Member(AbstractMember):
             if self._is_name_aliased()
             else self.name
         )
-        udt_member.type = self.tinfo
+        udt_member.type = ida_typeinf.tinfo_t(self.tinfo)
         if array_size:
-            udt_member.type.create_array(array_size)
+            array_data = ida_typeinf.array_type_data_t()
+            array_data.base = 0
+            array_data.elem_type = ida_typeinf.tinfo_t(self.tinfo)
+            array_data.nelems = array_size
+            array_tinfo = ida_typeinf.tinfo_t()
+            array_tinfo.create_array(array_data)
+            udt_member.type = array_tinfo
         udt_member.offset = self.offset - offset
         udt_member.cmt = self.comment
-        udt_member.size = self.size
+        udt_member.size = self.size * array_size if array_size else self.size
         return udt_member
 
     def activate(self):
-        new_type_decl = ida_kernwin.ask_str(self.type_name, 0x100, "Enter type:")
-        if new_type_decl is None:
+        new_type_decl = ida_kernwin.ask_str(
+            self.type_name,
+            ida_kernwin.HIST_TYPE,
+            "Enter type:",
+        )
+        if not new_type_decl:
             return
 
-        result = ida_typeinf.parse_decl(new_type_decl, 0)
-        if result is None:
+        tinfo = parse_user_tinfo(new_type_decl)
+        if tinfo is None:
+            log_warning(f"Failed to parse type declaration: {new_type_decl}", True)
             return
 
-        _, tp, fld = result
-        tinfo = ida_typeinf.tinfo_t()
-        tinfo.deserialize(ida_typeinf.cvar.idati, tp, fld, None)
         self.tinfo = tinfo
         self.is_array = False
+        self.invalidate_score()
 
     def _is_name_aliased(self):
         return re.match(r"((i|u|f)(8|16|32|64|128|256|512|1024))|(field)_", self.name)
@@ -236,7 +386,7 @@ class VoidMember(Member):
         return True
 
     def switch_array_flag(self):
-        pass
+        return None
 
     def set_enabled(self, enabled) -> None:
         self.enabled = enabled
@@ -248,6 +398,28 @@ class VirtualFunction:
         self.offset = offset
         self.vtable_name = table_name
         self.visited = False
+
+    @staticmethod
+    def _is_generated_name(name: str) -> bool:
+        return name.startswith(("sub_", "nullsub_", "j_sub_", "unknown_libname_"))
+
+    def try_rename(self) -> None:
+        desired_name = self._def_generate_vfunc_name()
+        current_name = ida_funcs.get_func_name(self.address)
+        if current_name == desired_name:
+            return
+        if not current_name or not self._is_generated_name(current_name):
+            return
+
+        existing_ea = ida_name.get_name_ea(idaapi.BADADDR, desired_name)
+        if existing_ea not in (idaapi.BADADDR, self.address):
+            log_debug(
+                "Skipping vtable function rename "
+                f"{hex(self.address)} -> {desired_name}: name already used at {hex(existing_ea)}"
+            )
+            return
+
+        ida_name.set_name(self.address, desired_name)
 
     def get_ptr_tinfo(self):
         ptr_tinfo = ida_typeinf.tinfo_t()
@@ -346,7 +518,7 @@ class VirtualTable(AbstractMember):
                 virtual_function = VirtualFunction(
                     ptr, address - self.address, self.vtable_name
                 )
-                ida_name.set_name(ptr, virtual_function.name)
+                virtual_function.try_rename()
                 self.virtual_functions.append(virtual_function)
             elif is_imported(ptr):
                 virtual_function = ImportedVirtualFunction(ptr, address - self.address)
@@ -459,7 +631,7 @@ class VirtualTable(AbstractMember):
             )
         else:
             log_info(f"Virtual table {self.vtable_name} added to local types")
-            return idaapi.import_type(idaapi.cvar.idati, -1, self.vtable_name)
+            return forge_types.import_type(self.vtable_name)
 
     def get_udt_member(self, offset=0):
         udt_member = ida_typeinf.udt_member_t()
@@ -467,8 +639,9 @@ class VirtualTable(AbstractMember):
         if tid != idaapi.BADADDR:
             udt_member.name = self.name
 
-            tmp_tinfo = idaapi.create_typedef(self.vtable_name)
-            tmp_tinfo.create_ptr(tmp_tinfo)
+            base_tinfo = idaapi.create_typedef(self.vtable_name)
+            tmp_tinfo = ida_typeinf.tinfo_t()
+            tmp_tinfo.create_ptr(base_tinfo)
 
             udt_member.type = tmp_tinfo
             udt_member.offset = self.offset - offset
@@ -484,7 +657,7 @@ class VirtualTable(AbstractMember):
         return False
 
     def switch_array_flag(self):
-        pass
+        return None
 
     @staticmethod
     def is_virtual_table(address: int) -> int:
@@ -557,7 +730,9 @@ class VirtualTable(AbstractMember):
         name = (
             demangled_name_to_c_str(demangled_name)
             .replace("const_", "")
+            .replace("const ", "")
             .replace("::_vftable", "_vtbl")
+            .replace("::`vftable'", "_vtbl")
         )
 
         return name, True

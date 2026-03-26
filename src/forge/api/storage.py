@@ -1,11 +1,13 @@
+from __future__ import annotations
+
 import json
 import zlib
-from typing import List, Union, Iterable, Tuple
+from typing import Any, Iterable, TypeAlias
 
 import ida_netnode
 
 from forge.plugin import PLUGIN_BASE_NETNODE_ID
-from forge.util.logging import *
+from forge.util.logging import log_debug
 
 BLOB_SIZE = 1024
 INT_KEYS_TAG = "M"
@@ -13,22 +15,27 @@ STR_KEYS_TAG = "N"
 STR_TO_INT_MAP_TAG = "O"
 INT_TO_INT_MAP_TAG = "P"
 
+StorageKey: TypeAlias = str | int
+StorageValue: TypeAlias = Any
+
 
 class NetnodeCorruptError(RuntimeError):
-    pass
+    """Raised when the underlying netnode mapping points at missing blob data."""
 
 
 class StorageNameError(RuntimeError):
-    pass
+    """Raised when a storage namespace cannot be represented safely."""
 
 
 # https://github.com/williballenthin/ida-netnode
 class Storage:
-    """
-    Storage class for storing data in IDA Pro netnodes.
-    """
+    """Store JSON-serializable data in IDA netnodes."""
 
     def __init__(self, name: str):
+        if not name or ":" in name:
+            raise StorageNameError(
+                "Storage names must be non-empty and must not contain ':'."
+            )
         self.name = f"{PLUGIN_BASE_NETNODE_ID}:{name}"
         self._n = ida_netnode.netnode(self.name, 0, True)
         log_debug(f"loaded storage {self.name}")
@@ -48,11 +55,11 @@ class Storage:
         return zlib.compress(data)
 
     @staticmethod
-    def _encode(data) -> bytes:
+    def _encode(data: StorageValue) -> bytes:
         return json.dumps(data).encode("ascii")
 
     @staticmethod
-    def _decode(data: bytes) -> dict:
+    def _decode(data: bytes) -> StorageValue:
         return json.loads(data.decode("ascii"))
 
     def _get_next_slot(self, tag: str) -> int:
@@ -126,7 +133,7 @@ class Storage:
             self._n.setblob(value, store_key, STR_KEYS_TAG)
             self._n.hashset(key, str(store_key).encode("utf-8"), STR_TO_INT_MAP_TAG)
         else:
-            self._n.hashset(key, bytes(value))
+            self._n.hashset(key, value)
 
     def _str_get(self, key: str) -> bytes:
         assert isinstance(key, str)
@@ -155,14 +162,14 @@ class Storage:
             self._n.delblob(store_key, STR_KEYS_TAG)
             self._n.hashdel(key, STR_TO_INT_MAP_TAG)
             did_del = True
-        if self._n.hashval(key):
+        if self._n.hashval(key) is not None:
             self._n.hashdel(key)
             did_del = True
 
         if not did_del:
             raise KeyError(f"'{key}' not found")
 
-    def __getitem__(self, key: Union[str, int]) -> dict:
+    def __getitem__(self, key: StorageKey) -> StorageValue:
         if isinstance(key, str):
             v = self._str_get(key)
         elif isinstance(key, int):
@@ -173,7 +180,7 @@ class Storage:
         data = self._decompress(v)
         return self._decode(data)
 
-    def __setitem__(self, key: Union[str, int], value) -> None:
+    def __setitem__(self, key: StorageKey, value: StorageValue) -> None:
         assert value is not None
         v = self._compress(self._encode(value))
 
@@ -184,7 +191,7 @@ class Storage:
         else:
             raise TypeError(f"cannot use {type(key)} as k")
 
-    def __delitem__(self, key: Union[str, int]) -> None:
+    def __delitem__(self, key: StorageKey) -> None:
         if isinstance(key, str):
             self._str_del(key)
         elif isinstance(key, int):
@@ -192,18 +199,17 @@ class Storage:
         else:
             raise TypeError(f"cannot use {type(key)} as k")
 
-    def get(self, key: Union[str, int], default=None) -> dict:
+    def get(self, key: StorageKey, default: StorageValue = None) -> StorageValue:
         try:
             return self[key]
-        except (KeyError, zlib.error):
+        except (KeyError, NetnodeCorruptError, json.JSONDecodeError, zlib.error):
             return default
 
-    def __contains__(self, key: Union[str, int]) -> bool:
+    def __contains__(self, key: StorageKey) -> bool:
         try:
-            if self[key] is not None:
-                return True
-            return False
-        except (KeyError, zlib.error):
+            self[key]
+            return True
+        except (KeyError, NetnodeCorruptError, json.JSONDecodeError, zlib.error):
             return False
 
     def _iter_int_keys_small(self) -> Iterable[int]:
@@ -230,7 +236,7 @@ class Storage:
             yield i
             i = self._n.hashnext(i, STR_TO_INT_MAP_TAG)
 
-    def iterkeys(self) -> Iterable[Union[str, int]]:
+    def iterkeys(self) -> Iterable[StorageKey]:
         for k in self._iter_int_keys_small():
             yield k
 
@@ -243,22 +249,22 @@ class Storage:
         for k in self._iter_str_keys_large():
             yield k
 
-    def keys(self) -> List[Union[str, int]]:
-        return [k for k in list(self.iterkeys())]
+    def keys(self) -> list[StorageKey]:
+        return list(self.iterkeys())
 
-    def itervalues(self) -> Iterable[dict]:
-        for k in list(self.keys()):
+    def itervalues(self) -> Iterable[StorageValue]:
+        for k in self.iterkeys():
             yield self[k]
 
-    def values(self) -> List[dict]:
-        return [v for v in list(self.itervalues())]
+    def values(self) -> list[StorageValue]:
+        return list(self.itervalues())
 
-    def iteritems(self) -> Iterable[Tuple[Union[str, int], dict]]:
-        for k in list(self.keys()):
+    def iteritems(self) -> Iterable[tuple[StorageKey, StorageValue]]:
+        for k in self.iterkeys():
             yield k, self[k]
 
-    def items(self) -> List[Tuple[Union[str, int], dict]]:
-        return [(k, v) for k, v in list(self.iteritems())]
+    def items(self) -> list[tuple[StorageKey, StorageValue]]:
+        return list(self.iteritems())
 
     def kill(self) -> None:
         self._n.kill()

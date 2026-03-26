@@ -1,12 +1,13 @@
 from dataclasses import dataclass
-from typing import Dict, Tuple
+from typing import Dict, Optional, Tuple
 
 import ida_ida
 import ida_typeinf
+import idc
 
 from forge.api.config import ForgeConfig
 from forge.util.util import DocIntEnum
-from forge.util.logging import log_debug
+from forge.util.logging import log_debug, log_error
 
 
 # leimurr — Today at 5:11 PM
@@ -184,8 +185,10 @@ class Types:
         # TODO: add any more types that are needed
 
     def convert_to_simple_type(
-        self, in_type: ida_typeinf.tinfo_t, was_pointer: bool = False
-    ) -> ida_typeinf.tinfo_t:
+        self,
+        in_type: Optional[ida_typeinf.tinfo_t],
+        was_pointer: bool = False,
+    ) -> Optional[ida_typeinf.tinfo_t]:
         """
         Convert a type to a simple type (i.e. remove any pointers, arrays, etc.).
 
@@ -193,40 +196,50 @@ class Types:
         :param was_pointer: Flag to indicate if the type was a pointer.
         :return: The converted type.
         """
+        if in_type is None:
+            return None
+
+        work_type = ida_typeinf.tinfo_t(in_type)
         out_type = ida_typeinf.tinfo_t()
 
-        if in_type.is_ptr():
-            if in_type.remove_ptr_or_array():
-                return self.convert_to_simple_type(in_type, True)
-            else:
-                raise Exception(f"Failed to remove pointer from type {in_type.dstr()}")
+        if work_type.is_ptr():
+            if work_type.remove_ptr_or_array():
+                return self.convert_to_simple_type(work_type, True)
+            raise Exception(f"Failed to remove pointer from type {work_type.dstr()}")
 
         # gets the width of the type in bytes
-        size = in_type.get_size()
+        size = work_type.get_size()
 
         if size in [1, 2, 4, 8, 16]:
-            if in_type.is_integral():
+            if work_type.is_integral():
                 # if signed gets iXX, if unsigned gets uXX (e.g. i8, u16)
-                out_type = self._type_cache[
-                    f"{'i' if in_type.is_signed() else 'u'}{size * 8}"
-                ].type
-            elif in_type.is_float():
-                out_type = self._type_cache[f"f{size * 8}"].type
+                out_type = ida_typeinf.tinfo_t(
+                    self._type_cache[
+                        f"{'i' if work_type.is_signed() else 'u'}{size * 8}"
+                    ].type
+                )
+            elif work_type.is_float():
+                out_type = ida_typeinf.tinfo_t(self._type_cache[f"f{size * 8}"].type)
             else:
-                return in_type
+                return work_type
         else:
-            return in_type
+            return work_type
 
         if was_pointer:
-            out_type.create_ptr(out_type)
+            pointer_tinfo = ida_typeinf.tinfo_t()
+            pointer_tinfo.create_ptr(out_type)
+            return pointer_tinfo
 
         return out_type
 
     def get_ptr(self):
+        return ida_typeinf.tinfo_t(self.get_ptr_type().ptr)
+        
+    def get_ptr_type(self):
         if self.width == 8:
-            return self._type_cache["u64"].ptr
+            return self._type_cache["u64"]
         elif self.width == 4:
-            return self._type_cache["u32"].ptr
+            return self._type_cache["u32"]
         else:
             raise Exception("Unsupported architecture")
 
@@ -250,3 +263,35 @@ class Types:
 
 
 types = Types()
+
+
+def create_type(name: str, declaration: str) -> bool:
+    """
+    Creates a new type in the IDA database.
+
+    :param str name: The name of the type to create.
+    :param str declaration: The declaration of the type to create.
+    :return bool: True if the type was created successfully, False otherwise.
+    """
+    tif = ida_typeinf.tinfo_t()
+    if tif.get_named_type(None, name):
+        log_error(f"Type with name '{name}' already exists")
+        return False
+    ida_typeinf.idc_parse_types(declaration, 0)
+    if not tif.get_named_type(None, name):
+        log_error(f"Failed to create type '{name}'")
+        return False
+    return True
+
+
+def import_type(name):
+    """
+    Imports a type from a library into the IDA database.
+
+    :param str name: The name of the type to import.
+    :return int: The ordinal number of the imported type.
+    """
+    last_ordinal = ida_typeinf.get_ordinal_count(ida_typeinf.get_idati())
+    type_id = idc.import_type(-1, name)  # tid_t
+    if type_id != ida_typeinf.BADORD:
+        return last_ordinal

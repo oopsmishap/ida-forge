@@ -1,41 +1,38 @@
-import importlib
-import os
-from pathlib import Path
-
 from forge.api import cache
-from forge.api.ui_actions import UIActionManager
 from forge.api.hooks import HexRaysHookManager
+from forge.api.ui_actions import UIActionManager
 from forge.feature_manager import FeatureManager
-from forge.util.logging import *
+from forge.menu import load_menu_modules
+from forge.util.logging import log_debug
 
 
 class ForgeCore:
     def __init__(self):
-        log_debug("Initializing Forge")
-        self._menu_root = Path(__file__).parent / "menu"
-        self._loaded_features = []
+        """Create the plugin core and its shared managers."""
         self._feature_manager = FeatureManager()
+        self._ui_action_manager = UIActionManager.get()
+        self._hook_manager = HexRaysHookManager.get()
 
     def load(self):
+        """Initialize plugin state and register actions/hooks."""
         log_debug("Loading Forge")
         cache.initialize_cache()
         self._feature_manager.load_features()
-        UIActionManager.get().initialize()
-        HexRaysHookManager.get().initialize()
         self._load_menu()
+        self._ui_action_manager.initialize()
+        self._hook_manager.initialize()
 
-    def unload(self):
+    def show_menu(self) -> bool:
+        """Attach registered actions to IDA's menu bar when the UI is ready."""
+        return self._ui_action_manager.show_menu()
+
+    def unload(self) -> None:
+        """Unregister UI actions and hooks."""
         log_debug("Unloading Forge")
-        UIActionManager.get().finalize()
-        HexRaysHookManager.get().finalize()
+        self._ui_action_manager.finalize()
+        self._hook_manager.finalize()
 
-    def _load_menu(self):
-        # TODO: This is a bit of a hack, we should probably just have a
-        #       menu.py file that we import and then register the menu
-        log_debug(f"Loading menu items from: {self._menu_root}")
-        for item in os.listdir(self._menu_root):
-            feature_path = self._menu_root / item
-            if not os.path.isdir(feature_path):
-                module_name = f"forge.menu.{item[:-3]}"
-                log_debug(f"Loading menu item: {module_name}")
-                importlib.import_module(module_name)
+    @staticmethod
+    def _load_menu() -> None:
+        """Import menu modules so their actions register with the action manager."""
+        load_menu_modules()
