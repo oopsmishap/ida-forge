@@ -1,10 +1,14 @@
-# standalone ui helper classes / functions
+"""Shared Qt/IDA UI helpers."""
+
+from __future__ import annotations
 
 import ida_kernwin
-from PyQt5 import QtWidgets, QtCore
+from PyQt5 import QtCore, QtWidgets
 
 
 class Choose(ida_kernwin.Choose):
+    """Minimal configurable wrapper around `ida_kernwin.Choose`."""
+
     title = ""
     cols = []
     icon = -1
@@ -29,7 +33,7 @@ class ClickableQLabel(QtWidgets.QLabel):
     doubleClicked = QtCore.pyqtSignal()
 
     def __init__(self, parent=None):
-        QtWidgets.QLabel.__init__(self, parent)
+        super().__init__(parent)
 
     def mousePressEvent(self, ev):
         self.clicked.emit()
@@ -42,7 +46,7 @@ class EnterPressQTableWidget(QtWidgets.QTableWidget):
     cellEnterPressed = QtCore.pyqtSignal(int, int)
 
     def __init__(self, parent=None):
-        super(EnterPressQTableWidget, self).__init__(parent)
+        super().__init__(parent)
 
     def keyPressEvent(self, event):
         if event.key() in [QtCore.Qt.Key_Return, QtCore.Qt.Key_Enter]:
@@ -51,13 +55,17 @@ class EnterPressQTableWidget(QtWidgets.QTableWidget):
             if row >= 0 and column >= 0:
                 self.cellEnterPressed.emit(row, column)
                 return
-        super(EnterPressQTableWidget, self).keyPressEvent(event)
+        super().keyPressEvent(event)
 
 def set_row_background_color(table, row, color):
     for i in range(table.columnCount()):
-        table.item(row, i).setBackground(color)
+        item = table.item(row, i)
+        if item is not None:
+            item.setBackground(color)
 
 
 def set_row_foreground_color(table, row, color):
     for i in range(table.columnCount()):
-        table.item(row, i).setForeground(color)
+        item = table.item(row, i)
+        if item is not None:
+            item.setForeground(color)
