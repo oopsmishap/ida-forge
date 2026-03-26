@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import re
 from collections import defaultdict
 from typing import Optional
@@ -7,7 +9,6 @@ import ida_bytes
 import ida_funcs
 import ida_hexrays
 import ida_kernwin
-import idaapi
 import ida_name
 import ida_segment
 import ida_typeinf
@@ -81,6 +82,59 @@ def _parse_idc_decl_attempt(declaration: str) -> Optional[ida_typeinf.tinfo_t]:
     return tinfo
 
 
+def _build_pointer_tinfo(base_declaration: str, pointer_depth: int) -> Optional[ida_typeinf.tinfo_t]:
+    base_tinfo = parse_user_tinfo(base_declaration)
+    if base_tinfo is None:
+        return None
+
+    resolved_tinfo = ida_typeinf.tinfo_t(base_tinfo)
+    for _ in range(pointer_depth):
+        pointer_tinfo = ida_typeinf.tinfo_t()
+        pointer_tinfo.create_ptr(resolved_tinfo)
+        resolved_tinfo = pointer_tinfo
+    return resolved_tinfo
+
+
+def _build_array_tinfo(base_declaration: str, element_count: int) -> Optional[ida_typeinf.tinfo_t]:
+    if element_count <= 0:
+        return None
+
+    base_tinfo = parse_user_tinfo(base_declaration)
+    if base_tinfo is None:
+        return None
+
+    array_data = ida_typeinf.array_type_data_t()
+    array_data.base = 0
+    array_data.elem_type = ida_typeinf.tinfo_t(base_tinfo)
+    array_data.nelems = element_count
+    array_tinfo = ida_typeinf.tinfo_t()
+    if array_tinfo.create_array(array_data):
+        return array_tinfo
+    return None
+
+
+def _parse_named_like_type(normalized: str) -> Optional[ida_typeinf.tinfo_t]:
+    array_match = re.fullmatch(
+        r"(?P<base>.+?)\s*\[\s*(?P<count>0x[0-9a-fA-F]+|\d+)\s*\]",
+        normalized,
+    )
+    if array_match:
+        return _build_array_tinfo(
+            array_match.group("base"),
+            int(array_match.group("count"), 0),
+        )
+
+    pointer_match = re.fullmatch(r"(?P<base>.+?)(?P<pointers>(?:\s*\*\s*)+)", normalized)
+    if pointer_match:
+        pointer_depth = pointer_match.group("pointers").count("*")
+        return _build_pointer_tinfo(pointer_match.group("base").strip(), pointer_depth)
+
+    named_type = ida_typeinf.tinfo_t()
+    if named_type.get_named_type(ida_typeinf.get_idati(), normalized):
+        return named_type
+    return None
+
+
 def parse_user_tinfo(declaration: str) -> Optional[ida_typeinf.tinfo_t]:
     normalized = normalize_type_declaration(declaration)
     attempts = [
@@ -93,9 +147,9 @@ def parse_user_tinfo(declaration: str) -> Optional[ida_typeinf.tinfo_t]:
         if tinfo is not None:
             return tinfo
 
-    named_type = ida_typeinf.tinfo_t()
-    if named_type.get_named_type(ida_typeinf.get_idati(), normalized):
-        return named_type
+    named_like_tinfo = _parse_named_like_type(normalized)
+    if named_like_tinfo is not None:
+        return named_like_tinfo
 
     for attempt in attempts:
         tinfo = _parse_idc_decl_attempt(attempt)
@@ -126,7 +180,7 @@ class AbstractMember:
         self.invalidate_score()
 
     def activate(self):
-        pass
+        raise NotImplementedError
 
     def set_enabled(self, enabled):
         self.enabled = enabled
@@ -294,7 +348,7 @@ class Member(AbstractMember):
             udt_member.type = array_tinfo
         udt_member.offset = self.offset - offset
         udt_member.cmt = self.comment
-        udt_member.size = self.size
+        udt_member.size = self.size * array_size if array_size else self.size
         return udt_member
 
     def activate(self):
@@ -332,7 +386,7 @@ class VoidMember(Member):
         return True
 
     def switch_array_flag(self):
-        pass
+        return None
 
     def set_enabled(self, enabled) -> None:
         self.enabled = enabled
@@ -344,6 +398,28 @@ class VirtualFunction:
         self.offset = offset
         self.vtable_name = table_name
         self.visited = False
+
+    @staticmethod
+    def _is_generated_name(name: str) -> bool:
+        return name.startswith(("sub_", "nullsub_", "j_sub_", "unknown_libname_"))
+
+    def try_rename(self) -> None:
+        desired_name = self._def_generate_vfunc_name()
+        current_name = ida_funcs.get_func_name(self.address)
+        if current_name == desired_name:
+            return
+        if not current_name or not self._is_generated_name(current_name):
+            return
+
+        existing_ea = ida_name.get_name_ea(idaapi.BADADDR, desired_name)
+        if existing_ea not in (idaapi.BADADDR, self.address):
+            log_debug(
+                "Skipping vtable function rename "
+                f"{hex(self.address)} -> {desired_name}: name already used at {hex(existing_ea)}"
+            )
+            return
+
+        ida_name.set_name(self.address, desired_name)
 
     def get_ptr_tinfo(self):
         ptr_tinfo = ida_typeinf.tinfo_t()
@@ -442,7 +518,7 @@ class VirtualTable(AbstractMember):
                 virtual_function = VirtualFunction(
                     ptr, address - self.address, self.vtable_name
                 )
-                ida_name.set_name(ptr, virtual_function.name)
+                virtual_function.try_rename()
                 self.virtual_functions.append(virtual_function)
             elif is_imported(ptr):
                 virtual_function = ImportedVirtualFunction(ptr, address - self.address)
@@ -563,8 +639,9 @@ class VirtualTable(AbstractMember):
         if tid != idaapi.BADADDR:
             udt_member.name = self.name
 
-            tmp_tinfo = idaapi.create_typedef(self.vtable_name)
-            tmp_tinfo.create_ptr(tmp_tinfo)
+            base_tinfo = idaapi.create_typedef(self.vtable_name)
+            tmp_tinfo = ida_typeinf.tinfo_t()
+            tmp_tinfo.create_ptr(base_tinfo)
 
             udt_member.type = tmp_tinfo
             udt_member.offset = self.offset - offset
@@ -580,7 +657,7 @@ class VirtualTable(AbstractMember):
         return False
 
     def switch_array_flag(self):
-        pass
+        return None
 
     @staticmethod
     def is_virtual_table(address: int) -> int:

@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from typing import Dict, Tuple
+from typing import Dict, Optional, Tuple
 
 import ida_ida
 import ida_typeinf
@@ -185,8 +185,10 @@ class Types:
         # TODO: add any more types that are needed
 
     def convert_to_simple_type(
-        self, in_type: ida_typeinf.tinfo_t, was_pointer: bool = False
-    ) -> ida_typeinf.tinfo_t:
+        self,
+        in_type: Optional[ida_typeinf.tinfo_t],
+        was_pointer: bool = False,
+    ) -> Optional[ida_typeinf.tinfo_t]:
         """
         Convert a type to a simple type (i.e. remove any pointers, arrays, etc.).
 
@@ -194,37 +196,44 @@ class Types:
         :param was_pointer: Flag to indicate if the type was a pointer.
         :return: The converted type.
         """
+        if in_type is None:
+            return None
+
+        work_type = ida_typeinf.tinfo_t(in_type)
         out_type = ida_typeinf.tinfo_t()
 
-        if in_type.is_ptr():
-            if in_type.remove_ptr_or_array():
-                return self.convert_to_simple_type(in_type, True)
-            else:
-                raise Exception(f"Failed to remove pointer from type {in_type.dstr()}")
+        if work_type.is_ptr():
+            if work_type.remove_ptr_or_array():
+                return self.convert_to_simple_type(work_type, True)
+            raise Exception(f"Failed to remove pointer from type {work_type.dstr()}")
 
         # gets the width of the type in bytes
-        size = in_type.get_size()
+        size = work_type.get_size()
 
         if size in [1, 2, 4, 8, 16]:
-            if in_type.is_integral():
+            if work_type.is_integral():
                 # if signed gets iXX, if unsigned gets uXX (e.g. i8, u16)
-                out_type = self._type_cache[
-                    f"{'i' if in_type.is_signed() else 'u'}{size * 8}"
-                ].type
-            elif in_type.is_float():
-                out_type = self._type_cache[f"f{size * 8}"].type
+                out_type = ida_typeinf.tinfo_t(
+                    self._type_cache[
+                        f"{'i' if work_type.is_signed() else 'u'}{size * 8}"
+                    ].type
+                )
+            elif work_type.is_float():
+                out_type = ida_typeinf.tinfo_t(self._type_cache[f"f{size * 8}"].type)
             else:
-                return in_type
+                return work_type
         else:
-            return in_type
+            return work_type
 
         if was_pointer:
-            out_type.create_ptr(out_type)
+            pointer_tinfo = ida_typeinf.tinfo_t()
+            pointer_tinfo.create_ptr(out_type)
+            return pointer_tinfo
 
         return out_type
 
     def get_ptr(self):
-        return self.get_ptr_type().ptr
+        return ida_typeinf.tinfo_t(self.get_ptr_type().ptr)
         
     def get_ptr_type(self):
         if self.width == 8:

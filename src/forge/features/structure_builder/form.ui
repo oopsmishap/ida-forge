@@ -157,7 +157,7 @@
           </widget>
          </item>
          <item>
-          <widget class="QTextEdit" name="txt_name">
+          <widget class="QLineEdit" name="input_name">
            <property name="sizePolicy">
             <sizepolicy hsizetype="Expanding" vsizetype="Fixed">
              <horstretch>0</horstretch>
@@ -285,7 +285,7 @@
          <number>1</number>
         </property>
         <item row="0" column="5">
-         <widget class="QPushButton" name="pushButton_7">
+         <widget class="QPushButton" name="btn_view_scanned_uses">
           <property name="sizePolicy">
            <sizepolicy hsizetype="Minimum" vsizetype="Fixed">
             <horstretch>0</horstretch>
@@ -304,21 +304,21 @@
          </widget>
         </item>
         <item row="0" column="2">
-         <widget class="QPushButton" name="pushButton_5">
+         <widget class="QPushButton" name="btn_enable_rows">
           <property name="text">
            <string>Enable</string>
           </property>
          </widget>
         </item>
         <item row="2" column="2">
-         <widget class="QPushButton" name="pushButton_6">
+         <widget class="QPushButton" name="btn_disable_rows">
           <property name="text">
            <string>Disable</string>
           </property>
          </widget>
         </item>
         <item row="0" column="0">
-         <widget class="QPushButton" name="pushButton_3">
+         <widget class="QPushButton" name="btn_auto_resolve">
           <property name="sizePolicy">
            <sizepolicy hsizetype="Minimum" vsizetype="Fixed">
             <horstretch>0</horstretch>
@@ -331,7 +331,7 @@
          </widget>
         </item>
         <item row="2" column="1">
-         <widget class="QPushButton" name="pushButton_4">
+         <widget class="QPushButton" name="btn_toggle_array">
           <property name="text">
            <string>Array</string>
           </property>
@@ -354,48 +354,62 @@
          </spacer>
         </item>
         <item row="2" column="5">
-         <widget class="QPushButton" name="pushButton_8">
+         <widget class="QPushButton" name="btn_recognize_vtable">
           <property name="text">
            <string>Recognize VTable</string>
           </property>
          </widget>
         </item>
         <item row="2" column="0">
-         <widget class="QPushButton" name="pushButton">
+         <widget class="QPushButton" name="btn_set_origin">
           <property name="text">
            <string>Set Origin</string>
           </property>
          </widget>
         </item>
         <item row="0" column="1">
-         <widget class="QPushButton" name="pushButton_2">
+         <widget class="QPushButton" name="btn_create_type">
           <property name="text">
            <string>Create Type</string>
           </property>
          </widget>
         </item>
         <item row="0" column="3">
-         <widget class="QPushButton" name="pushButton_9">
+         <widget class="QPushButton" name="btn_remove_rows">
           <property name="text">
            <string>Remove</string>
           </property>
          </widget>
         </item>
         <item row="2" column="4">
-         <widget class="QPushButton" name="pushButton_11">
+         <widget class="QPushButton" name="btn_add_row">
           <property name="text">
            <string>Add Row</string>
           </property>
          </widget>
         </item>
         <item row="2" column="3">
-         <widget class="QPushButton" name="pushButton_10">
+         <widget class="QPushButton" name="btn_clear_rows">
           <property name="text">
            <string>Clear</string>
           </property>
          </widget>
         </item>
+        <item row="0" column="6">
+         <widget class="QPushButton" name="btn_edit_row">
+          <property name="text">
+           <string>Edit Row</string>
+          </property>
+         </widget>
+        </item>
        </layout>
+      </item>
+      <item>
+       <widget class="QLabel" name="lbl_summary">
+        <property name="text">
+         <string>No structure selected.</string>
+        </property>
+       </widget>
       </item>
      </layout>
     </widget>
@@ -443,6 +457,28 @@
    </property>
    <property name="shortcut">
     <string>F</string>
+   </property>
+  </action>
+  <action name="action_edit">
+   <property name="text">
+    <string>Edit Row</string>
+   </property>
+   <property name="toolTip">
+    <string>Edit the selected row</string>
+   </property>
+   <property name="shortcut">
+    <string>Ctrl+E</string>
+   </property>
+  </action>
+  <action name="action_add_row">
+   <property name="text">
+    <string>Add Row</string>
+   </property>
+   <property name="toolTip">
+    <string>Add a manual row</string>
+   </property>
+   <property name="shortcut">
+    <string>Insert</string>
    </property>
   </action>
  </widget>

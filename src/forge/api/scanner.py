@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Optional
 
+import ida_bytes
 import ida_funcs
 import ida_hexrays
 import idaapi
@@ -200,6 +201,55 @@ class ScanVisitor(ObjectVisitor):
     def _describe_tinfo(tinfo: Optional[ida_typeinf.tinfo_t]) -> str:
         return "<none>" if tinfo is None else tinfo.dstr()
 
+    @staticmethod
+    def _is_unknown_tinfo(tinfo: Optional[ida_typeinf.tinfo_t]) -> bool:
+        return (
+            tinfo is None
+            or tinfo.dstr() == "?"
+            or tinfo.get_size() == ida_typeinf.BADSIZE
+        )
+
+    @staticmethod
+    def _create_byte_array_tinfo(size: int) -> ida_typeinf.tinfo_t:
+        if size <= 1:
+            return ida_typeinf.tinfo_t(types["u8"].type)
+
+        array_data = ida_typeinf.array_type_data_t()
+        array_data.base = 0
+        array_data.elem_type = ida_typeinf.tinfo_t(types["u8"].type)
+        array_data.nelems = size
+
+        array_tinfo = ida_typeinf.tinfo_t()
+        array_tinfo.create_array(array_data)
+        return array_tinfo
+
+    def _infer_data_object_tinfo(
+        self,
+        obj_ea: int,
+        current_tinfo: Optional[ida_typeinf.tinfo_t],
+    ) -> Optional[ida_typeinf.tinfo_t]:
+        if not self._is_unknown_tinfo(current_tinfo):
+            return current_tinfo
+
+        guessed_tinfo = ida_typeinf.tinfo_t()
+        if ida_typeinf.guess_tinfo(guessed_tinfo, obj_ea):
+            if not self._is_unknown_tinfo(guessed_tinfo):
+                log_debug(
+                    f"Inferred object type from {to_hex(obj_ea)}: {guessed_tinfo.dstr()}"
+                )
+                return guessed_tinfo
+
+        item_size = ida_bytes.get_item_size(obj_ea)
+        if item_size > 0:
+            fallback_tinfo = self._create_byte_array_tinfo(item_size)
+            log_debug(
+                f"Falling back to sized byte array for {to_hex(obj_ea)}: "
+                f"{fallback_tinfo.dstr()}"
+            )
+            return fallback_tinfo
+
+        return current_tinfo
+
     def _get_parent_context(self) -> ParentExpressionContext:
         expressions = [parent.cexpr for parent in list(self.parents)[:0:-1]]
         return ParentExpressionContext(expressions)
@@ -252,17 +302,20 @@ class ScanVisitor(ObjectVisitor):
             if is_code(obj_ea):
                 func = decompile(obj_ea)
                 if func:
-                    tinfo = func.type
-                    tinfo.create_ptr(tinfo)
+                    func_tinfo = ida_typeinf.tinfo_t(func.type)
+                    tinfo = ida_typeinf.tinfo_t()
+                    tinfo.create_ptr(func_tinfo)
                 else:
-                    tinfo = types["func_t"].type
+                    tinfo = ida_typeinf.tinfo_t(types["func_t"].type)
                 from forge.api.members import Member
                 return Member(offset, tinfo, scan_obj, self._origin)
 
-        if tinfo is not None:
-            tinfo.clr_const()
+            tinfo = self._infer_data_object_tinfo(obj_ea, tinfo)
 
-        tinfo = types.convert_to_simple_type(tinfo)
+        if tinfo is not None:
+            tinfo = ida_typeinf.tinfo_t(tinfo)
+            tinfo.clr_const()
+            tinfo = types.convert_to_simple_type(tinfo)
 
         if not tinfo or tinfo.equals_to(types["void"].type):
             from forge.api.members import VoidMember
@@ -328,6 +381,14 @@ class ScanVisitor(ObjectVisitor):
             context.pop_front()
         else:
             offset = 0
+
+        if offset == 0 and (
+            first_parent is None or first_parent.op >= ctype.cit_empty
+        ):
+            log_debug(
+                f"Skipping bare expression {obj.name} with no member access context"
+            )
+            return None
 
         return self._extract_member(cexpr, obj, offset, context)
 

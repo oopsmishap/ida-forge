@@ -5,7 +5,7 @@ from forge.api.scan_object import GlobalVariableObject, ObjectType, ScanObject
 from forge.api.scanner import NewShallowScanVisitor, NewDeepScanVisitor
 from forge.api.visitor import FunctionTouchVisitor
 from forge.api.ui_actions import register_action, UIMenuAction, HexRaysPopupAction
-from forge.util.logging import *
+from forge.util.logging import log_warning
 from .config import config
 from .form import structure_form
 
@@ -17,18 +17,12 @@ class ShowStructureFormAction(UIMenuAction):
     tooltip = "Show the Structure Builder form"
     menu_path = ""  # Empty string means it will be a top-level menu item
 
-    def __init__(self):
-        super().__init__()
-
     def activate(self, ctx):
         structure_form.show()
         return 0
 
 
 class StructureBuilderAction(HexRaysPopupAction):
-    def __init__(self):
-        super().__init__()
-
     def create_scan_object(
         self, cfunc: ida_hexrays.cfunc_t, ctree_item: ida_hexrays.ctree_item_t
     ):
