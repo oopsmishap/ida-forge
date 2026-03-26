@@ -1,10 +1,12 @@
 import re
 from collections import defaultdict
+from typing import Optional
 
 import ida_auto
 import ida_bytes
 import ida_funcs
 import ida_hexrays
+import ida_kernwin
 import idaapi
 import ida_name
 import ida_segment
@@ -23,6 +25,85 @@ from forge.util.logging import *
 
 import forge.api.types as forge_types
 
+
+TYPE_DECL_ALIASES = {
+    "_BYTE": "u8",
+    "BYTE": "u8",
+    "byte": "u8",
+    "_WORD": "u16",
+    "WORD": "u16",
+    "word": "u16",
+    "_DWORD": "u32",
+    "DWORD": "u32",
+    "dword": "u32",
+    "_QWORD": "u64",
+    "QWORD": "u64",
+    "qword": "u64",
+    "_OWORD": "u128",
+    "OWORD": "u128",
+    "oword": "u128",
+    "BOOL": "bool",
+    "BOOLEAN": "bool",
+    "CHAR": "char",
+    "UCHAR": "u8",
+    "uchar": "u8",
+    "unsigned char": "u8",
+    "unsigned short": "u16",
+    "unsigned int": "u32",
+    "unsigned __int64": "u64",
+    "unsigned long long": "u64",
+}
+
+
+def normalize_type_declaration(declaration: str) -> str:
+    normalized = declaration.strip()
+    for source, target in TYPE_DECL_ALIASES.items():
+        normalized = re.sub(rf"\b{re.escape(source)}\b", target, normalized)
+    return normalized
+
+
+def _parse_decl_attempt(declaration: str) -> Optional[ida_typeinf.tinfo_t]:
+    tinfo = ida_typeinf.tinfo_t()
+    flags = ida_typeinf.PT_TYP | ida_typeinf.PT_SIL
+    if ida_typeinf.parse_decl(tinfo, None, declaration, flags):
+        return tinfo
+    return None
+
+
+def _parse_idc_decl_attempt(declaration: str) -> Optional[ida_typeinf.tinfo_t]:
+    result = idaapi.idc_parse_decl(ida_typeinf.get_idati(), declaration, idaapi.PT_TYP)
+    if result is None:
+        return None
+
+    _, type_bytes, field_bytes = result
+    tinfo = ida_typeinf.tinfo_t()
+    tinfo.deserialize(ida_typeinf.get_idati(), type_bytes, field_bytes, None)
+    return tinfo
+
+
+def parse_user_tinfo(declaration: str) -> Optional[ida_typeinf.tinfo_t]:
+    normalized = normalize_type_declaration(declaration)
+    attempts = [
+        normalized,
+        f"{normalized};",
+        f"{normalized} __forge_member;",
+    ]
+    for attempt in attempts:
+        tinfo = _parse_decl_attempt(attempt)
+        if tinfo is not None:
+            return tinfo
+
+    named_type = ida_typeinf.tinfo_t()
+    if named_type.get_named_type(ida_typeinf.get_idati(), normalized):
+        return named_type
+
+    for attempt in attempts:
+        tinfo = _parse_idc_decl_attempt(attempt)
+        if tinfo is not None:
+            return tinfo
+
+    return None
+
 class AbstractMember:
     def __init__(self, offset: int, scanned_variable, origin: int, tinfo=None):
         self.offset: int = offset
@@ -34,11 +115,15 @@ class AbstractMember:
         self.scanned_variables = {scanned_variable} if scanned_variable else set()
         self.tinfo: ida_typeinf.tinfo_t = tinfo
 
+    def invalidate_score(self) -> None:
+        self._score = 0
+
     def type_equals_to(self, tinfo: ida_typeinf.tinfo_t) -> bool:
         return self.tinfo.equals_to(tinfo)
 
     def switch_array_flag(self):
         self.is_array ^= True
+        self.invalidate_score()
 
     def activate(self):
         pass
@@ -46,6 +131,7 @@ class AbstractMember:
     def set_enabled(self, enabled):
         self.enabled = enabled
         self.is_array = False
+        self.invalidate_score()
 
     def has_collision(self, other):
         if self.offset <= other.offset:
@@ -158,6 +244,7 @@ class AbstractMember:
     def __eq__(self, other):
         if self.offset == other.offset and self.type_name == other.type_name:
             self.scanned_variables |= other.scanned_variables
+            self.invalidate_score()
             return True
         return False
 
@@ -196,28 +283,37 @@ class Member(AbstractMember):
             if self._is_name_aliased()
             else self.name
         )
-        udt_member.type = self.tinfo
+        udt_member.type = ida_typeinf.tinfo_t(self.tinfo)
         if array_size:
-            udt_member.type.create_array(array_size)
+            array_data = ida_typeinf.array_type_data_t()
+            array_data.base = 0
+            array_data.elem_type = ida_typeinf.tinfo_t(self.tinfo)
+            array_data.nelems = array_size
+            array_tinfo = ida_typeinf.tinfo_t()
+            array_tinfo.create_array(array_data)
+            udt_member.type = array_tinfo
         udt_member.offset = self.offset - offset
         udt_member.cmt = self.comment
         udt_member.size = self.size
         return udt_member
 
     def activate(self):
-        new_type_decl = ida_kernwin.ask_str(self.type_name, 0x100, "Enter type:")
-        if new_type_decl is None:
+        new_type_decl = ida_kernwin.ask_str(
+            self.type_name,
+            ida_kernwin.HIST_TYPE,
+            "Enter type:",
+        )
+        if not new_type_decl:
             return
 
-        result = ida_typeinf.parse_decl(new_type_decl, 0)
-        if result is None:
+        tinfo = parse_user_tinfo(new_type_decl)
+        if tinfo is None:
+            log_warning(f"Failed to parse type declaration: {new_type_decl}", True)
             return
 
-        _, tp, fld = result
-        tinfo = ida_typeinf.tinfo_t()
-        tinfo.deserialize(ida_typeinf.cvar.idati, tp, fld, None)
         self.tinfo = tinfo
         self.is_array = False
+        self.invalidate_score()
 
     def _is_name_aliased(self):
         return re.match(r"((i|u|f)(8|16|32|64|128|256|512|1024))|(field)_", self.name)

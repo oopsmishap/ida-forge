@@ -79,7 +79,7 @@ class ScannedObject:
     ) -> "ScannedObject":
         if obj.id == ObjectType.global_object:
             return ScannedGlobalObject(
-                obj.ea, obj.name, expression_address, origin, applicable
+                obj.object_ea, obj.name, expression_address, origin, applicable
             )
         if obj.id == ObjectType.local_variable:
             return ScannedVariableObject(

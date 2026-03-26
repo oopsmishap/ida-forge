@@ -100,7 +100,7 @@
          <string>&lt;html&gt;&lt;head/&gt;&lt;body&gt;&lt;p&gt;Remove selected structure from the list&lt;/p&gt;&lt;/body&gt;&lt;/html&gt;</string>
         </property>
         <property name="text">
-         <string>Remove Stucture</string>
+         <string>Remove Structure</string>
         </property>
        </widget>
       </item>
@@ -299,7 +299,7 @@
            </size>
           </property>
           <property name="text">
-           <string>View Scanned Variables</string>
+           <string>View Scanned Uses</string>
           </property>
          </widget>
         </item>
@@ -326,7 +326,7 @@
            </sizepolicy>
           </property>
           <property name="text">
-           <string>Finalize</string>
+           <string>Auto Resolve</string>
           </property>
          </widget>
         </item>
@@ -356,21 +356,21 @@
         <item row="2" column="5">
          <widget class="QPushButton" name="pushButton_8">
           <property name="text">
-           <string>Recongnize Structure</string>
+           <string>Recognize VTable</string>
           </property>
          </widget>
         </item>
         <item row="2" column="0">
          <widget class="QPushButton" name="pushButton">
           <property name="text">
-           <string>Origin</string>
+           <string>Set Origin</string>
           </property>
          </widget>
         </item>
         <item row="0" column="1">
          <widget class="QPushButton" name="pushButton_2">
           <property name="text">
-           <string>Pack</string>
+           <string>Create Type</string>
           </property>
          </widget>
         </item>
@@ -378,6 +378,13 @@
          <widget class="QPushButton" name="pushButton_9">
           <property name="text">
            <string>Remove</string>
+          </property>
+         </widget>
+        </item>
+        <item row="2" column="4">
+         <widget class="QPushButton" name="pushButton_11">
+          <property name="text">
+           <string>Add Row</string>
           </property>
          </widget>
         </item>

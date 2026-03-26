@@ -143,6 +143,28 @@ def get_funcs_calling_address(ea):
     return xrefs
 
 
+def get_funcs_referencing_address(ea: int) -> set[int]:
+    """
+    Returns a set of function start addresses that reference the specified address.
+
+    This is broader than `get_funcs_calling_address()` and includes functions that
+    read/write a global variable through code or data xrefs.
+    """
+    xrefs: set[int] = set()
+    xref = ida_xref.xrefblk_t()
+    if not xref.first_to(ea, ida_xref.XREF_ALL):
+        return xrefs
+
+    while True:
+        xref_func = ida_funcs.get_func(xref.frm)
+        if xref_func is not None:
+            xrefs.add(xref_func.start_ea)
+        if not xref.next_to():
+            break
+
+    return xrefs
+
+
 def get_member_name(tinfo: ida_typeinf.tinfo_t, offset: int) -> str:
     """
     Acquires the member name based on the given struct/union

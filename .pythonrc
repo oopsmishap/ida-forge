@@ -1,0 +1,4 @@
+
+# Disable bytecode cache to prevent __pycache__ from being created
+PYTHONDONTWRITEBYTECODE=1
+

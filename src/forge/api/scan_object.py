@@ -196,10 +196,10 @@ class GlobalVariableObject(ScanObject):
     """
 
     def __init__(self, object_address):
-        super(GlobalVariableObject, self).__init__()
-        self.ea = object_address
+        super().__init__()
+        self.object_ea = object_address
         self.id = ObjectType.global_object
-        log_debug(f"Creating GlobalVariableObject {self.ea}")
+        log_debug(f"Creating GlobalVariableObject {self.object_ea}")
 
     def is_target(self, cexpr: ida_hexrays.cexpr_t) -> bool:
         """
@@ -208,7 +208,7 @@ class GlobalVariableObject(ScanObject):
         :param cexpr: ida_hexrays.cexpr_t
         :return: returns True if expression is a global variable
         """
-        return cexpr.op == ctype.obj and self.ea == cexpr.obj_ea
+        return cexpr.op == ctype.obj and self.object_ea == cexpr.obj_ea
 
 
 class CallArgumentObject(ScanObject):

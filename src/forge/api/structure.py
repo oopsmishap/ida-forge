@@ -1,6 +1,7 @@
 import bisect
 import itertools
 
+import ida_kernwin
 import ida_typeinf
 import idaapi
 import idc
@@ -107,10 +108,24 @@ class Structure:
         next_enabled = self.get_next_enabled(idx)
         if next_enabled == -1:
             return 0
-        return (
-            self.members[next_enabled].offset
-            - self.members[idx].offset // self.members[idx].size
-        )
+        member = self.members[idx]
+        if member.size <= 0:
+            return 0
+        return (self.members[next_enabled].offset - member.offset) // member.size
+
+    def clear_members(self) -> None:
+        self.members.clear()
+        self.collisions.clear()
+        self.main_offset = 0
+
+    def set_main_offset(self, offset: int) -> None:
+        self.main_offset = offset
+
+    def get_main_offset_index(self) -> int:
+        for idx, member in enumerate(self.members):
+            if member.offset >= self.main_offset:
+                return idx
+        return 0
 
     def get_name(self):
         """
@@ -160,21 +175,27 @@ class Structure:
         if isinstance(indices, int):
             indices = [indices]
         for index in indices:
-            self.members[index].enabled = False
+            if 0 <= index < len(self.members):
+                self.members[index].set_enabled(False)
         self.refresh_collisions()
 
     def enable_members(self, indices):
         if isinstance(indices, int):
             indices = [indices]
         for index in indices:
-            self.members[index].enabled = True
+            if 0 <= index < len(self.members):
+                self.members[index].set_enabled(True)
         self.refresh_collisions()
 
     def remove_members(self, indices):
         if isinstance(indices, int):
             indices = [indices]
         for index in sorted(indices, reverse=True):
-            del self.members[index]
+            if 0 <= index < len(self.members):
+                removed_member = self.members[index]
+                del self.members[index]
+                if removed_member.offset == self.main_offset:
+                    self.main_offset = self.members[0].offset if self.members else 0
         self.refresh_collisions()
 
     def auto_resolve(self):
@@ -210,11 +231,15 @@ class Structure:
 
         self.refresh_collisions()
 
-    def pack_structure(self, start=0, end=None):
+    def pack_structure(self, start=None, end=None):
         """
         Pack the structure by removing all disabled members and reordering the remaining members
         :return: None
         """
+        if not self.members:
+            log_warning("Structure is empty", True)
+            return None
+
         self.refresh_collisions()
 
         struct_name = self.get_name()
@@ -227,11 +252,13 @@ class Structure:
 
         final_tinfo = ida_typeinf.tinfo_t()
         udt_data = ida_typeinf.udt_type_data_t()
-        origin = self.members[start].offset if start else 0
+        if start is None:
+            start = self.get_main_offset_index()
+        origin = self.members[start].offset if start < len(self.members) else 0
         offset = origin
 
         for idx, member in enumerate(self.members):
-            if member.enabled is False:
+            if idx < start or member.enabled is False or member.offset < origin:
                 continue
             gap_size = member.offset - offset
             if gap_size:
@@ -270,6 +297,7 @@ class Structure:
         )
         if not cdecl:
             log_warning("No type definition was provided", True)
+            return None
 
         return self.set_cdecl(cdecl, origin)
 
