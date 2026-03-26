@@ -1,1 +1,1 @@
-from .menu import *
+"""Forge package."""

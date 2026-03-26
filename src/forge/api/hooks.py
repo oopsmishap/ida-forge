@@ -1,19 +1,18 @@
-from typing import Dict
+from __future__ import annotations
 
 import ida_hexrays
 
-from forge.util.logging import *
+from forge.util.logging import log_debug
 from forge.util.singleton import Singleton
 
 
 class HexRaysHook(ida_hexrays.Hexrays_Hooks):
+    """Base class for Hex-Rays hooks registered by the plugin."""
+
     name: str = None
-    """
-    Base class for implementing Hex-Rays hooks.
-    """
 
     def __init__(self):
-        ida_hexrays.Hexrays_Hooks.__init__(self)
+        super().__init__()
 
 
 @Singleton
@@ -23,30 +22,23 @@ class HexRaysHookManager:
     """
 
     def __init__(self):
-        self._hooks: Dict[str, HexRaysHook] = {}
-        # register all HexRaysHook subclasses
+        self._hooks: dict[str, HexRaysHook] = {}
 
     def register(self, hook: HexRaysHook) -> None:
-        """
-        Registers a Hex-Rays hook.
-
-        :param hook: The hook to register.
-        """
+        """Register a Hex-Rays hook instance."""
+        if not hook.name:
+            raise ValueError("Hex-Rays hooks must define a name")
         self._hooks[hook.name] = hook
 
     def initialize(self):
-        """
-        Initializes the Hex-Rays hook manager.
-        """
+        """Hook every registered Hex-Rays handler."""
         for hook_name, hook in self._hooks.items():
             log_debug(f"Hooked handler: {hook_name}")
             hook.hook()
         log_debug("Initialized Hex-Rays hook manager")
 
     def finalize(self):
-        """
-        Finalizes the Hex-Rays hook manager.
-        """
+        """Unhook every registered Hex-Rays handler."""
         for hook_name, hook in self._hooks.items():
             hook.unhook()
             log_debug(f"Unhooked handler: {hook_name}")
@@ -72,13 +64,10 @@ class HexRaysHookManager:
         log_debug(f"Enabled handler: {hook_name}")
 
 
-def register_hook(hook) -> None:
-    """
-    Registers a Hex-Rays hook with the hook manager.
-
-    :param hook: The hook to register.
-    """
+def register_hook(hook: type[HexRaysHook]) -> type[HexRaysHook]:
+    """Decorator that instantiates and registers a Hex-Rays hook class."""
     hook_manager = HexRaysHookManager.get()
     instance = hook()
     hook_manager.register(instance)
-    log_debug(f"Registered hook: {hook.name}")
+    log_debug(f"Registered hook: {instance.name}")
+    return hook

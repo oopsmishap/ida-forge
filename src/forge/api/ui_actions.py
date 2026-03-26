@@ -1,37 +1,33 @@
+from __future__ import annotations
+
 import re
-from typing import List
+from typing import TypeVar
 
 import ida_hexrays
 import ida_kernwin
 
-from forge.api.ui import main_menu
+from forge.plugin import PLUGIN_ACTIONS_PREFIX, PLUGIN_NAME
+from forge.util.logging import log_debug, log_warning
 from forge.util.singleton import Singleton
-from forge.util.logging import *
+
+
+TAction = TypeVar("TAction")
 
 
 @Singleton
 class UIActionManager:
-    """
-    A singleton class to manage all actions in the plugin.
-    """
+    """Manage plugin actions, popup hooks, and top-level menu attachment."""
 
     def __init__(self):
-        """
-        Constructs a new UIActionManager object.
-        """
-        self._actions: List[UIAction] = []
-        self._popup_actions: List[HexraysPopupRequestHandler] = []
-        self._menu_actions: List[UIMenuAction] = []
-        self._parent_menu = main_menu()
+        self._actions: list[UIAction] = []
+        self._popup_actions: list[HexraysPopupRequestHandler] = []
+        self._menu_actions: list[UIMenuAction] = []
+        self._main_menu_name = f"{PLUGIN_ACTIONS_PREFIX}_menu"
         self._main_menu_created = False
-        self._main_menu = None
+        self._attached_menu_actions: set[str] = set()
 
-    def register(self, action):
-        """
-        Registers the specified action.
-
-        :param action: The action to register.
-        """
+    def register(self, action: UIAction | UIMenuAction) -> None:
+        """Register an action instance with the appropriate internal list."""
         if isinstance(action, UIMenuAction):
             self._menu_actions.append(action)
         elif isinstance(action, HexRaysPopupAction):
@@ -42,27 +38,23 @@ class UIActionManager:
         else:
             raise TypeError(f"Unsupported action type: {type(action)}")
 
-    def initialize(self):
-        """
-        Initializes all actions registered with the manager.
-        """
-        # register all actions with IDA
+    def initialize(self) -> None:
+        """Register actions with IDA and install popup hooks."""
         for action in self._actions:
-            ida_kernwin.register_action(
+            self._register_action(
                 ida_kernwin.action_desc_t(
-                    action.name, action.description, action, action.hotkey
+                    action.name,
+                    action.description,
+                    action,
+                    action.hotkey,
                 )
             )
-        # install hexrays hooks for popup actions
+
         for popup_action in self._popup_actions:
             popup_action.hook()
-        # register all menu actions with IDA
+
         for menu_action in self._menu_actions:
-            # if this is the first menu action, create the main menu
-            if not self._main_menu_created:
-                self._main_menu = self._parent_menu.addMenu(PLUGIN_NAME)
-                self._main_menu_created = True
-            ida_kernwin.register_action(
+            self._register_action(
                 ida_kernwin.action_desc_t(
                     menu_action.id,
                     menu_action.name,
@@ -71,68 +63,113 @@ class UIActionManager:
                     menu_action.tooltip,
                 )
             )
-            ida_kernwin.attach_action_to_menu(menu_action.menu_path, menu_action.id, 0)
-        log_debug("Initialized Hex-Rays action manager")
 
-    def finalize(self):
-        """
-        Finalizes all actions registered with the manager.
-        """
-        # unregister all actions with IDA
-        [ida_kernwin.unregister_action(action.name) for action in self._actions]
-        [popup_action.unhook() for popup_action in self._popup_actions]
+        log_debug("Initialized UI actions")
+
+    def show_menu(self) -> bool:
+        """Create the top-level menu and attach registered menu actions."""
+        if not self._ensure_main_menu():
+            return False
+
+        for menu_action in self._menu_actions:
+            self._attach_menu_action(menu_action)
+
+        return True
+
+    def finalize(self) -> None:
+        """Unregister actions and remove the plugin menu."""
+        for action in self._actions:
+            ida_kernwin.unregister_action(action.name)
+
+        for popup_action in self._popup_actions:
+            popup_action.unhook()
+
+        for menu_action in self._menu_actions:
+            ida_kernwin.unregister_action(menu_action.id)
+
         if self._main_menu_created:
-            [
-                ida_kernwin.unregister_action(menu_action.id)
-                for menu_action in self._menu_actions
-            ]
-            self._parent_menu.removeAction(self._main_menu.menuAction())
+            ida_kernwin.delete_menu(self._main_menu_name)
+
+        self._main_menu_created = False
+        self._attached_menu_actions.clear()
+
+    @staticmethod
+    def _register_action(action_desc: ida_kernwin.action_desc_t) -> None:
+        """Register a single action descriptor with IDA."""
+        ida_kernwin.register_action(action_desc)
+
+    def _ensure_main_menu(self) -> bool:
+        """Ensure the plugin's top-level menu exists."""
+        if self._main_menu_created:
+            return True
+
+        try:
+            self._main_menu_created = ida_kernwin.create_menu(
+                self._main_menu_name,
+                PLUGIN_NAME,
+            )
+        except Exception as e:
+            log_warning(f"Could not create menu '{PLUGIN_NAME}': {e}")
+            return False
+
+        if not self._main_menu_created:
+            log_warning(f"IDA rejected creation of menu '{PLUGIN_NAME}'")
+            return False
+
+        return True
+
+    def _attach_menu_action(self, menu_action: UIMenuAction) -> None:
+        """Attach a registered action to the plugin menu once."""
+        if menu_action.id in self._attached_menu_actions:
+            return
+
+        try:
+            attached = ida_kernwin.attach_action_to_menu(
+                menu_action.menu_path,
+                menu_action.id,
+                0,
+            )
+        except Exception as e:
+            log_warning(f"Could not attach action {menu_action.id}: {e}")
+            return
+
+        if not attached:
+            log_warning(f"IDA rejected menu attachment: {menu_action.id}")
+            return
+
+        self._attached_menu_actions.add(menu_action.id)
 
 
-def register_action(action):
-    """
-    Registers the specified action with the action manager.
-
-    :param action: The action to register.
-    """
+def register_action(action: type[TAction]) -> type[TAction]:
+    """Decorator that instantiates and registers an action class."""
     action_manager = UIActionManager.get()
     instance = action()
     action_manager.register(instance)
     log_debug(f"Registered action: {instance.name}")
+    return action
 
 
 class HexraysPopupRequestHandler(ida_hexrays.Hexrays_Hooks):
-    """
-    A class to add an action to the Hex-Rays popup menu.
-    """
+    """Attach a registered action to the Hex-Rays popup menu."""
 
-    def __init__(self, action):
-        """
-        Constructs a new HexraysPopupRequestHandler object.
-
-        :param action: The action to add to the popup menu.
-        """
+    def __init__(self, action: "HexRaysPopupAction"):
         super().__init__()
         self._action = action
 
     def populating_popup(self, widget, popup_handle, hx_view):
-        """
-        Populates the specified popup menu.
-
-        :param widget: The widget to attach the action to.
-        :param popup_handle: The handle to the popup menu.
-        :param hx_view: The hexrays_widget_t object.
-        :return: 0.
-        """
-        # check if the action should be added to the popup menu
         if self._action.check(hx_view):
             ida_kernwin.attach_action_to_popup(
-                widget, popup_handle, self._action.name, None
+                widget,
+                popup_handle,
+                self._action.name,
+                None,
             )
         return 0
 
 
 class UIMenuAction(ida_kernwin.action_handler_t):
+    """Base class for actions shown under the Forge top-level menu."""
+
     name: str = None
     tooltip: str = None
     menu_path: str = None
@@ -143,9 +180,7 @@ class UIMenuAction(ida_kernwin.action_handler_t):
         self.menu_path = (
             f"{PLUGIN_NAME}/{self.menu_path}" if self.menu_path else f"{PLUGIN_NAME}"
         )
-        # prepend the plugin name to the action id and replace any non-alphanumeric characters with underscores
         self.id = f"{PLUGIN_NAME}:{re.sub('[^A-Za-z0-9]+', '_', self.name)}"
-        log_debug(f"{self.name} loaded! id: {self.id}, menu_path: {self.menu_path}")
 
     def activate(self, ctx):
         raise NotImplementedError()
@@ -155,165 +190,41 @@ class UIMenuAction(ida_kernwin.action_handler_t):
 
 
 class UIAction(ida_kernwin.action_handler_t):
-    """
-    Convenience wrapper for creating custom IDA _actions. Inherits from ida_kernwin.action_handler_t and
-    adds a name property for easy registration with the UIActionManager.
-
-    This is an abstract base class that must be subclassed to implement the activate, check, and update methods.
-    """
+    """Base class for reusable IDA actions."""
 
     description: str = None
     hotkey: str = None
 
     def __init__(self):
-        """
-        Initializes an instance of the UIAction class.
-        """
         super().__init__()
-        log_debug(
-            f"{self.__class__.__name__} loaded! description: {self.description}, hotkey: {self.hotkey}"
-        )
 
     def activate(self, ctx):
-        """
-        Activate an action. This function implements the menu behavior of an action. It is called when the action
-        is triggered, from a menu, from a popup menu, from the toolbar, or programmatically.
-
-        :param ctx: ida_kernwin.action_update_ctx_t (C++ only).
-        :return: Non-zero value: all IDA windows will be refreshed.
-        """
         raise NotImplementedError()
 
     def check(self, hx_view: ida_hexrays.vdui_t):
-        """
-        Check whether the action should be available.
-
-        :param hx_view: ida_hexrays.vdui_t: HexRays view object.
-        :return: True if the action should be available, False otherwise.
-        """
         raise NotImplementedError()
 
     def update(self, ctx):
-        """
-        Update an action. This is called when the context of the UI changed, and we need to let the action update some
-        of its properties if needed (label, icon, ...). In addition, this lets IDA know whether the action is enabled,
-        and when it should be queried for availability again. Note: This callback is not meant to change anything in
-        the application's state, except by calling one (or many) of the "update_action_*()" functions on this very
-        action.
-
-        :param ctx: ida_kernwin.action_update_ctx_t (C++ only).
-        :return: UIAction name prefixed with plugin name.
-        """
         raise NotImplementedError()
 
     @property
-    def name(self):
-        """
-        Returns the name of the action.
-
-        :return: The name of the action prefixed with the plugin name.
-        """
+    def name(self) -> str:
         return f"{PLUGIN_NAME}:{self.__class__.__name__}"
 
 
 class HexRaysXrefAction(UIAction):
-    """
-    Wrapper around UIAction. Represents an action that can be added to the context menu after right-clicking in the
-    Hex-Rays window. Has a `check` method that should tell whether the action should be added to the context menu
-    when different members are right-clicked. Children of this class can also be fired by a hotkey without right-clicking
-    if one is provided in the `hotkey` static member.
-    """
-
-    def __init__(self):
-        """
-        Initializes an instance of the HexRaysXrefAction class.
-        """
-        super().__init__()
-
-    def activate(self, ctx):
-        """
-        Activates the action. This method is called when the action is triggered, from a menu, from a popup menu,
-        from the toolbar, or programmatically.
-
-        :param ctx: ida_kernwin.action_update_ctx_t (C++ only).
-        """
-        raise NotImplementedError()
-
-    def check(self, hx_view: ida_hexrays.vdui_t):
-        """
-        Checks whether the action should be added to the context menu when different members are right-clicked.
-
-        :param hx_view: ida_hexrays.vdui_t: HexRays view object.
-        :return: True if the action should be added to the context menu, False otherwise.
-        """
-        raise NotImplementedError()
+    """Action available in pseudocode and structure windows."""
 
     def update(self, ctx):
-        """
-        Updates the action. This method is called when the context of the UI changed, and we need to let the action
-        update some of its properties if needed (label, icon, ...). In addition, this lets IDA know whether the action
-        is enabled, and when it should be queried for availability again. Note: This callback is not meant to change
-        anything in the application's state, except by calling one (or many) of the "update_action_*()" functions on
-        this very action.
-
-        :param ctx: ida_kernwin.action_update_ctx_t (C++ only).
-        :return: A value that specifies whether the action is enabled or disabled for the current widget. This value
-            can be one of `ida_kernwin.AST_ENABLE`, `ida_kernwin.AST_ENABLE_FOR_WIDGET`, or
-            `ida_kernwin.AST_DISABLE_FOR_WIDGET`.
-        """
-        if (
-            ctx.widget_type == ida_kernwin.BWN_PSEUDOCODE
-            or ctx.widget_type == ida_kernwin.BWN_STRUCTS
-        ):
+        if ctx.widget_type in (ida_kernwin.BWN_PSEUDOCODE, ida_kernwin.BWN_STRUCTS):
             return ida_kernwin.AST_ENABLE_FOR_WIDGET
         return ida_kernwin.AST_DISABLE_FOR_WIDGET
 
 
 class HexRaysPopupAction(UIAction):
-    """
-    Wrapper around UIAction. Represents an action that can be added to the context menu after right-clicking in the
-    Hex-Rays window. Has a `check` method that should tell whether the action should be added to the context menu
-    when different members are right-clicked. Children of this class can also be fired by a hotkey without right-clicking
-    if one is provided in the `hotkey` static member.
-    """
-
-    def __init__(self):
-        """
-        Initializes an instance of the HexRaysPopupAction class.
-        """
-        super().__init__()
-
-    def activate(self, ctx):
-        """
-        Activates the action. This method is called when the action is triggered, from a menu, from a popup menu,
-        from the toolbar, or programmatically.
-
-        :param ctx: ida_kernwin.action_update_ctx_t (C++ only).
-        """
-        raise NotImplementedError()
-
-    def check(self, hx_view: ida_hexrays.vdui_t):
-        """
-        Checks whether the action should be added to the context menu when different members are right-clicked.
-
-        :param hx_view: ida_hexrays.vdui_t: HexRays view object.
-        :return: True if the action should be added to the context menu, False otherwise.
-        """
-        raise NotImplementedError()
+    """Action available from the Hex-Rays right-click popup."""
 
     def update(self, ctx):
-        """
-        Updates the action. This method is called when the context of the UI changed, and we need to let the action
-        update some of its properties if needed (label, icon, ...). In addition, this lets IDA know whether the action
-        is enabled, and when it should be queried for availability again. Note: This callback is not meant to change
-        anything in the application's state, except by calling one (or many) of the "update_action_*()" functions on
-        this very action.
-
-        :param ctx: ida_kernwin.action_update_ctx_t (C++ only).
-        :return: A value that specifies whether the action is enabled or disabled for the current widget. This value
-            can be one of `ida_kernwin.AST_ENABLE`, `ida_kernwin.AST_ENABLE_FOR_WIDGET`, or
-            `ida_kernwin.AST_DISABLE_FOR_WIDGET`.
-        """
         return (
             ida_kernwin.AST_ENABLE_FOR_WIDGET
             if ctx.widget_type == ida_kernwin.BWN_PSEUDOCODE

@@ -1,14 +1,17 @@
+from __future__ import annotations
+
 import sys
+
 import ida_hexrays
 import idaapi
 from ida_idp import IDP_INTERFACE_VERSION
 
 import forge
 from forge.core import ForgeCore as Core
-from forge.plugin import PLUGIN_COMMENT, PLUGIN_HELP
-from forge.util.logging import *
-from forge.util.versions import is_ida_version_supported, is_python_version_supported
+from forge.plugin import PLUGIN_COMMENT, PLUGIN_HELP, PLUGIN_NAME
+from forge.util.logging import log_debug, log_warning
 from forge.util.reload import recursive_reload
+from forge.util.versions import is_ida_version_supported, is_python_version_supported
 
 
 def PLUGIN_ENTRY():
@@ -16,7 +19,7 @@ def PLUGIN_ENTRY():
 
 
 class ForgePlugin(idaapi.plugin_t):
-    """IDAPython plugin structure."""
+    """IDA plugin entry point for Forge."""
 
     version: int = IDP_INTERFACE_VERSION
     flags: int = idaapi.PLUGIN_KEEP
@@ -25,9 +28,10 @@ class ForgePlugin(idaapi.plugin_t):
     wanted_name: str = PLUGIN_NAME
     wanted_hotkey: str = ""
 
-    _core: Core = None
+    _core: Core | None = None
+    _menu_timer = None
 
-    def init(self):
+    def init(self) -> int:
         if not is_python_version_supported():
             log_warning("Unsupported Python version")
             return idaapi.PLUGIN_SKIP
@@ -42,35 +46,70 @@ class ForgePlugin(idaapi.plugin_t):
 
         self._core = Core()
         self._core.load()
-
         sys.modules["__main__"].forge = self
 
         log_debug(f"{self.wanted_name} loaded successfully!")
+        self._show_menu_async()
 
         return idaapi.PLUGIN_KEEP
 
-    def run(self, arg):
-        log_warning(f"This plugin cannot be ran as a script")
+    def _show_menu_async(self) -> None:
+        """Attach the menu once IDA's UI is ready, retrying if needed."""
+        if self._core is None:
+            return
 
-    def term(self):
-        self._core.unload()
+        if self._core.show_menu():
+            self._clear_menu_timer()
+            return
+
+        if self._menu_timer is None:
+            self._menu_timer = idaapi.register_timer(250, self._retry_show_menu)
+
+    def _retry_show_menu(self) -> int:
+        if self._core is None:
+            self._menu_timer = None
+            return -1
+
+        if self._core.show_menu():
+            self._menu_timer = None
+            return -1
+
+        return 250
+
+    def _clear_menu_timer(self) -> None:
+        if self._menu_timer is None:
+            return
+
+        unregister_timer = getattr(idaapi, "unregister_timer", None)
+        if unregister_timer is not None:
+            unregister_timer(self._menu_timer)
+        self._menu_timer = None
+
+    def run(self, arg: int) -> None:
+        if self._core is None:
+            log_warning("Plugin not initialized yet")
+            return
+
+        self._core.show_menu()
+
+    def term(self) -> None:
+        self._clear_menu_timer()
+        if self._core is not None:
+            self._core.unload()
+            self._core = None
 
     @property
-    def core(self):
-        """
-        Makes the core instance accessible from within the global plugin instance.
-        :return: The core instance.
-        """
+    def core(self) -> Core | None:
+        """Return the active plugin core."""
         return self._core
 
-    def reload(self):
-        """
-        Hot-reloads the plugin.
-        """
+    def reload(self) -> None:
+        """Hot-reload the plugin modules and recreate the core."""
         log_debug(f"Reloading {self.wanted_name}")
 
-        self._core.unload()
-        del self._core
+        if self._core is not None:
+            self._core.unload()
+            self._core = None
 
         recursive_reload(forge)
 
@@ -80,3 +119,4 @@ class ForgePlugin(idaapi.plugin_t):
         self._core.load()
 
         log_debug(f"{self.wanted_name} reloaded successfully!")
+        self._show_menu_async()

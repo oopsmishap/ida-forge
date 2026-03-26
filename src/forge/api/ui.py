@@ -53,23 +53,6 @@ class EnterPressQTableWidget(QtWidgets.QTableWidget):
                 return
         super(EnterPressQTableWidget, self).keyPressEvent(event)
 
-
-def main_window():
-    tform = ida_kernwin.get_current_widget()
-
-    if not tform:
-        tform = ida_kernwin.find_widget("Output window")
-
-    widget = ida_kernwin.PluginForm.FormToPyQtWidget(tform)
-    window = widget.window()
-    return window
-
-
-def main_menu():
-    win = main_window()
-    return win.findChild(QtWidgets.QMenuBar)
-
-
 def set_row_background_color(table, row, color):
     for i in range(table.columnCount()):
         table.item(row, i).setBackground(color)
