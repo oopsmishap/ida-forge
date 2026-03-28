@@ -2,12 +2,21 @@ import re
 
 import ida_diskio
 import ida_kernwin
-from PyQt5 import QtWidgets, QtGui
-from PyQt5.QtGui import QFontDatabase
+
+from forge.util.qt import QtGui, QtWidgets
 
 from .templated_types import TemplatedTypes
+from .ui_form import Ui_templated_types_form
 
 from forge.util.logging import *
+
+QFontDatabase = QtGui.QFontDatabase
+
+
+class UI(QtWidgets.QWidget, Ui_templated_types_form):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setupUi(self)
 
 
 # noinspection PyArgumentList
@@ -15,12 +24,7 @@ class TemplatedTypesForm(ida_kernwin.PluginForm):
     def __init__(self):
         super().__init__()
         self._parent = None
-        self.type_list_label = None
-        self.stl_title_fields = None
-        self.stl_title_struct = None
-        self.stl_struct_view = None
-        self.stl_list = None
-        self.stl_widget = None
+        self.ui = None
         self.stl_form_layout = None
         self.template_types = TemplatedTypes()
 
@@ -29,113 +33,92 @@ class TemplatedTypesForm(ida_kernwin.PluginForm):
 
     def OnCreate(self, form):
         self._parent = self.FormToPyQtWidget(form)
+        layout = QtWidgets.QVBoxLayout(self._parent)
 
-        layout = QtWidgets.QGridLayout()
+        self.ui = UI(self._parent)
+        layout.addWidget(self.ui)
 
-        self.type_list_label = QtWidgets.QLabel(
-            f"Type List: {self.template_types.file_name}"
-        )
-        layout.addWidget(self.type_list_label, 0, 0)
-
-        self.stl_title_fields = QtWidgets.QLabel("Selected Type: ")
-        layout.addWidget(self.stl_title_fields, 0, 1)
-
-        self.stl_title_struct = QtWidgets.QLabel("Creating Type: ")
-        layout.addWidget(self.stl_title_struct, 0, 2)
-
-        self.stl_struct_view = QtWidgets.QTextEdit()
-        self.stl_struct_view.setReadOnly(True)
         font = QFontDatabase.systemFont(QFontDatabase.FixedFont)
         font.setPointSize(11)
-        # font = QtGui.QFont(QFontDatabase.FixedFont, 11)
-        self.stl_struct_view.setFont(font)
-        layout.addWidget(self.stl_struct_view, 1, 2)
+        self.ui.stl_struct_view.setFont(font)
 
-        self.stl_list = QtWidgets.QListWidget()
-        for item in self.template_types.keys:
-            self.stl_list.addItem(item)
-        self.stl_list.setFixedWidth(300)
-        self.stl_list.setCurrentRow(0)
-        self.stl_list.currentRowChanged.connect(self.update_form)
-        layout.addWidget(self.stl_list, 1, 0)
-
-        self.stl_widget = QtWidgets.QWidget()
-        layout.addWidget(self.stl_widget, 1, 1)
-
-        btn_reload_stl_list = QtWidgets.QPushButton("Reload Templated Types TOML")
-        btn_reload_stl_list.setFixedWidth(300)
-        btn_reload_stl_list.clicked.connect(self.reload_stl_list)
-        layout.addWidget(btn_reload_stl_list, 2, 0)
-
-        btn_open_stl_toml = QtWidgets.QPushButton("Open Templated Types TOML")
-        btn_reload_stl_list.setFixedWidth(300)
-        btn_open_stl_toml.clicked.connect(self.open_dialog_stl_file)
-        layout.addWidget(btn_open_stl_toml, 3, 0)
+        self.ui.btn_reload_stl_list.clicked.connect(self.reload_stl_list)
+        self.ui.btn_open_stl_toml.clicked.connect(self.open_dialog_stl_file)
+        self.ui.stl_list.currentRowChanged.connect(self.update_form)
 
         self.stl_form_layout = QtWidgets.QFormLayout()
+        self.ui.stl_widget.setLayout(self.stl_form_layout)
 
-        layout.setColumnStretch(1, 1)
-        layout.setColumnStretch(2, 1)
-
-        self._parent.setLayout(layout)
-
+        self.reload_stl_list()
+        if self.ui.stl_list.count() > 0:
+            self.ui.stl_list.setCurrentRow(0)
         self.update_form()
 
     def update_form(self):
-        # wrapped in a try/except, as exception is thrown when TOML is refreshed
+        if self.ui is None:
+            return
+
         try:
-            # get key and update title
-            key = self.stl_list.currentItem().text()
-            self.stl_title_fields.setText("Selected Type: {}".format(key))
-            types = self.template_types.get_types(key)
+            current_item = self.ui.stl_list.currentItem()
+            if current_item is None:
+                self.ui.stl_title_fields.setText("Selected Type: ")
+                self.ui.stl_title_struct.setText("Creating Type: ")
+                self.ui.stl_struct_view.clear()
+                return
 
-            # remove previous widgets from layout... QT needs to do this
-            for i in reversed(range(self.stl_form_layout.count())):
-                self.stl_form_layout.itemAt(i).widget().setParent(None)
+            key = current_item.text()
+            self.ui.stl_title_fields.setText(f"Selected Type: {key}")
+            types = self.template_types.get_types(key) or []
 
-            # for each template type we add a type & name field
+            while self.stl_form_layout.count():
+                item = self.stl_form_layout.takeAt(0)
+                widget = item.widget()
+                if widget is not None:
+                    widget.deleteLater()
+
             for t in types:
-                e1 = QtWidgets.QLineEdit()
-                e2 = QtWidgets.QLineEdit()
-                self.stl_form_layout.addRow(QtWidgets.QLabel("{0} Type".format(t)), e1)
-                self.stl_form_layout.addRow(QtWidgets.QLabel("{0} Name".format(t)), e2)
-                e1.textChanged.connect(lambda: self.reload_stl_struct(key))
-                e2.textChanged.connect(lambda: self.reload_stl_struct(key))
+                type_edit = QtWidgets.QLineEdit()
+                name_edit = QtWidgets.QLineEdit()
+                self.stl_form_layout.addRow(f"{t} Type", type_edit)
+                self.stl_form_layout.addRow(f"{t} Name", name_edit)
+                type_edit.textChanged.connect(lambda _text, k=key: self.reload_stl_struct(k))
+                name_edit.textChanged.connect(lambda _text, k=key: self.reload_stl_struct(k))
 
-            # add the button and apply layout to widget
             btn_set_type = QtWidgets.QPushButton("Create Type")
             self.stl_form_layout.addRow(btn_set_type)
-            self.stl_widget.setLayout(self.stl_form_layout)
+            btn_set_type.clicked.connect(lambda: self.create_stl_type(key))
 
             self.reload_stl_struct(key)
-
-            # connect a callback to the button
-            btn_set_type.clicked.connect(lambda: self.create_stl_type(key))
-        except:
+        except Exception:
             pass
 
     def reload_stl_list(self):
-        self.type_list_label.setText(f"Type List: {self.template_types.file_name}")
-        self.stl_list.clear()
+        if self.ui is None:
+            return
+
+        self.ui.type_list_label.setText(f"Type List: {self.template_types.file_name}")
+        self.ui.stl_list.clear()
         if self.template_types.reload_types():
             log_info(f"Opening: {self.template_types.file_path}")
             for item in self.template_types.keys:
-                self.stl_list.addItem(item)
+                self.ui.stl_list.addItem(item)
 
     def reload_stl_struct(self, key):
+        if self.ui is None:
+            return
+
         try:
             struct = self.template_types.get_struct(key)
             base_name = "Creating Type: " + self.template_types.get_base_name(key)
             args = self.get_stl_args(key)
-            self.stl_struct_view.setPlainText(struct.format(*args))
-            self.stl_title_struct.setText(base_name.format(*args))
-        except:
+            self.ui.stl_struct_view.setPlainText(struct.format(*args))
+            self.ui.stl_title_struct.setText(base_name.format(*args))
+        except Exception:
             pass
 
     def get_stl_args(self, key):
         args = ()
-        # collect text in the text boxes push into tuple
-        for w in self.stl_widget.findChildren(QtWidgets.QLineEdit):
+        for w in self.ui.stl_widget.findChildren(QtWidgets.QLineEdit):
             arg = w.text()
             if arg == "":
                 arg = "$void$"
@@ -149,7 +132,6 @@ class TemplatedTypesForm(ida_kernwin.PluginForm):
             if not re.match(r"^[a-zA-Z_]([\w_](::){0,2})+(?<!:)\**$", args[i]):
                 log_warning(f"Type name {args[i]} is an invalid type name", True)
                 return
-            # name line edit
             else:
                 if not re.match(r"^\w+$", args[i]):
                     log_warning(f"Type name {args[i]} is an invalid name", True)

@@ -2,16 +2,22 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import IntEnum
-from pathlib import Path
 from typing import Dict
 
 import ida_hexrays
 import ida_kernwin
 import idaapi
-from PyQt5 import QtWidgets, uic
-from PyQt5.QtCore import QSignalBlocker, Qt
-from PyQt5.QtGui import QColor
-from PyQt5.QtWidgets import QListWidgetItem, QMenu, QTableWidgetItem, QWidget
+
+from forge.util.qt import QtCore, QtGui, QtWidgets, qt_exec
+from .ui_form import Ui_view_form
+
+QSignalBlocker = QtCore.QSignalBlocker
+Qt = QtCore.Qt
+QColor = QtGui.QColor
+QListWidgetItem = QtWidgets.QListWidgetItem
+QMenu = QtWidgets.QMenu
+QTableWidgetItem = QtWidgets.QTableWidgetItem
+QWidget = QtWidgets.QWidget
 
 from forge.api.members import AbstractMember, Member, VirtualTable, parse_user_tinfo
 from forge.api.structure import Structure
@@ -38,11 +44,10 @@ class MemberEditorValues:
     is_array: bool
 
 
-class UI(QWidget):
+class UI(QWidget, Ui_view_form):
     def __init__(self, parent=None):
         super().__init__(parent)
-        filename = Path(__file__).resolve().parent / "form.ui"
-        uic.loadUi(str(filename), self)
+        self.setupUi(self)
 
 
 class ScannedVariableChooser(Choose):
@@ -384,7 +389,7 @@ class StructureBuilderForm(ida_kernwin.PluginForm):
         if item is not None:
             menu.addAction("Remove Structure", self.remove_structure)
 
-        menu.exec_(self.ui.lst_structures.mapToGlobal(point))
+        qt_exec(menu, self.ui.lst_structures.mapToGlobal(point))
 
     def list_selection_changed(self):
         item = self.ui.lst_structures.currentItem()
@@ -563,7 +568,7 @@ class StructureBuilderForm(ida_kernwin.PluginForm):
             title=title,
             values=self._default_editor_values(member),
         )
-        if dialog.exec_() != QtWidgets.QDialog.Accepted:
+        if qt_exec(dialog) != QtWidgets.QDialog.Accepted:
             return None
         return dialog.get_values()
 
@@ -858,7 +863,7 @@ class StructureBuilderForm(ida_kernwin.PluginForm):
         recognize_action.setEnabled(isinstance(self.get_selected_member(), VirtualTable))
         recognize_action.triggered.connect(self.structure_table_recognize)
 
-        menu.exec_(self.ui.tbl_structure.viewport().mapToGlobal(point))
+        qt_exec(menu, self.ui.tbl_structure.viewport().mapToGlobal(point))
 
 
 structure_form = StructureBuilderForm()
