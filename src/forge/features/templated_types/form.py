@@ -2,10 +2,8 @@ import re
 
 import ida_diskio
 import ida_kernwin
-
-from forge.util.qt import QtGui, QtWidgets
-
-QFontDatabase = QtGui.QFontDatabase
+from PyQt5 import QtWidgets, QtGui
+from PyQt5.QtGui import QFontDatabase
 
 from .templated_types import TemplatedTypes
 

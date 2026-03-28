@@ -2,21 +2,16 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import IntEnum
+from pathlib import Path
 from typing import Dict
 
 import ida_hexrays
 import ida_kernwin
 import idaapi
-
-from forge.util.qt import QtCore, QtGui, QtWidgets, qt_exec
-
-QSignalBlocker = QtCore.QSignalBlocker
-Qt = QtCore.Qt
-QColor = QtGui.QColor
-QListWidgetItem = QtWidgets.QListWidgetItem
-QMenu = QtWidgets.QMenu
-QTableWidgetItem = QtWidgets.QTableWidgetItem
-QWidget = QtWidgets.QWidget
+from PyQt5 import QtWidgets, uic
+from PyQt5.QtCore import QSignalBlocker, Qt
+from PyQt5.QtGui import QColor
+from PyQt5.QtWidgets import QListWidgetItem, QMenu, QTableWidgetItem, QWidget
 
 from forge.api.members import AbstractMember, Member, VirtualTable, parse_user_tinfo
 from forge.api.structure import Structure
@@ -46,161 +41,8 @@ class MemberEditorValues:
 class UI(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
-        self._build_ui()
-
-    def _build_ui(self) -> None:
-        self.setObjectName("view_form")
-
-        root_layout = QtWidgets.QHBoxLayout(self)
-        root_layout.setContentsMargins(1, 1, 1, 1)
-
-        left_frame = QtWidgets.QFrame(self)
-        left_frame.setObjectName("frm_left")
-        left_frame.setMinimumWidth(100)
-        left_frame.setMaximumWidth(180)
-        left_layout = QtWidgets.QVBoxLayout(left_frame)
-        left_layout.setSpacing(1)
-        left_layout.setContentsMargins(1, 1, 1, 1)
-
-        lbl_title = QtWidgets.QLabel("Structures", left_frame)
-        lbl_title.setObjectName("lbl_title")
-        lbl_title.setMinimumHeight(34)
-        left_layout.addWidget(lbl_title)
-
-        self.lst_structures = QtWidgets.QListWidget(left_frame)
-        self.lst_structures.setObjectName("lst_structures")
-        left_layout.addWidget(self.lst_structures)
-
-        self.btn_add = QtWidgets.QPushButton("Add Structure", left_frame)
-        self.btn_add.setObjectName("btn_add")
-        left_layout.addWidget(self.btn_add)
-
-        self.btn_remove = QtWidgets.QPushButton("Remove Structure", left_frame)
-        self.btn_remove.setObjectName("btn_remove")
-        left_layout.addWidget(self.btn_remove)
-
-        root_layout.addWidget(left_frame)
-
-        right_frame = QtWidgets.QFrame(self)
-        right_frame.setObjectName("frm_right")
-        right_layout = QtWidgets.QVBoxLayout(right_frame)
-        right_layout.setSpacing(1)
-        right_layout.setContentsMargins(1, 1, 1, 1)
-
-        header_frame = QtWidgets.QFrame(right_frame)
-        header_frame.setObjectName("frm_right_header")
-        header_layout = QtWidgets.QHBoxLayout(header_frame)
-        header_layout.setContentsMargins(5, 5, 5, 5)
-
-        lbl_name = QtWidgets.QLabel("Name:", header_frame)
-        lbl_name.setObjectName("lbl_name")
-        header_layout.addWidget(lbl_name)
-
-        self.input_name = QtWidgets.QLineEdit(header_frame)
-        self.input_name.setObjectName("input_name")
-        self.input_name.setMinimumHeight(23)
-        header_layout.addWidget(self.input_name, 1)
-
-        self.btn_apply_name = QtWidgets.QPushButton("Apply Name", header_frame)
-        self.btn_apply_name.setObjectName("btn_apply_name")
-        header_layout.addWidget(self.btn_apply_name)
-        right_layout.addWidget(header_frame)
-
-        self.tbl_structure = QtWidgets.QTableWidget(right_frame)
-        self.tbl_structure.setObjectName("tbl_structure")
-        self.tbl_structure.setColumnCount(5)
-        self.tbl_structure.setHorizontalHeaderLabels(
-            ["Offset", "Type", "Name", "Score", "Comment"]
-        )
-        self.tbl_structure.horizontalHeader().setStretchLastSection(True)
-        self.tbl_structure.verticalHeader().setStretchLastSection(False)
-        right_layout.addWidget(self.tbl_structure)
-
-        button_layout = QtWidgets.QGridLayout()
-        button_layout.setSpacing(1)
-
-        self.btn_auto_resolve = QtWidgets.QPushButton("Auto Resolve", right_frame)
-        self.btn_auto_resolve.setObjectName("btn_auto_resolve")
-        button_layout.addWidget(self.btn_auto_resolve, 0, 0)
-
-        self.btn_create_type = QtWidgets.QPushButton("Create Type", right_frame)
-        self.btn_create_type.setObjectName("btn_create_type")
-        button_layout.addWidget(self.btn_create_type, 0, 1)
-
-        self.btn_enable_rows = QtWidgets.QPushButton("Enable", right_frame)
-        self.btn_enable_rows.setObjectName("btn_enable_rows")
-        button_layout.addWidget(self.btn_enable_rows, 0, 2)
-
-        self.btn_remove_rows = QtWidgets.QPushButton("Remove", right_frame)
-        self.btn_remove_rows.setObjectName("btn_remove_rows")
-        button_layout.addWidget(self.btn_remove_rows, 0, 3)
-
-        button_layout.setColumnStretch(4, 1)
-
-        self.btn_view_scanned_uses = QtWidgets.QPushButton("View Scanned Uses", right_frame)
-        self.btn_view_scanned_uses.setObjectName("btn_view_scanned_uses")
-        self.btn_view_scanned_uses.setMinimumWidth(200)
-        button_layout.addWidget(self.btn_view_scanned_uses, 0, 5)
-
-        self.btn_edit_row = QtWidgets.QPushButton("Edit Row", right_frame)
-        self.btn_edit_row.setObjectName("btn_edit_row")
-        button_layout.addWidget(self.btn_edit_row, 0, 6)
-
-        self.btn_set_origin = QtWidgets.QPushButton("Set Origin", right_frame)
-        self.btn_set_origin.setObjectName("btn_set_origin")
-        button_layout.addWidget(self.btn_set_origin, 2, 0)
-
-        self.btn_toggle_array = QtWidgets.QPushButton("Array", right_frame)
-        self.btn_toggle_array.setObjectName("btn_toggle_array")
-        button_layout.addWidget(self.btn_toggle_array, 2, 1)
-
-        self.btn_disable_rows = QtWidgets.QPushButton("Disable", right_frame)
-        self.btn_disable_rows.setObjectName("btn_disable_rows")
-        button_layout.addWidget(self.btn_disable_rows, 2, 2)
-
-        self.btn_clear_rows = QtWidgets.QPushButton("Clear", right_frame)
-        self.btn_clear_rows.setObjectName("btn_clear_rows")
-        button_layout.addWidget(self.btn_clear_rows, 2, 3)
-
-        self.btn_add_row = QtWidgets.QPushButton("Add Row", right_frame)
-        self.btn_add_row.setObjectName("btn_add_row")
-        button_layout.addWidget(self.btn_add_row, 2, 4)
-
-        self.btn_recognize_vtable = QtWidgets.QPushButton("Recognize VTable", right_frame)
-        self.btn_recognize_vtable.setObjectName("btn_recognize_vtable")
-        button_layout.addWidget(self.btn_recognize_vtable, 2, 5)
-
-        right_layout.addLayout(button_layout)
-
-        self.lbl_summary = QtWidgets.QLabel("No structure selected.", right_frame)
-        self.lbl_summary.setObjectName("lbl_summary")
-        right_layout.addWidget(self.lbl_summary)
-
-        self.action_enable = QtGui.QAction("Enable Row", self)
-        self.action_enable.setObjectName("action_enable")
-        self.action_enable.setShortcut("E")
-
-        self.action_disable = QtGui.QAction("Disable Row", self)
-        self.action_disable.setObjectName("action_disable")
-        self.action_disable.setShortcut("D")
-
-        self.action_resolve = QtGui.QAction("Auto Resolve", self)
-        self.action_resolve.setObjectName("action_resolve")
-        self.action_resolve.setShortcut("R")
-
-        self.action_finalize = QtGui.QAction("Finalize", self)
-        self.action_finalize.setObjectName("action_finalize")
-        self.action_finalize.setShortcut("F")
-
-        self.action_edit = QtGui.QAction("Edit Row", self)
-        self.action_edit.setObjectName("action_edit")
-        self.action_edit.setShortcut("Ctrl+E")
-
-        self.action_add_row = QtGui.QAction("Add Row", self)
-        self.action_add_row.setObjectName("action_add_row")
-        self.action_add_row.setShortcut("Insert")
-
-        root_layout.addWidget(right_frame, 1)
+        filename = Path(__file__).resolve().parent / "form.ui"
+        uic.loadUi(str(filename), self)
 
 
 class ScannedVariableChooser(Choose):
@@ -542,7 +384,7 @@ class StructureBuilderForm(ida_kernwin.PluginForm):
         if item is not None:
             menu.addAction("Remove Structure", self.remove_structure)
 
-        qt_exec(menu, self.ui.lst_structures.mapToGlobal(point))
+        menu.exec_(self.ui.lst_structures.mapToGlobal(point))
 
     def list_selection_changed(self):
         item = self.ui.lst_structures.currentItem()
@@ -721,7 +563,7 @@ class StructureBuilderForm(ida_kernwin.PluginForm):
             title=title,
             values=self._default_editor_values(member),
         )
-        if qt_exec(dialog) != QtWidgets.QDialog.Accepted:
+        if dialog.exec_() != QtWidgets.QDialog.Accepted:
             return None
         return dialog.get_values()
 
@@ -1016,7 +858,7 @@ class StructureBuilderForm(ida_kernwin.PluginForm):
         recognize_action.setEnabled(isinstance(self.get_selected_member(), VirtualTable))
         recognize_action.triggered.connect(self.structure_table_recognize)
 
-        qt_exec(menu, self.ui.tbl_structure.viewport().mapToGlobal(point))
+        menu.exec_(self.ui.tbl_structure.viewport().mapToGlobal(point))
 
 
 structure_form = StructureBuilderForm()

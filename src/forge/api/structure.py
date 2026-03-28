@@ -8,8 +8,7 @@ from typing import Iterator, Sequence
 
 import ida_kernwin
 import ida_typeinf
-
-from forge.util.qt import QtWidgets
+from PyQt5 import QtWidgets
 
 import forge.api.types as forge_types
 from forge.api.hexrays import create_udt_padding_member
