@@ -242,6 +242,8 @@ class CallArgumentObject(ScanObject):
         :param cexpr: ida_hexrays.cexpr_t
         :return: a ScanObject representing the argument expression
         """
+        if self.arg_idx < 0 or self.arg_idx >= len(cexpr.a):
+            return None
         e = cexpr.a[self.arg_idx]
         while e.op in (ctype.cast, ctype.ref, ctype.add, ctype.sub, ctype.idx):
             e = e.x
@@ -253,11 +255,18 @@ class CallArgumentObject(ScanObject):
         Creates a new CallArgumentObject
 
         :param cfunc: ida_hexrays.cfunc_t
-        :param arg_idx: argument index of variable
+        :param arg_idx: call-argument ordinal
         :return: CallArgumentObject
         """
+        argidx = getattr(cfunc, "argidx", ())
+        if arg_idx < 0 or arg_idx >= len(argidx):
+            return None
         result = CallArgumentObject(cfunc.entry_ea, arg_idx)
-        result.name = cfunc.get_lvars()[arg_idx].name
+        lvar_idx = argidx[arg_idx]
+        lvars = cfunc.get_lvars()
+        if lvar_idx < 0 or lvar_idx >= len(lvars):
+            return None
+        result.name = lvars[lvar_idx].name
         result.tinfo = ida_hexrays.cfunc_type(cfunc)
         return result
 
@@ -318,9 +327,9 @@ class MemoryAllocationObject(ScanObject):
         func_name = ida_name.get_short_name(call_expr.x.obj_ea)
         if "malloc" in func_name or "operator new" in func_name or "operator_new" in func_name:
             # if we find `malloc` or `new` we get the size of the allocation
-            size_expr = call_expr.a[0]
-            # ensure the value is a number, if not set size to zero
-            if size_expr.op == ctype.num:
+            size_expr = call_expr.a[0] if len(call_expr.a) else None
+            # Missing size arguments should not crash the scan; treat them as unknown.
+            if size_expr is not None and size_expr.op == ctype.num:
                 size = size_expr.numval()
             else:
                 size = 0

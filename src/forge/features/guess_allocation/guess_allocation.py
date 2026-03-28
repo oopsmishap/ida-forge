@@ -31,13 +31,13 @@ class GuessAllocationVisitor(RecursiveUpwardsObjectVisitor):
     def _manipulate(self, cexpr, obj: ScanObject):
         if obj.id == ObjectType.local_variable:
             parent = self.parent_expr()
+            if parent is None:
+                return
             if parent.op == ctype.asg:
-                alloc_obj = MemoryAllocationObject.create(
-                    self._cfunc, self.parent_expr().y
-                )
+                alloc_obj = MemoryAllocationObject.create(self._cfunc, parent.y)
                 if alloc_obj:
                     self._data.append([alloc_obj.ea, obj.name, self.get_line(), "HEAP"])
-            elif self.parent_expr().op == ctype.ref:
+            elif parent.op == ctype.ref:
                 self._data.append(
                     [
                         find_expr_address(cexpr, self.parents),
@@ -55,6 +55,7 @@ class GuessAllocationVisitor(RecursiveUpwardsObjectVisitor):
                     "GLOBAL",
                 ]
             )
+
 
     def _finish(self):
         chooser = StructureAllocationChoose(self._data)

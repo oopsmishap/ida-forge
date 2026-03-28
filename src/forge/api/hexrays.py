@@ -100,6 +100,20 @@ def get_argument(
     lvars = cfunc.get_lvars()
     return lvars[arg_idx], arg_idx
 
+def get_argument_index(cfunc: ida_hexrays.cfunc_t, lvar_idx: int) -> int | None:
+    """
+    Returns the ordinal index of an argument local variable.
+
+    :param cfunc: The cfunc_t object to inspect.
+    :param lvar_idx: The lvar index of the argument variable.
+    :return: The argument ordinal, or None when the lvar is not an argument.
+    """
+    for idx, candidate in enumerate(cfunc.argidx):
+        if candidate == lvar_idx:
+            return idx
+    return None
+
+
 
 def get_func_argument_info(
     function: ida_hexrays.cexpr_t, expression: ida_hexrays.cexpr_t

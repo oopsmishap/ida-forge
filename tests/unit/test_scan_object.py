@@ -37,9 +37,10 @@ class FakeLvar:
 
 
 class FakeCfunc:
-    def __init__(self, lvars, entry_ea=0x1000):
+    def __init__(self, lvars, entry_ea=0x1000, argidx=None):
         self._lvars = lvars
         self.entry_ea = entry_ea
+        self.argidx = list(range(len(lvars))) if argidx is None else list(argidx)
         self.body = SimpleNamespace(find_parent_of=lambda expr: None)
 
     def get_lvars(self):
@@ -226,3 +227,63 @@ def test_memory_allocation_object_create_returns_none_for_non_allocator_name(mon
     call = FakeExpr(ctype.call, x=SimpleNamespace(obj_ea=0x5000), a=[FakeNumberExpr(8)], ea=0x99)
 
     assert MemoryAllocationObject.create(FakeCfunc([]), call) is None
+
+def test_call_argument_object_create_uses_formal_argument_order():
+    cfunc = FakeCfunc(
+        [FakeLvar("local"), FakeLvar("first"), FakeLvar("second")],
+        entry_ea=0x1234,
+        argidx=[1, 2],
+    )
+    obj = CallArgumentObject.create(cfunc, 1)
+
+    assert obj is not None
+    assert obj.func_ea == 0x1234
+    assert obj.name == "second"
+    assert obj.arg_idx == 1
+
+
+def test_call_argument_object_create_scan_object_returns_none_for_missing_argument():
+    call = FakeExpr(ctype.call, a=[FakeExpr(ctype.var)])
+    obj = CallArgumentObject(0x1000, 1)
+
+    assert obj.create_scan_object(FakeCfunc([]), call) is None
+
+
+def test_memory_allocation_object_create_handles_missing_size_argument(monkeypatch):
+    import ida_name
+    monkeypatch.setattr(ida_name, "get_short_name", lambda _ea: "malloc")
+    monkeypatch.setattr(ScanObject, "get_expression_address", staticmethod(lambda _cfunc, expr: expr.ea))
+    call = FakeExpr(ctype.call, x=SimpleNamespace(obj_ea=0x5000), a=[], ea=0x99)
+
+    obj = MemoryAllocationObject.create(FakeCfunc([]), call)
+
+    assert obj is not None
+    assert obj.size == 0
+
+def test_get_argument_index_resolves_formal_argument_ordinals():
+    import importlib.util
+    from pathlib import Path
+    import ida_hexrays
+    if not hasattr(ida_hexrays, "ctree_parentee_t"):
+        ida_hexrays.ctree_parentee_t = type("ctree_parentee_t", (), {})
+
+    hexrays_path = Path(__file__).resolve().parents[2] / "src" / "forge" / "api" / "hexrays.py"
+    spec = importlib.util.spec_from_file_location("forge.api.hexrays_real", hexrays_path)
+    assert spec is not None and spec.loader is not None
+    hexrays_real = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(hexrays_real)
+
+    cfunc = SimpleNamespace(
+        argidx=[1, 3],
+        get_lvars=lambda: [
+            FakeLvar("local"),
+            FakeLvar("first"),
+            FakeLvar("ignored"),
+            FakeLvar("second"),
+        ],
+    )
+
+    assert hexrays_real.get_argument_index(cfunc, 3) == 1
+    assert hexrays_real.get_argument_index(cfunc, 2) is None
+
+

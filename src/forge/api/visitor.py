@@ -374,18 +374,24 @@ class RecursiveDownwardsObjectVisitor(RecursiveObjectVisitor, DownwardsObjectVis
         )
 
     def _check_call(self, cexpr: ida_hexrays.cexpr_t):
-        parent: ida_hexrays.cexpr_t = self.parent_expr()
-        grandparent: ida_hexrays.cexpr_t = self.parents.at(self.parents.size() - 2)
+        parent: ida_hexrays.cexpr_t | None = self.parent_expr()
+        if parent is None:
+            return
+        grandparent: ida_hexrays.cexpr_t | None = None
+        if self.parents.size() >= 2:
+            grandparent = self.parents.at(self.parents.size() - 2)
         if parent.op == ctype.call:
             call_cexpr = parent
             arg_cexpr = cexpr
-        elif parent.op == ctype.cast and grandparent.op == ctype.call:
+        elif parent.op == ctype.cast and grandparent is not None and grandparent.op == ctype.call:
             call_cexpr = grandparent.cexpr
             arg_cexpr = parent
         else:
             return
 
         idx, _ = get_func_argument_info(call_cexpr, arg_cexpr)
+        if idx is None:
+            return
         func_ea = call_cexpr.x.obj_ea
         if func_ea == ida_idaapi.BADADDR:
             return
@@ -401,11 +407,14 @@ class RecursiveDownwardsObjectVisitor(RecursiveObjectVisitor, DownwardsObjectVis
             # if is_imported_ea(func_ea):
             #     continue
             cfunc = decompile(func_ea)
-            if cfunc:
-                arg, lvar_idx = get_argument(cfunc, arg_idx)
-                obj = VariableObject(arg, lvar_idx)
-                self.prepare_new_scan(cfunc, lvar_idx, obj)
-                self._recursive_process()
+            if cfunc is None:
+                continue
+            if arg_idx is None or arg_idx < 0 or arg_idx >= len(getattr(cfunc, "argidx", ())):
+                continue
+            arg, lvar_idx = get_argument(cfunc, arg_idx)
+            obj = VariableObject(arg, lvar_idx)
+            self.prepare_new_scan(cfunc, lvar_idx, obj)
+            self._recursive_process()
 
 
 class RecursiveUpwardsObjectVisitor(RecursiveObjectVisitor, UpwardsObjectVisitor):
@@ -424,13 +433,24 @@ class RecursiveUpwardsObjectVisitor(RecursiveObjectVisitor, UpwardsObjectVisitor
         self._call_obj = obj if obj.id == ObjectType.call_argument else None
 
     def _check_call(self, cexpr: ida_hexrays.cexpr_t):
-        if cexpr.op == ctype.var and self._cfunc.get_lvars()[cexpr.v.idx].is_arg_var:
-            func_ea = self._cfunc.entry_ea
-            arg_idx = cexpr.v.idx
-            if self._add_visit(func_ea, arg_idx):
-                for callee_ea in get_funcs_calling_address(func_ea):
-                    self._add_scan_tree_info(callee_ea, arg_idx)
-
+        if cexpr.op != ctype.var:
+            return
+        lvars = self._cfunc.get_lvars()
+        if cexpr.v.idx < 0 or cexpr.v.idx >= len(lvars):
+            return
+        if not lvars[cexpr.v.idx].is_arg_var:
+            return
+        func_ea = self._cfunc.entry_ea
+        arg_idx = get_argument_index(self._cfunc, cexpr.v.idx)
+        if arg_idx is None:
+            log_warning(
+                f"Failed to resolve argument ordinal for {to_hex(func_ea)} lvar {cexpr.v.idx}",
+                True,
+            )
+            return
+        if self._add_visit(func_ea, arg_idx):
+            for callee_ea in get_funcs_calling_address(func_ea):
+                self._add_scan_tree_info(callee_ea, arg_idx)
     def leave_expr(self, cexpr):
         self._check_call(cexpr)
         return super().leave_expr(cexpr)
@@ -443,7 +463,12 @@ class RecursiveUpwardsObjectVisitor(RecursiveObjectVisitor, UpwardsObjectVisitor
             self._new_for_visit.clear()
             for func_ea, arg_idx in new_visit:
                 funcs = get_funcs_calling_address(func_ea)
-                obj = CallArgumentObject.create(decompile(func_ea), arg_idx)
+                cfunc = decompile(func_ea)
+                if cfunc is None:
+                    continue
+                obj = CallArgumentObject.create(cfunc, arg_idx)
+                if obj is None:
+                    continue
                 for callee_ea in funcs:
                     cfunc = decompile(callee_ea)
                     if cfunc:
