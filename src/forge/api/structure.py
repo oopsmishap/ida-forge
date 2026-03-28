@@ -3,8 +3,8 @@ from __future__ import annotations
 import bisect
 import itertools
 import re
-from dataclasses import dataclass
-from typing import Iterator, Sequence
+from dataclasses import dataclass, replace
+from typing import Iterator, Mapping, Sequence
 
 import ida_kernwin
 import ida_typeinf
@@ -26,19 +26,258 @@ class StructureStats:
     origin_offset: int
 
 
+@dataclass
+class StructureProvenance:
+    kind: str = "manual"
+    root_object_name: str | None = None
+    root_object_ea: int | None = None
+    root_function_ea: int | None = None
+    source_member_offset: int | None = None
+    has_multiple_roots: bool = False
+
+
+@dataclass
+class StructureRelationship:
+    parent_structure_name: str
+    child_structure_name: str
+    parent_member_offset: int
+    parent_member_name: str
+    relation_kind: str = "pointer"
+
+
 class Structure:
     def __init__(self, name: str):
         self.name = name
         self.main_offset = 0
         self.members: list[AbstractMember] = []
         self.collisions: list[bool] = []
+        self.is_auto_named: bool = False
+        self.created_type_name: str | None = None
+        self.provenance: StructureProvenance = StructureProvenance()
+        self.parent_relationships: list[StructureRelationship] = []
+        self.child_relationships: list[StructureRelationship] = []
 
     def add_member(self, member: AbstractMember) -> None:
         """Insert a member while keeping the structure ordered by offset/type."""
+        if not hasattr(member, "linked_child_structure_name"):
+            member.linked_child_structure_name = None
+        if not hasattr(member, "child_relation_kind"):
+            member.child_relation_kind = None
         if member in self.members:
             return
         bisect.insort(self.members, member)
         self.refresh_collisions()
+
+    def set_provenance(
+        self,
+        *,
+        kind: str,
+        root_object_name: str | None = None,
+        root_object_ea: int | None = None,
+        root_function_ea: int | None = None,
+        source_member_offset: int | None = None,
+        has_multiple_roots: bool = False,
+    ) -> None:
+        self.provenance = StructureProvenance(
+            kind=kind,
+            root_object_name=root_object_name,
+            root_object_ea=root_object_ea,
+            root_function_ea=root_function_ea,
+            source_member_offset=source_member_offset,
+            has_multiple_roots=has_multiple_roots,
+        )
+
+    def clone_provenance(self) -> StructureProvenance:
+        return replace(self.provenance)
+
+    def get_member_by_offset(self, offset: int) -> AbstractMember | None:
+        return next((member for member in self.members if member.offset == offset), None)
+
+    def add_child_relationship(
+        self,
+        *,
+        child_structure_name: str,
+        parent_member_offset: int,
+        parent_member_name: str,
+        relation_kind: str = "pointer",
+    ) -> StructureRelationship:
+        relationship = StructureRelationship(
+            parent_structure_name=self.name,
+            child_structure_name=child_structure_name,
+            parent_member_offset=parent_member_offset,
+            parent_member_name=parent_member_name,
+            relation_kind=relation_kind,
+        )
+        existing = next(
+            (
+                rel
+                for rel in self.child_relationships
+                if rel.child_structure_name == child_structure_name
+                and rel.parent_member_offset == parent_member_offset
+            ),
+            None,
+        )
+        if existing is None:
+            self.child_relationships.append(relationship)
+            return relationship
+        return existing
+
+    def add_parent_relationship(self, relationship: StructureRelationship) -> None:
+        if any(
+            rel.parent_structure_name == relationship.parent_structure_name
+            and rel.parent_member_offset == relationship.parent_member_offset
+            and rel.child_structure_name == relationship.child_structure_name
+            for rel in self.parent_relationships
+        ):
+            return
+        self.parent_relationships.append(relationship)
+
+    def remove_relationships_with(self, structure_name: str) -> None:
+        self.child_relationships = [
+            rel for rel in self.child_relationships if rel.child_structure_name != structure_name
+        ]
+        self.parent_relationships = [
+            rel for rel in self.parent_relationships if rel.parent_structure_name != structure_name
+        ]
+        for member in self.members:
+            if getattr(member, "linked_child_structure_name", None) == structure_name:
+                member.linked_child_structure_name = None
+                member.child_relation_kind = None
+
+    def rename_relationship_references(self, old_name: str, new_name: str) -> None:
+        for relationship in self.child_relationships:
+            if relationship.parent_structure_name == old_name:
+                relationship.parent_structure_name = new_name
+            if relationship.child_structure_name == old_name:
+                relationship.child_structure_name = new_name
+        for relationship in self.parent_relationships:
+            if relationship.parent_structure_name == old_name:
+                relationship.parent_structure_name = new_name
+            if relationship.child_structure_name == old_name:
+                relationship.child_structure_name = new_name
+        for member in self.members:
+            if getattr(member, "linked_child_structure_name", None) == old_name:
+                member.linked_child_structure_name = new_name
+
+    def get_linked_child_names(self) -> list[str]:
+        return sorted({rel.child_structure_name for rel in self.child_relationships})
+
+    def has_linked_children(self) -> bool:
+        return bool(self.child_relationships)
+
+    def get_provenance_summary(self) -> str:
+        parts = [self.provenance.kind.replace("_", " ")]
+        if self.provenance.root_object_name:
+            parts.append(self.provenance.root_object_name)
+        if self.provenance.source_member_offset is not None:
+            parts.append(f"member @ 0x{self.provenance.source_member_offset:X}")
+        if self.provenance.has_multiple_roots:
+            parts.append("multiple roots")
+        return " | ".join(parts)
+
+    def get_unresolved_child_names(
+        self,
+        structures_by_name: Mapping[str, "Structure"],
+    ) -> list[str]:
+        return sorted(
+            {
+                relationship.child_structure_name
+                for relationship in self.child_relationships
+                if (
+                    child := structures_by_name.get(
+                        relationship.child_structure_name
+                    )
+                )
+                is None
+                or child.created_type_name is None
+            }
+        )
+
+    def _iter_child_relationships(self) -> Iterator[StructureRelationship]:
+        yield from sorted(
+            self.child_relationships,
+            key=lambda relationship: (
+                relationship.parent_member_offset,
+                relationship.parent_member_name,
+                relationship.child_structure_name,
+            ),
+        )
+
+    def iter_child_structures(
+        self,
+        structures_by_name: Mapping[str, "Structure"],
+    ) -> Iterator["Structure"]:
+        seen_child_names: set[str] = set()
+        for relationship in self._iter_child_relationships():
+            child = structures_by_name.get(relationship.child_structure_name)
+            if child is None or child.name in seen_child_names:
+                continue
+            seen_child_names.add(child.name)
+            yield child
+
+    def can_create_type(
+        self,
+        structures_by_name: Mapping[str, "Structure"],
+    ) -> bool:
+        return not self.get_unresolved_child_names(structures_by_name)
+
+    def create_type_if_ready(
+        self,
+        structures_by_name: Mapping[str, "Structure"],
+        *,
+        start: int | None = None,
+        end: int | None = None,
+    ) -> ida_typeinf.tinfo_t | None:
+        unresolved_child_names = self.get_unresolved_child_names(structures_by_name)
+        if unresolved_child_names:
+            child_names = ", ".join(unresolved_child_names)
+            log_warning(
+                f"Cannot create type for {self.name}: unresolved child structures: {child_names}",
+                True,
+            )
+            return None
+        return self.pack_structure(start=start, end=end)
+
+    def create_subtree_types_postorder(
+        self,
+        structures_by_name: Mapping[str, "Structure"],
+        *,
+        visited: set[str] | None = None,
+    ) -> bool:
+        completed = visited if visited is not None else set()
+        stack: list[str] = []
+
+        def _walk(structure: "Structure") -> bool:
+            if structure.name in completed:
+                return True
+            if structure.name in stack:
+                cycle_start = stack.index(structure.name)
+                cycle_path = " -> ".join(stack[cycle_start:] + [structure.name])
+                log_warning(
+                    f"Cycle detected while creating type subtree: {cycle_path}",
+                    True,
+                )
+                return False
+
+            stack.append(structure.name)
+            try:
+                for child_structure in structure.iter_child_structures(structures_by_name):
+                    if not _walk(child_structure):
+                        log_warning(
+                            f"Cannot create subtree for {structure.name}: child subtree {child_structure.name} could not be finalized",
+                            True,
+                        )
+                        return False
+
+                if structure.create_type_if_ready(structures_by_name) is None:
+                    return False
+
+                completed.add(structure.name)
+                return True
+            finally:
+                stack.pop()
+
+        return _walk(self)
 
     def has_collision(self, index: int) -> bool:
         return 0 <= index < len(self.collisions) and self.collisions[index]
@@ -318,6 +557,7 @@ class Structure:
             return None
 
         if forge_types.create_type(structure_name, cdecl):
+            self.created_type_name = structure_name
             log_debug(f"Created type {structure_name}")
             return self._apply_scanned_variable_types(structure_name, origin)
 
@@ -339,5 +579,6 @@ class Structure:
             log_error(f"Failed to recreate type {structure_name}", True)
             return None
 
+        self.created_type_name = structure_name
         log_debug(f"Created type {structure_name}")
         return self._apply_scanned_variable_types(structure_name, origin)

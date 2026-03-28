@@ -1,4 +1,5 @@
 import ida_hexrays
+import idaapi
 
 from forge.api.hexrays import decompile, get_funcs_referencing_address, is_legal_type
 from forge.api.scan_object import GlobalVariableObject, ObjectType, ScanObject
@@ -40,6 +41,41 @@ class StructureBuilderAction(HexRaysPopupAction):
         return refreshed_cfunc or cfunc
 
     @staticmethod
+    def _provenance_kind_for_object(obj: ScanObject) -> str:
+        if obj.id == ObjectType.global_object:
+            return "global_root"
+        if obj.id in (ObjectType.structure_pointer, ObjectType.structure_reference):
+            return "upward_resolved_root"
+        return "confirmed_root"
+
+    @staticmethod
+    def _set_root_scan_provenance(
+        obj: ScanObject,
+        *,
+        root_function_ea: int | None,
+        has_multiple_roots: bool = False,
+    ) -> None:
+        structure = structure_form.current_structure
+        if structure is None or structure.provenance.kind != "manual":
+            return
+
+        root_object_ea = None
+        if obj.id == ObjectType.global_object:
+            root_object_ea = getattr(obj, "object_ea", None)
+        else:
+            candidate_ea = getattr(obj, "ea", idaapi.BADADDR)
+            if candidate_ea != idaapi.BADADDR:
+                root_object_ea = candidate_ea
+
+        structure.set_provenance(
+            kind=StructureBuilderAction._provenance_kind_for_object(obj),
+            root_object_name=getattr(obj, "name", None),
+            root_object_ea=root_object_ea,
+            root_function_ea=root_function_ea,
+            has_multiple_roots=has_multiple_roots,
+        )
+
+    @staticmethod
     def _ensure_structure_selected() -> bool:
         if structure_form.current_structure is not None:
             return True
@@ -72,6 +108,7 @@ class ShallowScanAction(StructureBuilderAction):
 
         obj = self.create_scan_object(cfunc, hx_view.item)
         if obj:
+            self._set_root_scan_provenance(obj, root_function_ea=cfunc.entry_ea)
             visitor = NewShallowScanVisitor(
                 cfunc, origin, obj, structure_form.current_structure
             )
@@ -101,6 +138,12 @@ class DeepScanAction(StructureBuilderAction):
             )
             return
 
+        self._set_root_scan_provenance(
+            obj,
+            root_function_ea=xref_functions[0] if len(xref_functions) == 1 else None,
+            has_multiple_roots=len(xref_functions) > 1,
+        )
+
         for func_ea in xref_functions:
             cfunc = decompile(func_ea)
             if cfunc is None:
@@ -129,6 +172,10 @@ class DeepScanAction(StructureBuilderAction):
                 self._scan_global_references(obj, origin)
             else:
                 prepared_cfunc = self._prepare_function(cfunc)
+                self._set_root_scan_provenance(
+                    obj,
+                    root_function_ea=prepared_cfunc.entry_ea,
+                )
                 if prepared_cfunc.entry_ea == cfunc.entry_ea:
                     hx_view.refresh_view(True)
                 visitor = NewDeepScanVisitor(
