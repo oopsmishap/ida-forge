@@ -89,7 +89,6 @@ def build_one(uic_cmd: list[str], src: Path, dst: Path) -> None:
         "QRadialGradient = QtGui.QRadialGradient\n"
         "QTransform = QtGui.QTransform\n"
         "QApplication = QtWidgets.QApplication\n"
-        "QFrame = QtWidgets.QFrame\n"
         "QDialog = QtWidgets.QDialog\n"
         "QFrame = QtWidgets.QFrame\n"
         "QGridLayout = QtWidgets.QGridLayout\n"
