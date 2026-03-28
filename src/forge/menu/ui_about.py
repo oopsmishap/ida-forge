@@ -34,7 +34,6 @@ QPixmap = QtGui.QPixmap
 QRadialGradient = QtGui.QRadialGradient
 QTransform = QtGui.QTransform
 QApplication = QtWidgets.QApplication
-QFrame = QtWidgets.QFrame
 QDialog = QtWidgets.QDialog
 QFrame = QtWidgets.QFrame
 QGridLayout = QtWidgets.QGridLayout

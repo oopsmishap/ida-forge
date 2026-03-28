@@ -99,6 +99,8 @@ def build_one(uic_cmd: list[str], src: Path, dst: Path) -> None:
         "QLineEdit = QtWidgets.QLineEdit\n"
         "QListWidget = QtWidgets.QListWidget\n"
         "QListWidgetItem = QtWidgets.QListWidgetItem\n"
+        "QTreeWidget = QtWidgets.QTreeWidget\n"
+        "QTreeWidgetItem = QtWidgets.QTreeWidgetItem\n"
         "QPushButton = QtWidgets.QPushButton\n"
         "QSizePolicy = QtWidgets.QSizePolicy\n"
         "QSpacerItem = QtWidgets.QSpacerItem\n"

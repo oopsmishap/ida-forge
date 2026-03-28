@@ -43,6 +43,8 @@ class Ui_Form(object):
     assert "from PySide6" not in content
     assert "class Ui_Form(object):" in content
     assert content.count("QFrame = QtWidgets.QFrame") == 1
+    assert content.count("QTreeWidget = QtWidgets.QTreeWidget") == 1
+    assert content.count("QTreeWidgetItem = QtWidgets.QTreeWidgetItem") == 1
 
 
 def test_build_one_rewrites_pyqt5_imports(tmp_path, monkeypatch):
