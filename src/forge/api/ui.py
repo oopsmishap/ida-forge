@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import ida_kernwin
-from PyQt5 import QtCore, QtWidgets
+
+from forge.util.qt import QtCore, QtWidgets, Signal
 
 
 class Choose(ida_kernwin.Choose):
@@ -29,8 +30,8 @@ class Choose(ida_kernwin.Choose):
 
 
 class ClickableQLabel(QtWidgets.QLabel):
-    clicked = QtCore.pyqtSignal()
-    doubleClicked = QtCore.pyqtSignal()
+    clicked = Signal()
+    doubleClicked = Signal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -43,7 +44,7 @@ class ClickableQLabel(QtWidgets.QLabel):
 
 
 class EnterPressQTableWidget(QtWidgets.QTableWidget):
-    cellEnterPressed = QtCore.pyqtSignal(int, int)
+    cellEnterPressed = Signal(int, int)
 
     def __init__(self, parent=None):
         super().__init__(parent)
