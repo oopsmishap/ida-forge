@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import copy
+import csv
+import io
 from dataclasses import dataclass
 from enum import IntEnum
 from typing import Dict, Optional
 
 import ida_hexrays
 import ida_kernwin
+import ida_lines
 import idaapi
 
 from forge.util.qt import QtCore, QtGui, QtWidgets, qt_exec
@@ -26,8 +29,9 @@ from forge.api.scan_object import ScanObject, StructurePointerObject, StructureR
 from forge.api.scanner import NewDeepScanVisitor
 from forge.api.structure import Structure, StructureRelationship
 from forge.api.ui import Choose, set_row_background_color, set_row_foreground_color
-from forge.util.logging import log_warning
+from forge.util.logging import log_debug, log_warning
 from .config import config
+
 
 class Column(IntEnum):
     offset = 0
@@ -1999,6 +2003,141 @@ class StructureBuilderForm(ida_kernwin.PluginForm):
         self.current_structure.clear_members()
         self.update_structure_fields()
 
+    @staticmethod
+    def _structure_table_debug_fields(member: AbstractMember) -> list[str]:
+        return [
+            f"0x{member.offset:04X} [{hex(member.size)}]",
+            StructureBuilderForm._format_type_name(member),
+            member.name,
+            str(member.score),
+            member.comment,
+            "yes" if member.enabled else "no",
+            "yes" if member.is_array else "no",
+            f"0x{member.origin:X}",
+        ]
+
+    @staticmethod
+    def _scan_object_decompiled_line(
+        scan_object: ScanObject,
+        cfunc_cache: dict[int, ida_hexrays.cfunc_t | None],
+    ) -> str:
+        func_ea = getattr(scan_object, "func_ea", idaapi.BADADDR)
+        if func_ea == idaapi.BADADDR:
+            return ""
+
+        cfunc = cfunc_cache.get(func_ea)
+        if func_ea not in cfunc_cache:
+            cfunc = decompile(func_ea)
+            cfunc_cache[func_ea] = cfunc
+
+        if cfunc is None:
+            return ""
+
+        target_ea = getattr(scan_object, "ea", idaapi.BADADDR)
+        if target_ea == idaapi.BADADDR:
+            return ""
+
+        for item in getattr(cfunc, "treeitems", []):
+            if getattr(item, "ea", idaapi.BADADDR) != target_ea:
+                continue
+            try:
+                line_no, _column = cfunc.find_item_coords(item)
+            except Exception:
+                return ""
+
+            pseudocode = cfunc.get_pseudocode()
+            tag_remove = getattr(ida_lines, "tag_remove", lambda value: value)
+            if 1 <= line_no <= len(pseudocode):
+                return " ".join(tag_remove(str(pseudocode[line_no - 1])).split())
+            return ""
+
+
+        return ""
+
+    def _build_structure_table_debug_csv(self) -> str:
+        if self.current_structure is None:
+            return ""
+
+        members = self.get_selected_members() or list(self.current_structure.members)
+        if not members:
+            return ""
+
+        cfunc_cache: dict[int, ida_hexrays.cfunc_t | None] = {}
+        buffer = io.StringIO()
+        writer = csv.writer(buffer)
+        writer.writerow(
+            [
+                "structure_name",
+                "row",
+                "offset",
+                "type",
+                "name",
+                "score",
+                "comment",
+                "enabled",
+                "array",
+                "origin",
+                "scan_location_count",
+                "scan_locations",
+                "scan_lines",
+            ]
+        )
+
+        for row, member in enumerate(members):
+            scanned_variables = sorted(
+                getattr(member, "scanned_variables", set()),
+                key=lambda scan_object: (
+                    getattr(scan_object, "func_ea", idaapi.BADADDR),
+                    getattr(scan_object, "ea", idaapi.BADADDR),
+                    scan_object.name,
+                ),
+            )
+            scan_locations = []
+            scan_lines = []
+            for scan_object in scanned_variables:
+                func_ea = getattr(scan_object, "func_ea", idaapi.BADADDR)
+                target_ea = getattr(scan_object, "ea", idaapi.BADADDR)
+                location = scan_object.function_name
+                if func_ea != idaapi.BADADDR and target_ea != idaapi.BADADDR:
+                    location = f"{scan_object.function_name}@{hex(target_ea)}"
+                scan_locations.append(location)
+                line_text = self._scan_object_decompiled_line(scan_object, cfunc_cache)
+                if line_text:
+                    scan_lines.append(line_text)
+
+
+            writer.writerow(
+                [
+                    self.current_structure.name,
+                    row,
+                    *self._structure_table_debug_fields(member),
+                    len(scanned_variables),
+                    "; ".join(scan_locations),
+                    " || ".join(scan_lines),
+                ]
+            )
+
+        return buffer.getvalue()
+
+    def copy_structure_table_debug_csv(self) -> None:
+        csv_text = self._build_structure_table_debug_csv()
+        if not csv_text:
+            log_warning("No structure rows available to export.", True)
+            return
+
+        clipboard_factory = getattr(QtWidgets.QApplication, "clipboard", None)
+        if callable(clipboard_factory):
+            clipboard_factory().setText(csv_text)
+        else:
+            copy_to_clipboard = getattr(ida_kernwin, "copy_to_clipboard", None)
+            if not callable(copy_to_clipboard):
+                log_warning("No clipboard API available to export CSV.", True)
+                return
+            copy_to_clipboard(csv_text)
+
+        log_debug("Copied structure builder debug CSV to clipboard")
+
+
     def show_scanned_variables(self):
         if self.current_structure is None:
             return
@@ -2143,6 +2282,10 @@ class StructureBuilderForm(ida_kernwin.PluginForm):
         scanned_variables_action.setEnabled(bool(self.current_structure.members))
         scanned_variables_action.triggered.connect(self.show_scanned_variables)
 
+        debug_copy_action = menu.addAction("Copy Debug CSV")
+        debug_copy_action.setEnabled(bool(self.current_structure.members))
+        debug_copy_action.triggered.connect(self.copy_structure_table_debug_csv)
+
         scan_child_action = menu.addAction("Scan Child Structure")
         scan_child_action.setEnabled(can_scan_child)
         scan_child_action.triggered.connect(self.scan_child_structure)
@@ -2150,6 +2293,7 @@ class StructureBuilderForm(ida_kernwin.PluginForm):
         open_child_action = menu.addAction("Open Linked Child")
         open_child_action.setEnabled(can_open_child)
         open_child_action.triggered.connect(self.open_linked_child_structure)
+
 
         recognize_action = menu.addAction("Recognize VTable")
         recognize_action.setEnabled(isinstance(selected_member, VirtualTable))
