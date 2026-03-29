@@ -808,3 +808,71 @@ def test_update_action_states_enables_child_scan_actions_for_scannable_member(mo
     assert structure_form.ui.action_scan_child.enabled is True
     assert "child scan ready" in structure_form._format_selected_member_info(member)
 
+
+
+def test_execute_child_scan_plan_enables_recursive_child_traversal(monkeypatch):
+    structure_form = _make_form(monkeypatch)
+    child = structure_form.create_structure("Child")
+    assert child is not None
+    child.main_offset = 0x30
+
+    plan = SimpleNamespace(
+        function_eas=(0x401000,),
+        scan_object=SimpleNamespace(name="child_ptr"),
+    )
+    captured = {}
+
+    monkeypatch.setattr(
+        structure_form,
+        "_prepare_scan_cfunc",
+        lambda _ea: SimpleNamespace(entry_ea=0x401000),
+    )
+
+    class FakeVisitor:
+        def __init__(self, cfunc, origin, obj, structure, recurse_calls=False):
+            captured["args"] = (
+                cfunc.entry_ea,
+                origin,
+                obj.name,
+                structure.name,
+                recurse_calls,
+            )
+        def process(self):
+            return None
+
+    monkeypatch.setattr(form_module, "NewDeepScanVisitor", FakeVisitor)
+
+    assert structure_form._execute_child_scan_plan(child, plan) is True
+    assert captured["args"] == (0x401000, 0x30, "child_ptr", "Child", True)
+
+
+def test_link_child_structure_materializes_pointer_and_inline_member_types(monkeypatch):
+    structure_form = _make_form(monkeypatch)
+    parent = structure_form.create_structure("Parent")
+    child = structure_form.create_structure("Child")
+    assert parent is not None
+    assert child is not None
+
+    member_pointer = _FakeMember(0x30, 8, type_name="u64", name="child_ptr")
+    member_inline = _FakeMember(0x40, 8, type_name="u64", name="child_inline")
+
+    parent.add_member(member_pointer)
+    parent.add_member(member_inline)
+
+    sentinel = SimpleNamespace(
+        dstr=lambda: "ChildType",
+        get_size=lambda: 8,
+        is_funcptr=lambda: False,
+    )
+    seen: list[str] = []
+
+    monkeypatch.setattr(form_module, "parse_user_tinfo", lambda decl: seen.append(decl) or sentinel)
+
+    form_module.StructureBuilderForm._link_child_structure(parent, child, member_pointer, "pointer")
+    form_module.StructureBuilderForm._link_child_structure(parent, child, member_inline, "embedded")
+
+    assert seen == ["Child *", "Child"]
+    assert member_pointer.tinfo is sentinel
+    assert member_inline.tinfo is sentinel
+    assert member_pointer.child_relation_kind == "pointer"
+    assert member_inline.child_relation_kind == "embedded"

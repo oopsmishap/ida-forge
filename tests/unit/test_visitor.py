@@ -78,9 +78,12 @@ def test_recursive_downwards_object_visitor_leave_expr_checks_calls(monkeypatch)
         visitor_module.RecursiveDownwardsObjectVisitor
     )
     visitor._skip = False
+    visitor._recurse_calls = True
     seen = []
 
     monkeypatch.setattr(visitor, "_check_call", lambda cexpr: seen.append(cexpr), raising=False)
+
+
     monkeypatch.setattr(
         visitor_module.DownwardsObjectVisitor,
         "leave_expr",

@@ -369,10 +369,13 @@ class RecursiveDownwardsObjectVisitor(RecursiveObjectVisitor, DownwardsObjectVis
         data=None,
         skip_until_object=False,
         visited=None,
+        recurse_calls: bool = False,
     ):
         super(RecursiveDownwardsObjectVisitor, self).__init__(
             cfunc, obj, data, skip_until_object, visited
         )
+        self._recurse_calls = recurse_calls
+
 
     def _check_call(self, cexpr: ida_hexrays.cexpr_t):
         parent: ida_hexrays.cexpr_t | None = self.parent_expr()
@@ -400,8 +403,11 @@ class RecursiveDownwardsObjectVisitor(RecursiveObjectVisitor, DownwardsObjectVis
             self._add_scan_tree_info(func_ea, idx)
 
     def leave_expr(self, cexpr):
-        self._check_call(cexpr)
+        if getattr(self, "_recurse_calls", False):
+            self._check_call(cexpr)
         return super(RecursiveDownwardsObjectVisitor, self).leave_expr(cexpr)
+
+
     def _refresh_decompilation_tree(self, cfunc: ida_hexrays.cfunc_t | None = None) -> ida_hexrays.cfunc_t | None:
         target_cfunc = cfunc or self._cfunc
         refreshed = refresh_function_tree_postorder(target_cfunc)

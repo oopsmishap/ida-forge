@@ -569,8 +569,9 @@ class NewDeepScanVisitor(ScanVisitor, RecursiveDownwardsObjectVisitor):
         origin: int,
         obj: ScanObject,
         structure,
+        recurse_calls: bool = False,
     ):
-        super().__init__(cfunc, origin, obj, structure)
+        super().__init__(cfunc, origin, obj, structure, recurse_calls=recurse_calls)
 
 
 class DeepScanReturnVisitor(NewDeepScanVisitor):

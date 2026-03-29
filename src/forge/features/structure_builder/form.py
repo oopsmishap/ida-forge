@@ -1083,10 +1083,30 @@ class StructureBuilderForm(ida_kernwin.PluginForm):
                 child_structure.main_offset,
                 plan.scan_object,
                 child_structure,
+                recurse_calls=True,
             )
+
             visitor.process()
             scanned_any = True
         return scanned_any
+
+    @staticmethod
+    def _materialize_child_member_type(
+        member: AbstractMember,
+        child_structure: Structure,
+        relation_kind: str,
+    ) -> None:
+        child_type_name = child_structure.created_type_name or child_structure.name
+        type_decl = f"{child_type_name} *" if relation_kind == "pointer" else child_type_name
+        tinfo = parse_user_tinfo(type_decl)
+        if tinfo is None:
+            return
+
+        member.tinfo = tinfo
+        member.is_array = False
+        if hasattr(member, "invalidate_score"):
+            member.invalidate_score()
+
 
     @staticmethod
     def _link_child_structure(
@@ -1105,6 +1125,7 @@ class StructureBuilderForm(ida_kernwin.PluginForm):
         child_structure.add_parent_relationship(relationship)
         member.linked_child_structure_name = child_structure.name
         member.child_relation_kind = relation_kind
+        StructureBuilderForm._materialize_child_member_type(member, child_structure, relation_kind)
 
     @staticmethod
     def _set_child_scan_provenance(
