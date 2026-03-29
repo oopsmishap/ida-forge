@@ -192,10 +192,15 @@ class ScanVisitor(ObjectVisitor):
         origin: int,
         obj: ScanObject,
         structure,
+        recurse_calls: bool | None = None,
     ):
-        super().__init__(cfunc, obj, None, True)
+        if recurse_calls is None:
+            super().__init__(cfunc, obj, None, True)
+        else:
+            super().__init__(cfunc, obj, None, True, recurse_calls=recurse_calls)
         self._origin = origin
         self._structure = structure
+
 
     @staticmethod
     def _describe_tinfo(tinfo: Optional[ida_typeinf.tinfo_t]) -> str:
