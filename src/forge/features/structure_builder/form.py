@@ -280,6 +280,9 @@ class StructureBuilderForm(ida_kernwin.PluginForm):
         )
         self.ui.tbl_structure.itemChanged.connect(self.structure_table_item_changed)
         self.ui.tbl_structure.itemSelectionChanged.connect(self.update_action_states)
+        self.ui.tbl_structure.currentCellChanged.connect(
+            lambda *_args: self.update_action_states()
+        )
         self.ui.tbl_structure.cellClicked.connect(
             lambda *_args: self.update_action_states()
         )
