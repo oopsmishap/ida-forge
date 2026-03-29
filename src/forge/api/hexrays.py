@@ -44,6 +44,11 @@ def decompile(ea: int):
         )
 
 
+
+def mark_cfunc_dirty(ea: int, close_views: bool = False) -> None:
+    if hasattr(ida_hexrays, "mark_cfunc_dirty"):
+        ida_hexrays.mark_cfunc_dirty(ea, close_views)
+
 def get_line(ctree: ida_hexrays.ctree_parentee_t, cfunc) -> str:
     for p in reversed(ctree.parents):
         if not p.is_expr():

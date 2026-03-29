@@ -2,6 +2,7 @@ import ida_funcs
 import ida_hexrays
 import ida_idaapi
 
+from forge.api import hexrays as hexrays_api
 from forge.api.hexrays import *
 from forge.api.scan_object import (
     ScanObject,
@@ -398,23 +399,112 @@ class RecursiveDownwardsObjectVisitor(RecursiveObjectVisitor, DownwardsObjectVis
         if self._add_visit(func_ea, idx):
             self._add_scan_tree_info(func_ea, idx)
 
+    def _refresh_decompilation_tree(self, cfunc: ida_hexrays.cfunc_t | None = None) -> ida_hexrays.cfunc_t | None:
+        target_cfunc = cfunc or self._cfunc
+        refreshed = refresh_function_tree_postorder(target_cfunc)
+        if refreshed is not None:
+            return refreshed
+        return target_cfunc
+
     def _recursive_process(self):
+        self._cfunc = self._refresh_decompilation_tree(self._cfunc)
         super(RecursiveDownwardsObjectVisitor, self)._recursive_process()
 
-        while self._new_for_visit:
-            func_ea, arg_idx = self._new_for_visit.pop()
+
+        pending_visits = list(self._new_for_visit)
+        self._new_for_visit.clear()
+        deferred_visits: list[tuple[int, int]] = []
+
+        while pending_visits:
+            func_ea, arg_idx = pending_visits.pop()
             # TODO: implement is_imported_ea
             # if is_imported_ea(func_ea):
             #     continue
             cfunc = decompile(func_ea)
             if cfunc is None:
                 continue
-            if arg_idx is None or arg_idx < 0 or arg_idx >= len(getattr(cfunc, "argidx", ())):
+            cfunc = self._refresh_decompilation_tree(cfunc)
+            if cfunc is None:
                 continue
+
+            argidx = getattr(cfunc, "argidx", ())
+            if arg_idx is None or arg_idx < 0 or arg_idx >= len(argidx):
+                deferred_visits.append((func_ea, arg_idx))
+                continue
+
             arg, lvar_idx = get_argument(cfunc, arg_idx)
             obj = VariableObject(arg, lvar_idx)
+
+            saved_cfunc = self._cfunc
+            saved_arg_index = getattr(self, "_arg_index", None)
+            saved_objects = list(getattr(self, "_objects", []))
+            saved_skip = getattr(self, "_skip", False)
+            saved_init_obj = getattr(self, "_init_obj", None)
+
             self.prepare_new_scan(cfunc, lvar_idx, obj)
             self._recursive_process()
+
+            self._cfunc = saved_cfunc
+            self._arg_index = saved_arg_index
+            self._objects = saved_objects
+            self._skip = saved_skip
+            self._init_obj = saved_init_obj
+            self._cfunc = self._refresh_decompilation_tree()
+            super(RecursiveDownwardsObjectVisitor, self)._recursive_process()
+            if self._new_for_visit:
+                pending_visits.extend(self._new_for_visit)
+                self._new_for_visit.clear()
+
+            if not pending_visits:
+                pending_visits = deferred_visits
+                deferred_visits = []
+                if not pending_visits:
+                    return
+
+        while deferred_visits:
+            next_round: list[tuple[int, int]] = []
+            progressed = False
+            for func_ea, arg_idx in deferred_visits:
+                cfunc = decompile(func_ea)
+                if cfunc is None:
+                    continue
+                cfunc = self._refresh_decompilation_tree(cfunc)
+                if cfunc is None:
+                    continue
+
+                argidx = getattr(cfunc, "argidx", ())
+                if arg_idx is None or arg_idx < 0 or arg_idx >= len(argidx):
+                    next_round.append((func_ea, arg_idx))
+                    continue
+
+                arg, lvar_idx = get_argument(cfunc, arg_idx)
+                obj = VariableObject(arg, lvar_idx)
+
+                saved_cfunc = self._cfunc
+                saved_arg_index = getattr(self, "_arg_index", None)
+                saved_objects = list(getattr(self, "_objects", []))
+                saved_skip = getattr(self, "_skip", False)
+                saved_init_obj = getattr(self, "_init_obj", None)
+
+                self.prepare_new_scan(cfunc, lvar_idx, obj)
+                self._recursive_process()
+
+                self._cfunc = saved_cfunc
+                self._arg_index = saved_arg_index
+                self._objects = saved_objects
+                self._skip = saved_skip
+                self._init_obj = saved_init_obj
+                self._cfunc = self._refresh_decompilation_tree()
+                super(RecursiveDownwardsObjectVisitor, self)._recursive_process()
+                if self._new_for_visit:
+                    pending_visits.extend(self._new_for_visit)
+                    self._new_for_visit.clear()
+                progressed = True
+
+            if not progressed or not next_round:
+                break
+            deferred_visits = next_round
+
 
 
 class RecursiveUpwardsObjectVisitor(RecursiveObjectVisitor, UpwardsObjectVisitor):
@@ -518,3 +608,67 @@ class FunctionTouchVisitor(ida_hexrays.ctree_parentee_t):
                     stack.extend(self._functions)
             except ida_hexrays.DecompilationFailure:
                 log_warning(f"Failed to decompile function {to_hex(address)}")
+
+
+def _mark_cfunc_dirty(ea: int) -> None:
+    dirty = getattr(hexrays_api, "mark_cfunc_dirty", None)
+    if callable(dirty):
+        dirty(ea, False)
+
+
+def refresh_function_tree_postorder(
+    cfunc: ida_hexrays.cfunc_t,
+) -> ida_hexrays.cfunc_t | None:
+    visited: set[int] = set()
+
+    def _touch(func_ea: int) -> ida_hexrays.cfunc_t | None:
+        if is_imported(func_ea):
+            return None
+
+        _mark_cfunc_dirty(func_ea)
+        current = decompile(func_ea)
+        if current is None:
+            return None
+
+        if func_ea in visited:
+            return current
+        visited.add(func_ea)
+
+        seen_callees: set[int] = set()
+        while True:
+            body = getattr(current, "body", None)
+            if body is None:
+                return current
+
+            collector = FunctionTouchVisitor(current)
+            apply_to = getattr(collector, "apply_to", None)
+            if callable(apply_to):
+                try:
+                    apply_to(body, None)
+                except AttributeError:
+                    pass
+            else:
+                collector.visit_expr(body)
+
+            callees = sorted(
+                callee_ea
+                for callee_ea in getattr(collector, "_functions", set())
+                if callee_ea not in seen_callees and not is_imported(callee_ea)
+            )
+            if not callees:
+                break
+
+            for callee_ea in callees:
+                _touch(callee_ea)
+                seen_callees.add(callee_ea)
+
+            _mark_cfunc_dirty(func_ea)
+            refreshed = decompile(func_ea)
+            if refreshed is None:
+                return current
+            current = refreshed
+
+        return current
+
+    refreshed = _touch(cfunc.entry_ea)
+    return refreshed or cfunc

@@ -26,10 +26,8 @@ from forge.api.scan_object import ScanObject, StructurePointerObject, StructureR
 from forge.api.scanner import NewDeepScanVisitor
 from forge.api.structure import Structure, StructureRelationship
 from forge.api.ui import Choose, set_row_background_color, set_row_foreground_color
-from forge.api.visitor import FunctionTouchVisitor
 from forge.util.logging import log_warning
 from .config import config
-
 
 class Column(IntEnum):
     offset = 0
@@ -934,11 +932,12 @@ class StructureBuilderForm(ida_kernwin.PluginForm):
             log_warning(f"Failed to decompile function at {hex(func_ea)}", True)
             return None
 
-        if FunctionTouchVisitor(cfunc).process():
-            refreshed = decompile(func_ea)
-            if refreshed is not None:
-                cfunc = refreshed
-        return cfunc
+        from forge.api.visitor import refresh_function_tree_postorder
+
+        return refresh_function_tree_postorder(cfunc) or cfunc
+
+
+
 
     def _build_child_scan_plan(
         self,
@@ -1831,6 +1830,9 @@ class StructureBuilderForm(ida_kernwin.PluginForm):
             return
         if name in self.structures:
             log_warning("That structure name already exists!", True)
+            return
+
+        if not self.current_structure.rename_created_type(old_name, name):
             return
 
         self.structures[name] = self.current_structure

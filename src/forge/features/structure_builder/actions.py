@@ -4,7 +4,6 @@ import idaapi
 from forge.api.hexrays import decompile, get_funcs_referencing_address, is_legal_type
 from forge.api.scan_object import GlobalVariableObject, ObjectType, ScanObject
 from forge.api.scanner import NewShallowScanVisitor, NewDeepScanVisitor
-from forge.api.visitor import FunctionTouchVisitor
 from forge.api.ui_actions import register_action, UIMenuAction, HexRaysPopupAction
 from forge.util.logging import log_warning
 from .config import config
@@ -36,9 +35,8 @@ class StructureBuilderAction(HexRaysPopupAction):
 
     @staticmethod
     def _prepare_function(cfunc: ida_hexrays.cfunc_t) -> ida_hexrays.cfunc_t:
-        FunctionTouchVisitor(cfunc).process()
-        refreshed_cfunc = decompile(cfunc.entry_ea)
-        return refreshed_cfunc or cfunc
+        from forge.api.visitor import refresh_function_tree_postorder
+        return refresh_function_tree_postorder(cfunc) or cfunc
 
     @staticmethod
     def _provenance_kind_for_object(obj: ScanObject) -> str:
