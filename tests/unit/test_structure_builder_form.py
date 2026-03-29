@@ -521,14 +521,19 @@ def test_scan_child_structure_auto_creates_child_and_records_metadata(monkeypatc
     parent = structure_form.create_structure("Parent")
     assert parent is not None
 
-    member = _FakeMember(0x30, 8, type_name="Child *", name="child_ptr")
+    member = _FakeMember(0x30, 8, type_name="u64", name="child_ptr")
+    member.tinfo = SimpleNamespace(is_ptr=lambda: False, is_udt=lambda: False)
+    member.scanned_variables = [
+        SimpleNamespace(func_ea=0x401000, ea=0x402000, name="root"),
+    ]
+    parent.created_type_name = "Parent_t"
     parent.add_member(member)
     structure_form.current_structure = parent
 
     plan = form_module.ChildScanPlan(
         scan_object=SimpleNamespace(name="child_ptr"),
         function_eas=(0x401000,),
-        relation_kind="pointer",
+        relation_kind="embedded",
         root_object_name="Parent.child_ptr",
         root_object_ea=0x402000,
         root_function_ea=0x401000,
@@ -557,7 +562,10 @@ def test_scan_child_structure_auto_creates_child_and_records_metadata(monkeypatc
     assert child.provenance.root_object_name == "Parent.child_ptr"
     assert child.provenance.source_member_offset == 0x30
     assert member.linked_child_structure_name == child.name
-    assert member.child_relation_kind == "pointer"
+    assert member.child_relation_kind == "embedded"
+    assert parent.child_relationships[0].child_structure_name == child.name
+    assert child.parent_relationships[0].parent_structure_name == "Parent"
+
     assert parent.child_relationships[0].child_structure_name == child.name
     assert child.parent_relationships[0].parent_structure_name == "Parent"
 
@@ -654,10 +662,11 @@ def test_build_child_scan_plan_uses_created_parent_type(monkeypatch):
     assert parent is not None
 
     parent.created_type_name = "Parent_t"
-    member = _FakeMember(0x30, 8, type_name="Child *", name="child_ptr")
-    member.tinfo = SimpleNamespace(is_ptr=lambda: True, is_udt=lambda: False)
+    parent.created_type_name = "Parent_t"
+    member = _FakeMember(0x30, 8, type_name="u64", name="child_ptr")
+    member.tinfo = SimpleNamespace(is_ptr=lambda: False, is_udt=lambda: False)
     member.scanned_variables = [
-        SimpleNamespace(func_ea=0x401000, ea=0x402000, name="root")
+        SimpleNamespace(func_ea=0x401000, ea=0x402000, name="root"),
     ]
     structure_form.current_structure = parent
     monkeypatch.setattr(form_module, "is_legal_type", lambda _tinfo: True)
@@ -665,11 +674,12 @@ def test_build_child_scan_plan_uses_created_parent_type(monkeypatch):
     plan = structure_form._build_child_scan_plan(member)
 
     assert plan is not None
-    assert plan.relation_kind == "pointer"
+    assert plan.relation_kind == "embedded"
     assert plan.function_eas == (0x401000,)
     assert plan.root_object_name == "Parent.child_ptr"
     assert plan.scan_object.struct_name == "Parent_t"
     assert plan.scan_object.offset == 0x30
+
 
 
 def test_build_child_scan_plan_requires_unambiguous_parent_evidence(monkeypatch):
@@ -693,11 +703,14 @@ def test_update_action_states_enables_child_scan_actions_for_scannable_member(mo
     parent = structure_form.create_structure("Parent")
     assert parent is not None
 
-    member = _FakeMember(0x30, 8, type_name="Child *", name="child_ptr")
+    member = _FakeMember(0x30, 8, type_name="u64", name="child_ptr")
+    member.tinfo = SimpleNamespace(is_ptr=lambda: False, is_udt=lambda: False)
+    member.scanned_variables = [SimpleNamespace(func_ea=0x401000, ea=0x402000, name="root")]
+    parent.created_type_name = "Parent_t"
     parent.add_member(member)
     structure_form.current_structure = parent
 
-    plan = SimpleNamespace(function_eas=(0x401000,), relation_kind="pointer")
+    plan = SimpleNamespace(function_eas=(0x401000,), relation_kind="embedded")
 
     structure_form.ui = SimpleNamespace(
         btn_remove=_Recorder(),
@@ -750,3 +763,4 @@ def test_update_action_states_enables_child_scan_actions_for_scannable_member(mo
     assert structure_form.ui.btn_scan_child.enabled is True
     assert structure_form.ui.action_scan_child.enabled is True
     assert "child scan ready" in structure_form._format_selected_member_info(member)
+
