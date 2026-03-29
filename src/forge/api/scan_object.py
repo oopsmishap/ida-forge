@@ -40,17 +40,19 @@ def _type_name_matches(tinfo, expected_name: str) -> bool:
 
 
 def _strip_casts_and_refs(expr):
-    while expr is not None and expr.op in (ctype.cast, ctype.ref):
+    while expr is not None and hasattr(expr, "op") and expr.op in (ctype.cast, ctype.ref):
         expr = expr.x
     return expr
+
 
 
 def _extract_offset_expression(expr):
     offset = 0
     current = expr
-    while current is not None and current.op in (ctype.cast, ctype.ref):
+    while current is not None and hasattr(current, "op") and current.op in (ctype.cast, ctype.ref):
         current = current.x
-    while current is not None and current.op in (ctype.add, ctype.sub, ctype.idx):
+    while current is not None and hasattr(current, "op") and current.op in (ctype.add, ctype.sub, ctype.idx):
+
         if current.op == ctype.idx:
             if not hasattr(current, "y") or current.y is None:
                 current = _strip_casts_and_refs(getattr(current, "x", None))
@@ -67,16 +69,17 @@ def _extract_offset_expression(expr):
 
         left = _strip_casts_and_refs(current.x)
         right = _strip_casts_and_refs(current.y)
-        if left is not None and left.op == ctype.num and right is not None:
+        if left is not None and hasattr(left, "op") and left.op == ctype.num and right is not None:
             offset += left.numval() if current.op == ctype.add else -left.numval()
             current = right
             continue
-        if right is not None and right.op == ctype.num and left is not None:
+        if right is not None and hasattr(right, "op") and right.op == ctype.num and left is not None:
             offset += right.numval() if current.op == ctype.add else -right.numval()
             current = left
             continue
         current = left if right is None else right
         continue
+
 
     return current, offset
 
@@ -279,10 +282,20 @@ class StructureReferenceObject(ScanObject):
         """
         Checks if expression is a member of a structure
         """
-        if cexpr.op != ctype.memref or not hasattr(cexpr, "x") or cexpr.x is None:
+        if cexpr.op == ctype.memref:
+            if not hasattr(cexpr, "x") or cexpr.x is None:
+                return False
+            struct_type = _unwrap_struct_type(getattr(cexpr.x, "type", None))
+            return cexpr.m == self.offset and _type_name_matches(struct_type, self.struct_name)
+
+        base_expr, offset = _extract_offset_expression(cexpr)
+        if base_expr is None or offset != self.offset:
             return False
-        struct_type = _unwrap_struct_type(getattr(cexpr.x, "type", None))
-        return cexpr.m == self.offset and _type_name_matches(struct_type, self.struct_name)
+
+        base_type = _unwrap_struct_type(getattr(base_expr, "type", None))
+        return base_type is None or _type_name_matches(base_type, self.struct_name)
+
+
 
 
 

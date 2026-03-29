@@ -135,6 +135,16 @@ def test_structure_pointer_and_reference_targets_ignore_type_wrappers():
     assert StructureReferenceObject("MyStruct", 4).is_target(ref_expr) is True
 
 
+def test_structure_reference_targets_match_pointer_arithmetic_expression():
+    expr = FakeExpr(
+        ctype.add,
+        x=SimpleNamespace(type=FakeType("MyStruct")),
+        y=FakeNumberExpr(0xCD8),
+    )
+
+    assert StructureReferenceObject("MyStruct", 0xCD8).is_target(expr) is True
+
+
 def test_structure_member_targets_ignore_incomplete_expressions():
     ptr_expr = FakeExpr(ctype.memptr, m=8)
     ref_expr = FakeExpr(ctype.memref, m=4)
