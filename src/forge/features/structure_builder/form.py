@@ -1495,7 +1495,11 @@ class StructureBuilderForm(ida_kernwin.PluginForm):
         if scanned_variables:
             parts.append(f"uses {len(scanned_variables)}")
 
+        if self._build_child_scan_plan(member) is not None:
+            parts.append("child scan ready")
+
         return " | ".join(parts)
+
 
     def _format_type_status(self, structure: Structure) -> str:
         status = (
@@ -2008,6 +2012,10 @@ class StructureBuilderForm(ida_kernwin.PluginForm):
         if item is not None and not self.ui.tbl_structure.item(item.row(), 0).isSelected():
             self.ui.tbl_structure.selectRow(item.row())
 
+        selected_member = self.get_selected_member()
+        can_scan_child = self._build_child_scan_plan(selected_member) is not None
+        can_open_child = bool(getattr(selected_member, "linked_child_structure_name", None))
+
         menu = QMenu()
         menu.addAction("Add Row", self.add_manual_row)
         menu.addAction("Insert Row Before", self.add_manual_row_before)
@@ -2069,6 +2077,7 @@ class StructureBuilderForm(ida_kernwin.PluginForm):
         create_subtree_types_action = menu.addAction("Create Type Subtree")
         create_subtree_types_action.setEnabled(bool(self.current_structure.child_relationships))
         create_subtree_types_action.triggered.connect(self.create_type_subtree)
+
         clear_action = menu.addAction("Clear")
         clear_action.setEnabled(bool(self.current_structure.members))
         clear_action.triggered.connect(self.structure_table_clear)
@@ -2079,9 +2088,20 @@ class StructureBuilderForm(ida_kernwin.PluginForm):
         scanned_variables_action.setEnabled(bool(self.current_structure.members))
         scanned_variables_action.triggered.connect(self.show_scanned_variables)
 
+        scan_child_action = menu.addAction("Scan Child Structure")
+        scan_child_action.setEnabled(can_scan_child)
+        scan_child_action.triggered.connect(self.scan_child_structure)
+
+        open_child_action = menu.addAction("Open Linked Child")
+        open_child_action.setEnabled(can_open_child)
+        open_child_action.triggered.connect(self.open_linked_child_structure)
+
         recognize_action = menu.addAction("Recognize VTable")
-        recognize_action.setEnabled(isinstance(self.get_selected_member(), VirtualTable))
+        recognize_action.setEnabled(isinstance(selected_member, VirtualTable))
         recognize_action.triggered.connect(self.structure_table_recognize)
+
+        qt_exec(menu, self.ui.tbl_structure.viewport().mapToGlobal(point))
+
 
         qt_exec(menu, self.ui.tbl_structure.viewport().mapToGlobal(point))
 

@@ -511,6 +511,9 @@ def test_update_action_states_enables_child_type_actions_for_child_relationships
     assert structure_form.ui.btn_create_subtree_types.enabled is True
     assert structure_form.ui.action_create_child_types.enabled is True
     assert structure_form.ui.action_create_subtree_types.enabled is True
+    assert structure_form.ui.btn_scan_child.enabled is False
+    assert structure_form.ui.action_scan_child.enabled is False
+
 
 
 def test_scan_child_structure_auto_creates_child_and_records_metadata(monkeypatch):
@@ -684,3 +687,66 @@ def test_build_child_scan_plan_requires_unambiguous_parent_evidence(monkeypatch)
     monkeypatch.setattr(form_module, "is_legal_type", lambda _tinfo: True)
 
     assert structure_form._build_child_scan_plan(member) is None
+
+def test_update_action_states_enables_child_scan_actions_for_scannable_member(monkeypatch):
+    structure_form = _make_form(monkeypatch)
+    parent = structure_form.create_structure("Parent")
+    assert parent is not None
+
+    member = _FakeMember(0x30, 8, type_name="Child *", name="child_ptr")
+    parent.add_member(member)
+    structure_form.current_structure = parent
+
+    plan = SimpleNamespace(function_eas=(0x401000,), relation_kind="pointer")
+
+    structure_form.ui = SimpleNamespace(
+        btn_remove=_Recorder(),
+        btn_duplicate_structure=_Recorder(),
+        btn_apply_name=_Recorder(),
+        input_name=_Recorder(),
+        input_filter=_Recorder(),
+        tbl_structure=_Recorder(),
+        btn_auto_resolve=_Recorder(),
+        btn_create_type=_Recorder(),
+        btn_enable_rows=_Recorder(),
+        btn_disable_rows=_Recorder(),
+        btn_toggle_array=_Recorder(),
+        btn_set_origin=_Recorder(),
+        btn_remove_rows=_Recorder(),
+        btn_clear_rows=_Recorder(),
+        btn_view_scanned_uses=_Recorder(),
+        btn_recognize_vtable=_Recorder(),
+        btn_add_row=_Recorder(),
+        btn_duplicate_row=_Recorder(),
+        btn_edit_row=_Recorder(),
+        btn_scan_child=_Recorder(),
+        btn_open_child=_Recorder(),
+        btn_create_child_types=_Recorder(),
+        btn_create_subtree_types=_Recorder(),
+        action_enable=_Recorder(),
+        action_disable=_Recorder(),
+        action_resolve=_Recorder(),
+        action_finalize=_Recorder(),
+        action_edit=_Recorder(),
+        action_add_row=_Recorder(),
+        action_duplicate_row=_Recorder(),
+        action_scan_child=_Recorder(),
+        action_create_child_types=_Recorder(),
+        action_create_subtree_types=_Recorder(),
+    )
+    monkeypatch.setattr(structure_form, "get_selected_rows", lambda: [member])
+    monkeypatch.setattr(structure_form, "get_selected_member", lambda: member)
+    monkeypatch.setattr(structure_form, "_build_child_scan_plan", lambda _member, show_warnings=False: plan)
+    monkeypatch.setattr(structure_form, "_update_summary_label", lambda: None)
+    monkeypatch.setattr(structure_form, "_update_inspector_panel", lambda: None)
+    monkeypatch.setattr(
+        structure_form,
+        "update_action_states",
+        form_module.StructureBuilderForm.update_action_states.__get__(structure_form),
+    )
+
+    structure_form.update_action_states()
+
+    assert structure_form.ui.btn_scan_child.enabled is True
+    assert structure_form.ui.action_scan_child.enabled is True
+    assert "child scan ready" in structure_form._format_selected_member_info(member)
