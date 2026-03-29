@@ -662,7 +662,6 @@ def test_build_child_scan_plan_uses_created_parent_type(monkeypatch):
     assert parent is not None
 
     parent.created_type_name = "Parent_t"
-    parent.created_type_name = "Parent_t"
     member = _FakeMember(0x30, 8, type_name="u64", name="child_ptr")
     member.tinfo = SimpleNamespace(is_ptr=lambda: False, is_udt=lambda: False)
     member.scanned_variables = [
@@ -680,6 +679,25 @@ def test_build_child_scan_plan_uses_created_parent_type(monkeypatch):
     assert plan.scan_object.struct_name == "Parent_t"
     assert plan.scan_object.offset == 0x30
 
+def test_build_child_scan_plan_accepts_inferred_primitive_member(monkeypatch):
+    structure_form = _make_form(monkeypatch)
+    parent = structure_form.create_structure("Parent")
+    assert parent is not None
+
+    member = _FakeMember(0xCD8, 8, type_name="u64", name="child_ptr")
+    member.tinfo = SimpleNamespace(is_ptr=lambda: False, is_udt=lambda: False)
+    member.scanned_variables = [
+        SimpleNamespace(func_ea=0x401000, ea=0x402000, name="root", _name="auto_struct_001"),
+    ]
+    structure_form.current_structure = parent
+    monkeypatch.setattr(form_module, "is_legal_type", lambda _tinfo: True)
+
+    plan = structure_form._build_child_scan_plan(member)
+
+    assert plan is not None
+    assert plan.relation_kind == "embedded"
+    assert plan.scan_object.struct_name == "auto_struct_001"
+    assert plan.scan_object.offset == 0xCD8
 
 
 def test_build_child_scan_plan_requires_unambiguous_parent_evidence(monkeypatch):
