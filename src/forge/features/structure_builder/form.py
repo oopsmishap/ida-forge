@@ -983,17 +983,13 @@ class StructureBuilderForm(ida_kernwin.PluginForm):
                 self.current_structure.created_type_name or self.current_structure.name,
                 member.offset,
             )
-        elif hasattr(tinfo, "is_udt") and tinfo.is_udt():
+        else:
             relation_kind = "embedded"
             scan_object = StructureReferenceObject(
                 self.current_structure.created_type_name or self.current_structure.name,
                 member.offset,
             )
-        else:
-            warn(
-                "Only pointer or embedded-structure rows can be scanned as child structures right now."
-            )
-            return None
+
 
         parent_struct_name = self.current_structure.created_type_name
         if not parent_struct_name:
@@ -1009,11 +1005,13 @@ class StructureBuilderForm(ida_kernwin.PluginForm):
             )
             if len(parent_struct_names) != 1:
                 warn(
-                    "Child scan currently requires a typed parent structure or unambiguous member evidence."
+                    "Child scan currently requires a typed parent structure or unambiguous member evidence.",
                 )
                 return None
             parent_struct_name = parent_struct_names[0]
             scan_object = type(scan_object)(parent_struct_name, member.offset)
+
+
 
         function_eas = tuple(
             sorted(
