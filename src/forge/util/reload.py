@@ -13,14 +13,18 @@ def reload_module(module: ModuleType):
     importlib.reload(module)
 
 
-def recursive_reload(module: ModuleType):
+def recursive_reload(module: ModuleType, exclude_prefixes: tuple[str, ...] = ()) -> None:
     """
     Recursively reloads a module and its submodules.
 
-    :param module: The module to recursively reload.
+    Reload foundational modules first so dependent modules import the freshly
+    reloaded singletons and registries instead of the stale ones left behind
+    by a hot-reload.
     """
     module_name = module.__name__
-    module_names = [name for name in sys.modules.keys() if name.startswith(module_name)]
+    module_names = sorted(name for name in sys.modules.keys() if name.startswith(module_name))
 
     for name in module_names:
+        if any(name == prefix or name.startswith(f"{prefix}.") for prefix in exclude_prefixes):
+            continue
         reload_module(sys.modules[name])

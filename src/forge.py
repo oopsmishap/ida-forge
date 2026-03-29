@@ -107,11 +107,16 @@ class ForgePlugin(idaapi.plugin_t):
         """Hot-reload the plugin modules and recreate the core."""
         log_debug(f"Reloading {self.wanted_name}")
 
+        self._clear_menu_timer()
+
         if self._core is not None:
-            self._core.unload()
+            self._core.unload(keep_menu=True)
             self._core = None
 
-        recursive_reload(forge)
+        # Keep the UIActionManager module loaded so the top-level Forge menu
+        # remains the same menubar item across hot-reloads; only refresh the
+        # action modules beneath it.
+        recursive_reload(forge, exclude_prefixes=("forge.api.ui_actions",))
 
         from forge.core import ForgeCore as Core
 

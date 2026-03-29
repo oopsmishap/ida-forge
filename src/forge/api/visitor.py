@@ -68,6 +68,7 @@ class DownwardsObjectVisitor(ObjectVisitor):
     ):
         super(DownwardsObjectVisitor, self).__init__(cfunc, obj, data, skip_until_object)
         self.cv_flags |= ida_hexrays.CV_POST
+        self._rescan_current_function = False
 
     def visit_expr(self, cexpr: ida_hexrays.cexpr_t):
         if self._skip:
@@ -94,10 +95,15 @@ class DownwardsObjectVisitor(ObjectVisitor):
                     self._objects.remove(obj)
             elif obj.is_target(y_cexpr):
                 new_obj = ScanObject.create(self._cfunc, x_cexpr)
-                if new_obj:
+                if new_obj and new_obj not in self._objects:
                     if hasattr(new_obj, "inherit_scan_root_from"):
                         new_obj.inherit_scan_root_from(obj)
                     self._objects.append(new_obj)
+                    if (
+                        getattr(new_obj, "func_ea", ida_idaapi.BADADDR)
+                        == getattr(self._cfunc, "entry_ea", ida_idaapi.BADADDR)
+                    ):
+                        self._rescan_current_function = True
                 return 0
 
         return 0
@@ -419,7 +425,12 @@ class RecursiveDownwardsObjectVisitor(RecursiveObjectVisitor, DownwardsObjectVis
 
     def _recursive_process(self):
         self._cfunc = self._refresh_decompilation_tree(self._cfunc)
-        super(RecursiveDownwardsObjectVisitor, self)._recursive_process()
+        while True:
+            self._rescan_current_function = False
+            super(RecursiveDownwardsObjectVisitor, self)._recursive_process()
+            if not self._rescan_current_function:
+                break
+            self._cfunc = self._refresh_decompilation_tree(self._cfunc)
 
 
         pending_visits = list(self._new_for_visit)

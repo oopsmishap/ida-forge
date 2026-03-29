@@ -393,3 +393,61 @@ def test_refresh_function_tree_postorder_discovers_new_root_callees_after_child_
     assert 0x404000 in touched
     assert touched.count(0x401000) >= 2
 
+
+
+def test_downwards_object_visitor_marks_same_function_rescan_for_new_local(monkeypatch):
+    visitor_module = _load_visitor_module()
+    visitor = visitor_module.DownwardsObjectVisitor.__new__(
+        visitor_module.DownwardsObjectVisitor
+    )
+    visitor._cfunc = SimpleNamespace(entry_ea=0x401000)
+    visitor._skip = False
+    visitor._rescan_current_function = False
+    root_obj = SimpleNamespace(
+        id=visitor_module.ObjectType.local_variable,
+        name="root",
+        is_target=lambda expr: getattr(expr, "name", None) == "root",
+    )
+    visitor._objects = [root_obj]
+    new_expr = SimpleNamespace(op=visitor_module.ctype.var, name="v1")
+    root_expr = SimpleNamespace(op=visitor_module.ctype.var, name="root")
+    asg_op = getattr(visitor_module.ctype, "asg", 1)
+    monkeypatch.setattr(visitor_module.ctype, "asg", asg_op, raising=False)
+    asg_expr = SimpleNamespace(op=asg_op, x=new_expr, y=root_expr)
+    new_obj = SimpleNamespace(func_ea=0x401000, name="v1")
+    new_obj.inherit_scan_root_from = lambda other: setattr(new_obj, "inherited_from", other.name)
+    monkeypatch.setattr(
+        visitor_module.ScanObject,
+        "create",
+        staticmethod(lambda _cfunc, expr: new_obj if expr is new_expr else None),
+    )
+
+    visitor.visit_expr(asg_expr)
+
+    assert visitor._objects == [root_obj, new_obj]
+    assert getattr(new_obj, "inherited_from", None) == "root"
+    assert visitor._rescan_current_function is True
+
+
+def test_recursive_downwards_object_visitor_rescans_current_function_until_stable(monkeypatch):
+    visitor_module = _load_visitor_module()
+    visitor = visitor_module.RecursiveDownwardsObjectVisitor.__new__(
+        visitor_module.RecursiveDownwardsObjectVisitor
+    )
+    visitor._cfunc = SimpleNamespace(entry_ea=0x401000)
+    visitor._new_for_visit = set()
+    visitor._objects = []
+    visitor._skip = False
+    visitor._init_obj = None
+    visitor._rescan_current_function = False
+    visitor._refresh_decompilation_tree = lambda cfunc=None: cfunc or visitor._cfunc
+    calls: list[int] = []
+    monkeypatch.setattr(
+        visitor_module.RecursiveObjectVisitor,
+        "_recursive_process",
+        lambda self: (calls.append(self._cfunc.entry_ea), setattr(self, "_rescan_current_function", len(calls) == 1)),
+    )
+
+    visitor._recursive_process()
+
+    assert calls == [0x401000, 0x401000]

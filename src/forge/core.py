@@ -26,10 +26,10 @@ class ForgeCore:
         """Attach registered actions to IDA's menu bar when the UI is ready."""
         return self._ui_action_manager.show_menu()
 
-    def unload(self) -> None:
+    def unload(self, keep_menu: bool = False) -> None:
         """Unregister UI actions and hooks."""
         log_debug("Unloading Forge")
-        self._ui_action_manager.finalize()
+        self._ui_action_manager.finalize(keep_main_menu=keep_menu)
         self._hook_manager.finalize()
 
     @staticmethod

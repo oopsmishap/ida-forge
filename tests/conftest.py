@@ -101,10 +101,13 @@ _stub_module(
     unregister_action=lambda *args, **kwargs: True,
     create_menu=lambda *args, **kwargs: True,
     delete_menu=lambda *args, **kwargs: True,
+    detach_action_from_menu=lambda *args, **kwargs: True,
     attach_action_to_menu=lambda *args, **kwargs: True,
     attach_action_to_popup=lambda *args, **kwargs: True,
+    execute_ui_requests=lambda *args, **kwargs: True,
     action_desc_t=lambda *args, **kwargs: (args, kwargs),
     action_handler_t=_DummyActionHandler,
+
     HIST_TYPE=0,
     AST_ENABLE_FOR_IDB=1,
     AST_ENABLE_FOR_WIDGET=2,

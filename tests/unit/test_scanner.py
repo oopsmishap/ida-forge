@@ -86,6 +86,56 @@ def test_prefer_object_tinfo_keeps_structure_like_members(obj_tinfo, call_tinfo,
     assert preferred.dstr() == expected_name
 
 
+
+def test_parse_left_assignee_handles_cast_pointer_assignment():
+    scanner_module = _load_scanner_module()
+    visitor = scanner_module.ScanVisitor.__new__(scanner_module.ScanVisitor)
+    scanner_module.ctype = SimpleNamespace(cast=1, ptr=2, idx=2, add=3, num=4, asg=5, var=6)
+
+    leaf = SimpleNamespace(op=scanner_module.ctype.var)
+    cast = SimpleNamespace(op=scanner_module.ctype.cast, x=leaf)
+    ptr = SimpleNamespace(op=scanner_module.ctype.ptr, x=cast)
+
+    parsed = visitor._parse_left_assignee(ptr, 0)
+
+    assert parsed is not None
+    base, offset = parsed
+    assert base is leaf
+    assert offset == 0
+
+
+def test_extract_member_recognizes_cast_pointer_assignment_on_left_hand_side():
+    scanner_module = _load_scanner_module()
+    visitor = scanner_module.ScanVisitor.__new__(scanner_module.ScanVisitor)
+    scanner_module.ctype = SimpleNamespace(cast=1, ptr=2, idx=2, add=3, num=4, asg=5, var=6)
+
+    captured = {}
+
+    def fake_get_member(offset, cexpr, obj, tinfo, obj_ea=None):
+        captured['offset'] = offset
+        captured['tinfo'] = tinfo
+        captured['obj_ea'] = obj_ea
+        return 'member'
+
+    visitor._get_member = fake_get_member
+    visitor._describe_tinfo = lambda tinfo: getattr(tinfo, 'dstr', lambda: str(tinfo))()
+    visitor._deref_tinfo = lambda tinfo: tinfo
+    visitor._parse_call = lambda *_args, **_kwargs: None
+    visitor._extract_obj_ea = lambda *_args, **_kwargs: None
+
+    leaf = SimpleNamespace(op=scanner_module.ctype.var, type=SimpleNamespace(dstr=lambda: 'void *'))
+    cast = SimpleNamespace(op=scanner_module.ctype.cast, x=leaf, type=SimpleNamespace(dstr=lambda: 'u64 *'))
+    ptr = SimpleNamespace(op=scanner_module.ctype.ptr, x=cast, type=SimpleNamespace(dstr=lambda: 'u64 **'))
+    asg = SimpleNamespace(op=scanner_module.ctype.asg, x=ptr, y=SimpleNamespace(op=scanner_module.ctype.num))
+
+    context = scanner_module.ParentExpressionContext([asg])
+    result = visitor._extract_member(leaf, SimpleNamespace(name='v2'), 0, context)
+
+
+    assert result == 'member'
+    assert captured['offset'] == 0
+    assert captured['tinfo'].dstr() == 'u64 **'
+
 def test_scanned_object_create_inherits_scan_root_metadata(monkeypatch):
     scanner_module = _load_scanner_module()
     scan_object_module = import_module("forge.api.scan_object")
@@ -108,3 +158,54 @@ def test_scanned_object_create_inherits_scan_root_metadata(monkeypatch):
     assert scanned.scan_root_ea == 0x401234
     assert scanned.scan_root_function_name == "sub_401000"
 
+
+
+def test_extract_member_logs_coherent_warning_when_argument_info_missing(monkeypatch):
+    scanner_module = _load_scanner_module()
+    visitor = scanner_module.ScanVisitor.__new__(scanner_module.ScanVisitor)
+    scanner_module.ctype = SimpleNamespace(cast=1, ptr=2, idx=2, add=3, num=4, asg=5, var=6, call=7)
+
+    captured = {}
+
+    def fake_get_member(offset, cexpr, obj, tinfo, obj_ea=None):
+        captured["offset"] = offset
+        captured["tinfo"] = tinfo
+        captured["obj_ea"] = obj_ea
+        return "member"
+
+    def fake_warning(message=None, display_messagebox=False):
+        captured["warning"] = message
+        captured["display_messagebox"] = display_messagebox
+
+    visitor._get_member = fake_get_member
+    visitor._describe_tinfo = lambda tinfo: getattr(tinfo, "dstr", lambda: str(tinfo))()
+    visitor._deref_tinfo = lambda tinfo: tinfo
+    monkeypatch.setattr(scanner_module, "log_warning", fake_warning)
+    monkeypatch.setattr(scanner_module, "get_func_argument_info", lambda *_args, **_kwargs: (0, None))
+
+    class _FakeTypes:
+        def get_ptr(self):
+            return SimpleNamespace(dstr=lambda: "void *")
+
+        def __getitem__(self, key):
+            return SimpleNamespace(ptr=SimpleNamespace(dstr=lambda: f"{key} *"))
+
+    monkeypatch.setattr(scanner_module, "types", _FakeTypes())
+
+    leaf = SimpleNamespace(op=scanner_module.ctype.var, type=SimpleNamespace(dstr=lambda: "void *"))
+    first_expr = SimpleNamespace(op=scanner_module.ctype.ptr, x=leaf, type=SimpleNamespace(dstr=lambda: "void **"))
+    second_expr = SimpleNamespace(
+        op=scanner_module.ctype.call,
+        x=SimpleNamespace(obj_ea=0x5000),
+        a=[leaf],
+        ea=0x401234,
+        dstr=lambda: "callee(arg)",
+        type=SimpleNamespace(dstr=lambda: "__int64"),
+    )
+    context = scanner_module.ParentExpressionContext([first_expr, second_expr])
+
+    result = visitor._extract_member(leaf, SimpleNamespace(name="v2"), 0, context)
+
+    assert result == "member"
+    assert captured["display_messagebox"] is True
+    assert captured["warning"] == "Failed to get function argument info for callee(arg) @ 0x401234"

@@ -43,6 +43,12 @@ class HexRaysHookManager:
             hook.unhook()
             log_debug(f"Unhooked handler: {hook_name}")
 
+        self.reset()
+
+    def reset(self) -> None:
+        """Clear cached hook state so a reload starts cleanly."""
+        self._hooks.clear()
+
     def disable(self, hook_name: str) -> None:
         """
         Disables a hook.

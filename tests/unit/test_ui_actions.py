@@ -83,18 +83,51 @@ def test_initialize_and_finalize_register_and_unregister_actions(manager, monkey
     manager.register(popup)
 
     registered = []
+    detached = []
     unregistered = []
     monkeypatch.setattr(ui_actions.ida_kernwin, "register_action", lambda desc: registered.append(desc) or True)
+    monkeypatch.setattr(ui_actions.ida_kernwin, "detach_action_from_menu", lambda path, action_id: detached.append((path, action_id)) or True)
     monkeypatch.setattr(ui_actions.ida_kernwin, "unregister_action", lambda name: unregistered.append(name) or True)
 
     manager.initialize()
     manager.finalize()
 
     assert len(registered) == 3
+    assert detached == [(menu.menu_path, menu.id)]
     assert plain.name in unregistered
     assert popup.name in unregistered
     assert menu.id in unregistered
+    assert manager._actions == []
+    assert manager._popup_actions == []
+    assert manager._menu_actions == []
+    assert manager._attached_menu_actions == set()
+    assert manager._main_menu_created is False
 
+
+
+
+def test_finalize_can_keep_main_menu(manager, monkeypatch):
+    menu = DummyMenuAction()
+    manager.register(menu)
+
+    created = []
+    detached = []
+    unregistered = []
+    monkeypatch.setattr(ui_actions.ida_kernwin, "create_menu", lambda name, title: created.append((name, title)) or True)
+    monkeypatch.setattr(ui_actions.ida_kernwin, "detach_action_from_menu", lambda path, action_id: detached.append((path, action_id)) or True)
+    monkeypatch.setattr(ui_actions.ida_kernwin, "unregister_action", lambda name: unregistered.append(name) or True)
+
+    assert manager.show_menu() is True
+    manager.finalize(keep_main_menu=True)
+
+    assert created == [(ui_actions.PLUGIN_NAME, ui_actions.PLUGIN_NAME)]
+    assert detached == [(menu.menu_path, menu.id)]
+    assert menu.id in unregistered
+    assert manager._main_menu_created is True
+    assert manager._actions == []
+    assert manager._popup_actions == []
+    assert manager._menu_actions == []
+    assert manager._attached_menu_actions == set()
 
 
 def test_show_menu_creates_menu_and_attaches_actions_only_once(manager, monkeypatch):
@@ -108,8 +141,9 @@ def test_show_menu_creates_menu_and_attaches_actions_only_once(manager, monkeypa
     assert manager.show_menu() is True
     assert manager.show_menu() is True
 
-    assert len(created) == 1
+    assert created == [(ui_actions.PLUGIN_NAME, ui_actions.PLUGIN_NAME)]
     assert attached == [(menu.menu_path, menu.id, 0)]
+
 
 
 

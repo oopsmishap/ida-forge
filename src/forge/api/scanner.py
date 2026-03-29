@@ -444,6 +444,25 @@ class ScanVisitor(ObjectVisitor):
             f"Extracting member: {obj.name}, parents: '{ctype_to_str(context.ops)}'"
         )
 
+        asg_index = None
+        for index, op in enumerate(context.ops):
+            if op == ctype.asg:
+                asg_index = index
+                break
+        if asg_index is not None:
+            assignment_parent = context.expr_at(asg_index)
+            if assignment_parent is not None and getattr(assignment_parent, "x", None) is not None:
+                parsed_assignee = self._parse_left_assignee(assignment_parent.x, offset)
+                if parsed_assignee is not None:
+                    _assignee, assignee_offset = parsed_assignee
+                    log_debug("assignment to object")
+                    return self._get_member(
+                        assignee_offset,
+                        cexpr,
+                        obj,
+                        assignment_parent.x.type,
+                    )
+
         if context.op_at(0) == ctype.cast and context.expr_at(0) is not None:
             # `(TYPE)expr`
             tinfo = context.expr_at(0).type
@@ -489,8 +508,8 @@ class ScanVisitor(ObjectVisitor):
                 _, tinfo = get_func_argument_info(second_expr, first_expr)
                 if tinfo is None:
                     log_warning(
-                        f"Failed to get function argument info for {second_expr}, "
-                        f"ea: {hex(second_expr.ea)}"
+                        f"Failed to get function argument info for {second_expr.dstr()} @ {hex(second_expr.ea)}",
+                        True,
                     )
                     tinfo = types["u8"].ptr
                 return self._get_member(offset, cexpr, obj, tinfo)
@@ -500,9 +519,7 @@ class ScanVisitor(ObjectVisitor):
             # `void (__some_call*)(..., (TYPE)(expr + x), ...)`
             call_parent = context.expr_at(0)
             log_debug(
-                "function call with cast, parent: "
-                f"{call_parent.type.dstr()} {call_parent.dstr()}, "
-                f"cexpr: {cexpr.type.dstr()} {cexpr.dstr()}"
+                f"function call with cast, parent: {call_parent.type.dstr()} {call_parent.dstr()}, cexpr: {cexpr.type.dstr()} {cexpr.dstr()}"
             )
             tinfo = self._parse_call(call_parent, cexpr)
             return self._get_member(offset, cexpr, obj, tinfo)
@@ -580,7 +597,22 @@ class ScanVisitor(ObjectVisitor):
         return types["char"].type
 
     def _parse_left_assignee(self, x, offset):
-        pass
+        if x is None:
+            return None
+
+        if x.op == ctype.cast and getattr(x, "x", None) is not None:
+            return self._parse_left_assignee(x.x, offset)
+
+        if x.op in (ctype.ptr, ctype.idx) and getattr(x, "x", None) is not None:
+            return self._parse_left_assignee(x.x, offset)
+
+        if x.op == ctype.add and getattr(x, "x", None) is not None and getattr(x, "y", None) is not None:
+            if x.x.op == ctype.num:
+                return self._parse_left_assignee(x.y, offset + x.x.numval())
+            if x.y.op == ctype.num:
+                return self._parse_left_assignee(x.x, offset + x.y.numval())
+
+        return (x, offset)
 
 
 class NewShallowScanVisitor(ScanVisitor, DownwardsObjectVisitor):

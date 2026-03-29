@@ -35,6 +35,7 @@ class AboutWindow(QtWidgets.QDialog, Ui_about_window):
 class AboutAction(UIMenuAction):
     name = "About"
     tooltip = "Show the about dialogue"
+    menu_path = "Actions"
 
     def activate(self, ctx):
         qt_exec(AboutWindow())

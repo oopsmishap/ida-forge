@@ -6,7 +6,7 @@ from typing import TypeVar
 import ida_hexrays
 import ida_kernwin
 
-from forge.plugin import PLUGIN_ACTIONS_PREFIX, PLUGIN_NAME
+from forge.plugin import PLUGIN_NAME
 from forge.util.logging import log_debug, log_warning
 from forge.util.singleton import Singleton
 
@@ -22,9 +22,10 @@ class UIActionManager:
         self._actions: list[UIAction] = []
         self._popup_actions: list[HexraysPopupRequestHandler] = []
         self._menu_actions: list[UIMenuAction] = []
-        self._main_menu_name = f"{PLUGIN_ACTIONS_PREFIX}_menu"
+        self._main_menu_name = PLUGIN_NAME
         self._main_menu_created = False
         self._attached_menu_actions: set[str] = set()
+
 
     def register(self, action: UIAction | UIMenuAction) -> None:
         """Register an action instance with the appropriate internal list."""
@@ -76,8 +77,14 @@ class UIActionManager:
 
         return True
 
-    def finalize(self) -> None:
-        """Unregister actions and remove the plugin menu."""
+    def finalize(self, keep_main_menu: bool = False) -> None:
+        """Unregister actions and optionally remove the plugin menu."""
+        for menu_action in self._menu_actions:
+            try:
+                ida_kernwin.detach_action_from_menu(menu_action.menu_path, menu_action.id)
+            except Exception as e:
+                log_warning(f"Could not detach action {menu_action.id}: {e}")
+
         for action in self._actions:
             ida_kernwin.unregister_action(action.name)
 
@@ -87,11 +94,21 @@ class UIActionManager:
         for menu_action in self._menu_actions:
             ida_kernwin.unregister_action(menu_action.id)
 
-        if self._main_menu_created:
+        if self._main_menu_created and not keep_main_menu:
             ida_kernwin.delete_menu(self._main_menu_name)
 
-        self._main_menu_created = False
+        self.reset(keep_main_menu=keep_main_menu)
+
+    def reset(self, keep_main_menu: bool = False) -> None:
+        """Clear cached action state so a reload starts cleanly."""
+        self._actions.clear()
+        self._popup_actions.clear()
+        self._menu_actions.clear()
+        if not keep_main_menu:
+            self._main_menu_created = False
         self._attached_menu_actions.clear()
+
+
 
     @staticmethod
     def _register_action(action_desc: ida_kernwin.action_desc_t) -> None:

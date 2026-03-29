@@ -734,6 +734,65 @@ def test_build_structure_table_debug_csv_includes_scan_metadata(monkeypatch):
 
 
 
+
+def test_build_structure_table_debug_csv_falls_back_for_root_labels_and_lines(monkeypatch):
+    structure_form = _make_form(monkeypatch)
+    parent = structure_form.create_structure("Parent")
+    assert parent is not None
+
+    member = _FakeMember(
+        0x30,
+        8,
+        type_name="Child *",
+        name="child_ptr",
+        comment="linked",
+        score=13,
+        origin=0x20,
+    )
+    scan_object = _FakeScanObject(
+        func_ea=0x401000,
+        ea=0x401234,
+        name="child_ptr_scan",
+        function_name="child_func",
+        root_func_ea=0x400800,
+        root_ea=0x400ABC,
+        root_function_name=None,
+    )
+    scan_object.scan_root_function_name = None
+    member.scanned_variables = {scan_object}
+    parent.add_member(member)
+    structure_form.current_structure = parent
+    monkeypatch.setattr(structure_form, "get_selected_members", lambda rows=None: [])
+    monkeypatch.setattr(
+        form_module.ida_funcs,
+        "get_func_name",
+        lambda ea: {0x401000: "child_func", 0x400800: "root_func"}.get(ea, f"sub_{ea:x}"),
+        raising=False,
+    )
+
+    root_item = SimpleNamespace(ea=0x400ABC)
+    fake_cfunc = SimpleNamespace(
+        treeitems=[SimpleNamespace(ea=0x401234)],
+        eamap={0x400ABC: [root_item]},
+        find_item_coords=lambda item: (2, 0) if getattr(item, "ea", None) == 0x401234 else (1, 0),
+        get_pseudocode=lambda: [
+            "if (ok) {",
+            "    parent->child = value;",
+        ],
+    )
+    monkeypatch.setattr(form_module, "decompile", lambda func_ea: fake_cfunc if func_ea in (0x401000, 0x400800) else None)
+    csv_text = structure_form._build_structure_table_debug_csv()
+    rows = list(csv.reader(io.StringIO(csv_text)))
+
+    row = dict(zip(rows[0], rows[1]))
+
+    assert row["scan_location_count"] == "1"
+    assert row["scan_locations"] == "child_func@0x401234"
+    assert row["scan_lines"] == "parent->child = value;"
+    assert row["scan_root_location_count"] == "1"
+    assert row["scan_root_locations"] == "root_func@0x400abc"
+    assert row["scan_root_lines"] == "if (ok) {"
+
 def test_copy_structure_table_debug_csv_writes_clipboard(monkeypatch):
     structure_form = _make_form(monkeypatch)
     parent = structure_form.create_structure("Parent")
@@ -832,6 +891,8 @@ def test_build_child_scan_plan_uses_created_parent_type(monkeypatch):
     assert plan.root_object_name == "Parent.child_ptr"
     assert plan.scan_object.struct_name == "Parent_t"
     assert plan.scan_object.offset == 0x30
+
+
 
 def test_build_child_scan_plan_accepts_inferred_primitive_member(monkeypatch):
     structure_form = _make_form(monkeypatch)
