@@ -210,6 +210,19 @@ class ScanVisitor(ObjectVisitor):
         )
 
     @staticmethod
+    def _is_structure_like_tinfo(tinfo: Optional[ida_typeinf.tinfo_t]) -> bool:
+        return tinfo is not None and (tinfo.is_ptr() or tinfo.is_udt())
+
+    def _prefer_object_tinfo(
+        self, obj: ScanObject, tinfo: Optional[ida_typeinf.tinfo_t]
+    ) -> Optional[ida_typeinf.tinfo_t]:
+        obj_tinfo = getattr(obj, "tinfo", None)
+        if obj_tinfo is None:
+            return tinfo
+        if self._is_structure_like_tinfo(obj_tinfo) and not self._is_structure_like_tinfo(tinfo):
+            return obj_tinfo
+        return tinfo
+    @staticmethod
     def _create_byte_array_tinfo(size: int) -> ida_typeinf.tinfo_t:
         if size <= 1:
             return ida_typeinf.tinfo_t(types["u8"].type)
@@ -311,6 +324,8 @@ class ScanVisitor(ObjectVisitor):
                 return Member(offset, tinfo, scan_obj, self._origin)
 
             tinfo = self._infer_data_object_tinfo(obj_ea, tinfo)
+
+        tinfo = self._prefer_object_tinfo(obj, tinfo)
 
         if tinfo is not None:
             tinfo = ida_typeinf.tinfo_t(tinfo)
