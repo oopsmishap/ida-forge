@@ -420,7 +420,13 @@ class CallArgumentObject(ScanObject):
             return None
         result.name = lvars[lvar_idx].name
         result.tinfo = ida_hexrays.cfunc_type(cfunc)
+        result.set_scan_root(
+            cfunc.entry_ea,
+            function_name=getattr(ida_funcs, "get_func_name", lambda ea: f"sub_{ea:x}")(cfunc.entry_ea),
+        )
         return result
+
+
 
     def __repr__(self):
         return self.name
@@ -493,7 +499,13 @@ class MemoryAllocationObject(ScanObject):
                 size = 0
             result = MemoryAllocationObject(func_name, size)
             result.ea = ScanObject.get_expression_address(cfunc, call_expr)
+            result.set_scan_root(
+                cfunc.entry_ea,
+                expression_ea=result.ea,
+                function_name=getattr(ida_funcs, "get_func_name", lambda ea: f"sub_{ea:x}")(cfunc.entry_ea),
+            )
             return result
+
 
     def is_target(self, cexpr: ida_hexrays.cexpr_t) -> bool:
         return True

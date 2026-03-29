@@ -328,7 +328,14 @@ def test_memory_allocation_object_create_handles_direct_and_casted_calls(monkeyp
     assert direct.name == "malloc"
     assert direct.size == 64
     assert direct.ea == 0x88
+    assert direct.scan_root_function_ea == 0x1000
+    assert direct.scan_root_ea == 0x88
+    assert direct.scan_root_function_name == "sub_1000"
     assert via_cast.size == 64
+    assert via_cast.scan_root_function_ea == 0x1000
+    assert via_cast.scan_root_ea == 0x88
+    assert via_cast.scan_root_function_name == "sub_1000"
+
 
 
 
