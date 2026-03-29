@@ -159,6 +159,30 @@ class Structure:
             if getattr(member, "linked_child_structure_name", None) == old_name:
                 member.linked_child_structure_name = new_name
 
+
+    def rename_created_type(self, old_name: str, new_name: str) -> bool:
+        if self.created_type_name != old_name or old_name == new_name:
+            return True
+
+        tinfo = ida_typeinf.tinfo_t()
+        if not tinfo.get_named_type(ida_typeinf.get_idati(), old_name):
+            log_warning(
+                f"Created type {old_name} is missing; leaving the type name unchanged.",
+                True,
+            )
+            return True
+
+        rename_result = tinfo.rename_type(new_name)
+        if rename_result != 0:
+            log_warning(
+                f"Failed to rename created type {old_name} to {new_name}: {rename_result}",
+                True,
+            )
+            return False
+
+        self.created_type_name = new_name
+        return True
+
     def get_linked_child_names(self) -> list[str]:
         return sorted({rel.child_structure_name for rel in self.child_relationships})
 

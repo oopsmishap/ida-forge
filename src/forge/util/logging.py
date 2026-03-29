@@ -56,3 +56,4 @@ def log_debug(message=None):
     if message:
         # logging.info(f"{logging_prefix}: {message}")
         ida_kernwin.msg(f"{logging_prefix}[DEBUG]: {message}\n")
+

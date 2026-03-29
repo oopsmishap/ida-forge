@@ -7,6 +7,108 @@ import ida_name
 
 from forge.api.hexrays import get_member_name, ctype
 from forge.util.logging import log_debug
+TYPE_IGNORED_TOKENS = {"const", "volatile", "struct", "class", "union", "&"}
+
+
+def _type_identity_key(name: str) -> str:
+    # IDA decorates the same structure with qualifiers and reference markers; keep
+    # pointer depth, but compare the underlying identity.
+    normalized = name.replace("*", " * ").replace("&", " & ")
+    return " ".join(
+        token for token in normalized.split() if token not in TYPE_IGNORED_TOKENS
+    )
+
+
+def _unwrap_struct_type(tinfo):
+    if tinfo is None:
+        return None
+    if hasattr(tinfo, "is_ptr") and tinfo.is_ptr() and hasattr(tinfo, "get_pointed_object"):
+        pointed = tinfo.get_pointed_object()
+        if pointed is not None:
+            return pointed
+    if hasattr(tinfo, "is_array") and tinfo.is_array() and hasattr(tinfo, "get_array_element"):
+        array_element = tinfo.get_array_element()
+        if array_element is not None:
+            return array_element
+    return tinfo
+
+
+def _type_name_matches(tinfo, expected_name: str) -> bool:
+    if tinfo is None:
+        return False
+    return _type_identity_key(tinfo.dstr()) == _type_identity_key(expected_name)
+
+
+def _strip_casts_and_refs(expr):
+    while expr is not None and expr.op in (ctype.cast, ctype.ref):
+        expr = expr.x
+    return expr
+
+
+def _extract_offset_expression(expr):
+    offset = 0
+    current = expr
+    while current is not None and current.op in (ctype.cast, ctype.ref):
+        current = current.x
+    while current is not None and current.op in (ctype.add, ctype.sub, ctype.idx):
+        if current.op == ctype.idx:
+            if not hasattr(current, "y") or current.y is None:
+                current = _strip_casts_and_refs(getattr(current, "x", None))
+                continue
+            if current.y.op != ctype.num:
+                return None, None
+            offset += current.y.numval()
+            current = _strip_casts_and_refs(current.x)
+            continue
+
+        if not hasattr(current, "x") or not hasattr(current, "y"):
+            current = _strip_casts_and_refs(getattr(current, "x", None))
+            continue
+
+        left = _strip_casts_and_refs(current.x)
+        right = _strip_casts_and_refs(current.y)
+        if left is not None and left.op == ctype.num and right is not None:
+            offset += left.numval() if current.op == ctype.add else -left.numval()
+            current = right
+            continue
+        if right is not None and right.op == ctype.num and left is not None:
+            offset += right.numval() if current.op == ctype.add else -right.numval()
+            current = left
+            continue
+        current = left if right is None else right
+        continue
+
+    return current, offset
+
+
+
+def _get_struct_tinfo(tinfo):
+    if tinfo is None:
+        return None
+    if hasattr(tinfo, "is_ptr") and tinfo.is_ptr() and hasattr(tinfo, "get_pointed_object"):
+        pointed = tinfo.get_pointed_object()
+        if pointed is not None:
+            return pointed
+    return tinfo
+
+
+def _make_offset_scan_object(base_obj, offset: int):
+    base_tinfo = _get_struct_tinfo(getattr(base_obj, "tinfo", None))
+    if base_tinfo is None or offset == 0:
+        return base_obj
+
+    struct_name = base_tinfo.dstr()
+    if not struct_name:
+        return base_obj
+
+    result = StructureReferenceObject(struct_name, offset)
+    try:
+        result.name = get_member_name(base_tinfo, offset) or base_obj.name
+    except Exception:
+        result.name = base_obj.name
+    result.tinfo = base_tinfo
+    result.ea = getattr(base_obj, "ea", idaapi.BADADDR)
+    return result
 
 
 class ObjectType(Enum):
@@ -151,10 +253,11 @@ class StructurePointerObject(ScanObject):
         :param cexpr: ida_hexrays.cexpr_t
         :return: returns True if expression is a pointer member of a structure
         """
+        pointed_type = _unwrap_struct_type(cexpr.x.type)
         return (
             cexpr.op == ctype.memptr
             and cexpr.m == self.offset
-            and cexpr.x.type.get_pointed_object().dstr() == self.struct_name
+            and _type_name_matches(pointed_type, self.struct_name)
         )
 
 
@@ -181,12 +284,13 @@ class StructureReferenceObject(ScanObject):
         Checks if expression is a member of a structure
 
         :param cexpr: The expression to check
-        :return: True if the expression is a member of the structure, False otherwise
+        :return: True if expression is a member of the structure, False otherwise
         """
+        struct_type = _unwrap_struct_type(cexpr.x.type)
         return (
             cexpr.op == ctype.memref
             and cexpr.m == self.offset
-            and cexpr.x.type.dstr() == self.struct_name
+            and _type_name_matches(struct_type, self.struct_name)
         )
 
 
@@ -244,10 +348,17 @@ class CallArgumentObject(ScanObject):
         """
         if self.arg_idx < 0 or self.arg_idx >= len(cexpr.a):
             return None
+
         e = cexpr.a[self.arg_idx]
-        while e.op in (ctype.cast, ctype.ref, ctype.add, ctype.sub, ctype.idx):
-            e = e.x
-        return ScanObject.create(cfunc, e)
+        base_expr, offset = _extract_offset_expression(e)
+        if base_expr is None:
+            return None
+
+        base_obj = ScanObject.create(cfunc, base_expr)
+        if base_obj is None:
+            return None
+
+        return _make_offset_scan_object(base_obj, offset)
 
     @staticmethod
     def create(cfunc: ida_hexrays.cfunc_t, arg_idx):
