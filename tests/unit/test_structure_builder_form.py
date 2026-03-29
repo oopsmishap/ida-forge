@@ -681,7 +681,7 @@ def test_build_child_scan_plan_uses_created_parent_type(monkeypatch):
 
 def test_build_child_scan_plan_accepts_inferred_primitive_member(monkeypatch):
     structure_form = _make_form(monkeypatch)
-    parent = structure_form.create_structure("Parent")
+    parent = structure_form.create_structure("auto_struct_001")
     assert parent is not None
 
     member = _FakeMember(0xCD8, 8, type_name="u64", name="child_ptr")
@@ -700,7 +700,28 @@ def test_build_child_scan_plan_accepts_inferred_primitive_member(monkeypatch):
     assert plan.scan_object.offset == 0xCD8
 
 
-def test_build_child_scan_plan_requires_unambiguous_parent_evidence(monkeypatch):
+
+def test_build_child_scan_plan_uses_structure_name_when_untyped(monkeypatch):
+    structure_form = _make_form(monkeypatch)
+    parent = structure_form.create_structure("auto_struct_001")
+    assert parent is not None
+
+    member = _FakeMember(0xCD8, 8, type_name="u64", name="child_ptr")
+    member.tinfo = SimpleNamespace(is_ptr=lambda: False, is_udt=lambda: False)
+    member.scanned_variables = [
+        SimpleNamespace(func_ea=0x401000, ea=0x402000, name="root"),
+    ]
+    structure_form.current_structure = parent
+    monkeypatch.setattr(form_module, "is_legal_type", lambda _tinfo: True)
+
+    plan = structure_form._build_child_scan_plan(member)
+
+    assert plan is not None
+    assert plan.scan_object.struct_name == "auto_struct_001"
+    assert plan.scan_object.offset == 0xCD8
+
+
+def test_build_child_scan_plan_allows_ambiguous_member_evidence_when_parent_named(monkeypatch):
     structure_form = _make_form(monkeypatch)
     parent = structure_form.create_structure("Parent")
     assert parent is not None
@@ -714,7 +735,12 @@ def test_build_child_scan_plan_requires_unambiguous_parent_evidence(monkeypatch)
     structure_form.current_structure = parent
     monkeypatch.setattr(form_module, "is_legal_type", lambda _tinfo: True)
 
-    assert structure_form._build_child_scan_plan(member) is None
+    plan = structure_form._build_child_scan_plan(member)
+
+    assert plan is not None
+    assert plan.scan_object.struct_name == "Parent"
+    assert plan.has_multiple_roots is True
+
 
 def test_update_action_states_enables_child_scan_actions_for_scannable_member(monkeypatch):
     structure_form = _make_form(monkeypatch)

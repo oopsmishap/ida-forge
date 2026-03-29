@@ -997,7 +997,7 @@ class StructureBuilderForm(ida_kernwin.PluginForm):
             )
 
 
-        parent_struct_name = self.current_structure.created_type_name
+        parent_struct_name = self.current_structure.created_type_name or self.current_structure.name
         if not parent_struct_name:
             parent_struct_names = sorted(
                 {
@@ -1016,6 +1016,7 @@ class StructureBuilderForm(ida_kernwin.PluginForm):
                 return None
             parent_struct_name = parent_struct_names[0]
             scan_object = type(scan_object)(parent_struct_name, member.offset)
+
 
 
 
