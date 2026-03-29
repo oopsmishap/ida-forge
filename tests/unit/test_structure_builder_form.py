@@ -548,6 +548,7 @@ def test_scan_child_structure_auto_creates_child_and_records_metadata(monkeypatc
 
     def fake_execute(child_structure, built_plan):
         assert built_plan is plan
+        assert child_structure.main_offset == member.offset
         child_structure.add_member(_FakeMember(0, 4, type_name="u32", name="value"))
         return True
 
@@ -558,6 +559,7 @@ def test_scan_child_structure_auto_creates_child_and_records_metadata(monkeypatc
     child = structure_form.structures["auto_struct_001"]
     assert structure_form.current_structure is child
     assert child.is_auto_named is True
+    assert child.main_offset == 0x30
     assert child.provenance.kind == "child_scan"
     assert child.provenance.root_object_name == "Parent.child_ptr"
     assert child.provenance.source_member_offset == 0x30
@@ -566,8 +568,6 @@ def test_scan_child_structure_auto_creates_child_and_records_metadata(monkeypatc
     assert parent.child_relationships[0].child_structure_name == child.name
     assert child.parent_relationships[0].parent_structure_name == "Parent"
 
-    assert parent.child_relationships[0].child_structure_name == child.name
-    assert child.parent_relationships[0].parent_structure_name == "Parent"
 
 
 def test_scan_child_structure_reuses_existing_linked_child(monkeypatch):

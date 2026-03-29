@@ -1140,6 +1140,9 @@ class StructureBuilderForm(ida_kernwin.PluginForm):
         if child_structure is None:
             return
 
+        if child_structure.main_offset != selected_member.offset:
+            child_structure.set_main_offset(selected_member.offset)
+
         existing_member_count = len(child_structure.members)
         scanned_any = self._execute_child_scan_plan(child_structure, plan)
         scan_produced_results = len(child_structure.members) > existing_member_count
