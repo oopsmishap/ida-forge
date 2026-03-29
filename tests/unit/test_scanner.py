@@ -84,3 +84,27 @@ def test_prefer_object_tinfo_keeps_structure_like_members(obj_tinfo, call_tinfo,
     preferred = visitor._prefer_object_tinfo(obj, call_tinfo)
 
     assert preferred.dstr() == expected_name
+
+
+def test_scanned_object_create_inherits_scan_root_metadata(monkeypatch):
+    scanner_module = _load_scanner_module()
+    scan_object_module = import_module("forge.api.scan_object")
+    import ida_funcs
+
+    monkeypatch.setattr(ida_funcs, "get_func", lambda _ea: SimpleNamespace(start_ea=0x401000), raising=False)
+
+    source = SimpleNamespace(
+        id=scan_object_module.ObjectType.global_object,
+        object_ea=0x5000,
+        name="g_root",
+        scan_root_function_ea=0x401000,
+        scan_root_ea=0x401234,
+        scan_root_function_name="sub_401000",
+    )
+
+    scanned = scanner_module.ScannedObject.create(source, 0x401234, 0x0)
+
+    assert scanned.scan_root_function_ea == 0x401000
+    assert scanned.scan_root_ea == 0x401234
+    assert scanned.scan_root_function_name == "sub_401000"
+

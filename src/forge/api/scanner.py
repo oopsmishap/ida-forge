@@ -61,7 +61,19 @@ class ScannedObject:
         self.ea = expression_address
         self.func_ea = self._get_function_start(expression_address)
         self.origin = origin
+        self.scan_root_ea = idaapi.BADADDR
+        self.scan_root_function_ea = idaapi.BADADDR
+        self.scan_root_function_name = None
         self._applicable = applicable
+
+    def inherit_scan_root_from(self, other: ScanObject) -> None:
+        if getattr(other, "scan_root_function_ea", idaapi.BADADDR) != idaapi.BADADDR:
+            self.scan_root_function_ea = other.scan_root_function_ea
+        if getattr(other, "scan_root_ea", idaapi.BADADDR) != idaapi.BADADDR:
+            self.scan_root_ea = other.scan_root_ea
+        if getattr(other, "scan_root_function_name", None):
+            self.scan_root_function_name = other.scan_root_function_name
+
 
     @staticmethod
     def _get_function_start(ea: int) -> int:
@@ -79,18 +91,27 @@ class ScannedObject:
         applicable: bool = True,
     ) -> "ScannedObject":
         if obj.id == ObjectType.global_object:
-            return ScannedGlobalObject(
+            result = ScannedGlobalObject(
                 obj.object_ea, obj.name, expression_address, origin, applicable
             )
-        if obj.id == ObjectType.local_variable:
-            return ScannedVariableObject(
+        elif obj.id == ObjectType.local_variable:
+            result = ScannedVariableObject(
                 obj.lvar, obj.name, expression_address, origin, applicable
             )
-        if obj.id in (ObjectType.structure_pointer, ObjectType.structure_reference):
-            return ScannedStructureMemberObject(
+        elif obj.id in (ObjectType.structure_pointer, ObjectType.structure_reference):
+            result = ScannedStructureMemberObject(
                 obj.struct_name, obj.name, expression_address, origin, applicable
             )
-        raise AssertionError(f"Unsupported scan object type: {obj.id}")
+        else:
+            raise AssertionError(f"Unsupported scan object type: {obj.id}")
+
+        for attr in ("scan_root_function_ea", "scan_root_ea", "scan_root_function_name"):
+            value = getattr(obj, attr, None)
+            if value is not None and value != idaapi.BADADDR:
+                setattr(result, attr, value)
+        return result
+
+
 
     @property
     def function_name(self) -> str:
