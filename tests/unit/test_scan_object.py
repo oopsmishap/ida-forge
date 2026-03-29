@@ -73,8 +73,10 @@ class FakeExpr:
         self.op = op
         self.ea = kwargs.pop("ea", 0x401000)
         self.to_specific_type = kwargs.pop("to_specific_type", None)
+        self.type = kwargs.pop("type", FakeType("int"))
         for key, value in kwargs.items():
             setattr(self, key, value)
+
 
 
 class FakeNumberExpr(FakeExpr):
@@ -258,8 +260,46 @@ def test_call_argument_object_create_scan_object_preserves_numeric_offset(monkey
 
     assert isinstance(derived, StructureReferenceObject)
     assert derived.struct_name == "FixtureScene"
+
+def test_scan_object_create_sets_scan_root_provenance(monkeypatch):
+    cfunc = FakeCfunc([FakeLvar("arg0")], entry_ea=0x401000)
+    monkeypatch.setattr(ScanObject, "get_expression_address", staticmethod(lambda _cfunc, expr: expr.ea))
+
+    expr = FakeExpr(ctype.var, v=SimpleNamespace(idx=0), ea=0x401234)
+    obj = ScanObject.create(cfunc, expr)
+
+    assert obj is not None
+    assert obj.scan_root_function_ea == 0x401000
+    assert obj.scan_root_ea == 0x401234
+    assert obj.scan_root_function_name == "sub_401000"
+
+
+def test_make_offset_scan_object_inherits_scan_root_provenance(monkeypatch):
+    import importlib
+
+    scan_object_module = importlib.import_module("forge.api.scan_object")
+    base = SimpleNamespace(
+        tinfo=FakeType("FixtureScene *", pointed=FakeType("FixtureScene")),
+        name="this",
+        ea=0x401234,
+        scan_root_function_ea=0x401000,
+        scan_root_ea=0x401234,
+        scan_root_function_name="sub_401000",
+    )
+    base.inherit_scan_root_from = lambda other: (
+        setattr(base, "scan_root_function_ea", other.scan_root_function_ea),
+        setattr(base, "scan_root_ea", other.scan_root_ea),
+        setattr(base, "scan_root_function_name", other.scan_root_function_name),
+    )
+    derived = scan_object_module._make_offset_scan_object(base, 0x538)
+
+    assert derived.scan_root_function_ea == 0x401000
+    assert derived.scan_root_ea == 0x401234
+    assert derived.scan_root_function_name == "sub_401000"
     assert derived.offset == 0x538
-    assert derived.ea == 0x10
+    assert derived.ea == 0x401234
+
+
 
 
 
@@ -298,6 +338,8 @@ def test_memory_allocation_object_create_returns_zero_for_non_numeric_size(monke
     monkeypatch.setattr(ida_name, "get_short_name", lambda _ea: "malloc")
     call = FakeExpr(ctype.call, x=SimpleNamespace(obj_ea=0x5000), a=[FakeExpr(ctype.var)], ea=0x99)
     obj = MemoryAllocationObject.create(FakeCfunc([]), call)
+
+
 
     assert obj.size == 0
 

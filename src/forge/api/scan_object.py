@@ -3,6 +3,7 @@ import traceback
 
 import ida_hexrays
 import idaapi
+import ida_funcs
 import ida_name
 
 from forge.api.hexrays import get_member_name, ctype
@@ -111,7 +112,11 @@ def _make_offset_scan_object(base_obj, offset: int):
         result.name = base_obj.name
     result.tinfo = base_tinfo
     result.ea = getattr(base_obj, "ea", idaapi.BADADDR)
+    if hasattr(result, "inherit_scan_root_from"):
+        result.inherit_scan_root_from(base_obj)
     return result
+
+
 
 
 class ObjectType(Enum):
@@ -135,6 +140,31 @@ class ScanObject:
         self.name = None
         self.tinfo = None
         self.id = ObjectType.unknown
+        self.scan_root_ea = idaapi.BADADDR
+        self.scan_root_function_ea = idaapi.BADADDR
+        self.scan_root_function_name = None
+
+    def set_scan_root(
+        self,
+        function_ea: int | None,
+        *,
+        expression_ea: int | None = None,
+        function_name: str | None = None,
+    ) -> None:
+        if function_ea is not None and function_ea != idaapi.BADADDR:
+            self.scan_root_function_ea = function_ea
+        if expression_ea is not None and expression_ea != idaapi.BADADDR:
+            self.scan_root_ea = expression_ea
+        if function_name is not None:
+            self.scan_root_function_name = function_name
+
+    def inherit_scan_root_from(self, other: "ScanObject") -> None:
+        if getattr(other, "scan_root_function_ea", idaapi.BADADDR) != idaapi.BADADDR:
+            self.scan_root_function_ea = other.scan_root_function_ea
+        if getattr(other, "scan_root_ea", idaapi.BADADDR) != idaapi.BADADDR:
+            self.scan_root_ea = other.scan_root_ea
+        if getattr(other, "scan_root_function_name", None):
+            self.scan_root_function_name = other.scan_root_function_name
 
     @staticmethod
     def create(cfunc: ida_hexrays.cfunc_t, arg):
@@ -167,7 +197,6 @@ class ScanObject:
             lvar = cfunc.get_lvars()[cexpr.v.idx]
             result = VariableObject(lvar, cexpr.v.idx)
             result.ea = ScanObject.get_expression_address(cfunc, cexpr)
-            return result
         elif cexpr.op == ctype.memptr:
             t = cexpr.x.type.get_pointed_object()
             result = StructurePointerObject(t.dstr(), cexpr.m)
@@ -184,7 +213,14 @@ class ScanObject:
 
         result.tinfo = cexpr.type
         result.ea = ScanObject.get_expression_address(cfunc, cexpr)
+        result.set_scan_root(
+            cfunc.entry_ea,
+            expression_ea=result.ea,
+            function_name=getattr(ida_funcs, "get_func_name", lambda ea: f"sub_{ea:x}")(cfunc.entry_ea),
+        )
+
         return result
+
 
     def is_target(self, cexpr: ida_hexrays.cexpr_t) -> bool:
         raise NotImplementedError()

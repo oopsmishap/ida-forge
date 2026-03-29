@@ -76,11 +76,26 @@ class _FakeMember:
 
 
 class _FakeScanObject:
-    def __init__(self, *, func_ea: int, ea: int, name: str, function_name: str):
+    def __init__(
+        self,
+        *,
+        func_ea: int,
+        ea: int,
+        name: str,
+        function_name: str,
+        root_func_ea: int | None = None,
+        root_ea: int | None = None,
+        root_function_name: str | None = None,
+    ):
         self.func_ea = func_ea
         self.ea = ea
         self.name = name
         self.function_name = function_name
+        self.scan_root_function_ea = func_ea if root_func_ea is None else root_func_ea
+        self.scan_root_ea = ea if root_ea is None else root_ea
+        self.scan_root_function_name = (
+            function_name if root_function_name is None else root_function_name
+        )
 
     def __hash__(self):
         return hash((self.func_ea, self.ea, self.name))
@@ -92,6 +107,7 @@ class _FakeScanObject:
             and self.ea == other.ea
             and self.name == other.name
         )
+
 
 
 
@@ -654,23 +670,28 @@ def test_build_structure_table_debug_csv_includes_scan_metadata(monkeypatch):
         ea=0x401234,
         name="child_ptr_scan",
         function_name="child_func",
+        root_func_ea=0x400800,
+        root_ea=0x400ABC,
+        root_function_name="root_func",
     )
+
     member.scanned_variables = {scan_object}
     parent.add_member(member)
     structure_form.current_structure = parent
     monkeypatch.setattr(structure_form, "get_selected_members", lambda rows=None: [])
 
     fake_cfunc = SimpleNamespace(
-        treeitems=[SimpleNamespace(ea=0x401234)],
-        find_item_coords=lambda _item: (2, 0),
+        treeitems=[SimpleNamespace(ea=0x401234), SimpleNamespace(ea=0x400ABC)],
+        find_item_coords=lambda _item: (2, 0) if getattr(_item, "ea", None) == 0x401234 else (1, 0),
         get_pseudocode=lambda: [
             "if (ok) {",
             "    parent->child = value;",
         ],
     )
-    monkeypatch.setattr(form_module, "decompile", lambda func_ea: fake_cfunc if func_ea == 0x401000 else None)
+    monkeypatch.setattr(form_module, "decompile", lambda func_ea: fake_cfunc if func_ea in (0x401000, 0x400800) else None)
     csv_text = structure_form._build_structure_table_debug_csv()
     rows = list(csv.reader(io.StringIO(csv_text)))
+
 
 
     assert rows[0] == [
@@ -687,6 +708,9 @@ def test_build_structure_table_debug_csv_includes_scan_metadata(monkeypatch):
         "scan_location_count",
         "scan_locations",
         "scan_lines",
+        "scan_root_location_count",
+        "scan_root_locations",
+        "scan_root_lines",
     ]
     assert rows[1] == [
         "Parent",
@@ -702,7 +726,11 @@ def test_build_structure_table_debug_csv_includes_scan_metadata(monkeypatch):
         "1",
         f"child_func@{hex(0x401234)}",
         "parent->child = value;",
+        "1",
+        f"root_func@{hex(0x400ABC)}",
+        "if (ok) {",
     ]
+
 
 
 
@@ -713,21 +741,32 @@ def test_copy_structure_table_debug_csv_writes_clipboard(monkeypatch):
 
     member = _FakeMember(0x30, 8, type_name="Child *", name="child_ptr")
     member.scanned_variables = {
-        _FakeScanObject(func_ea=0x401000, ea=0x401234, name="child_ptr_scan", function_name="child_func")
+        _FakeScanObject(
+            func_ea=0x401000,
+            ea=0x401234,
+            name="child_ptr_scan",
+            function_name="child_func",
+            root_func_ea=0x400800,
+            root_ea=0x400ABC,
+            root_function_name="root_func",
+        )
     }
     parent.add_member(member)
     structure_form.current_structure = parent
     monkeypatch.setattr(structure_form, "get_selected_members", lambda rows=None: [])
     monkeypatch.setattr(form_module, "decompile", lambda *_args, **_kwargs: None)
 
+
+
+
     fake_clipboard = SimpleNamespace(text=None, setText=lambda value: setattr(fake_clipboard, "text", value))
     monkeypatch.setattr(form_module.ida_kernwin, "copy_to_clipboard", lambda value: fake_clipboard.setText(value), raising=False)
 
     structure_form.copy_structure_table_debug_csv()
 
-
     assert fake_clipboard.text is not None
     assert fake_clipboard.text.startswith("structure_name,row,offset,type,name,score,comment,enabled,array,origin")
+
 
 
 

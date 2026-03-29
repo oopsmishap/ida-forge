@@ -2020,8 +2020,14 @@ class StructureBuilderForm(ida_kernwin.PluginForm):
     def _scan_object_decompiled_line(
         scan_object: ScanObject,
         cfunc_cache: dict[int, ida_hexrays.cfunc_t | None],
+        *,
+        root: bool = False,
     ) -> str:
-        func_ea = getattr(scan_object, "func_ea", idaapi.BADADDR)
+        func_ea = (
+            getattr(scan_object, "scan_root_function_ea", idaapi.BADADDR)
+            if root
+            else getattr(scan_object, "func_ea", idaapi.BADADDR)
+        )
         if func_ea == idaapi.BADADDR:
             return ""
 
@@ -2033,7 +2039,11 @@ class StructureBuilderForm(ida_kernwin.PluginForm):
         if cfunc is None:
             return ""
 
-        target_ea = getattr(scan_object, "ea", idaapi.BADADDR)
+        target_ea = (
+            getattr(scan_object, "scan_root_ea", idaapi.BADADDR)
+            if root
+            else getattr(scan_object, "ea", idaapi.BADADDR)
+        )
         if target_ea == idaapi.BADADDR:
             return ""
 
@@ -2051,8 +2061,29 @@ class StructureBuilderForm(ida_kernwin.PluginForm):
                 return " ".join(tag_remove(str(pseudocode[line_no - 1])).split())
             return ""
 
-
         return ""
+
+    @staticmethod
+    def _scan_object_location_label(scan_object: ScanObject, *, root: bool = False) -> str:
+        func_ea = (
+            getattr(scan_object, "scan_root_function_ea", idaapi.BADADDR)
+            if root
+            else getattr(scan_object, "func_ea", idaapi.BADADDR)
+        )
+        target_ea = (
+            getattr(scan_object, "scan_root_ea", idaapi.BADADDR)
+            if root
+            else getattr(scan_object, "ea", idaapi.BADADDR)
+        )
+        function_name = (
+            getattr(scan_object, "scan_root_function_name", None)
+            if root
+            else getattr(scan_object, "function_name", "")
+        )
+        if func_ea == idaapi.BADADDR or target_ea == idaapi.BADADDR:
+            return function_name or ""
+        return f"{function_name}@{hex(target_ea)}"
+
 
     def _build_structure_table_debug_csv(self) -> str:
         if self.current_structure is None:
@@ -2080,8 +2111,12 @@ class StructureBuilderForm(ida_kernwin.PluginForm):
                 "scan_location_count",
                 "scan_locations",
                 "scan_lines",
+                "scan_root_location_count",
+                "scan_root_locations",
+                "scan_root_lines",
             ]
         )
+
 
         for row, member in enumerate(members):
             scanned_variables = sorted(
@@ -2094,17 +2129,17 @@ class StructureBuilderForm(ida_kernwin.PluginForm):
             )
             scan_locations = []
             scan_lines = []
+            scan_root_locations = []
+            scan_root_lines = []
             for scan_object in scanned_variables:
-                func_ea = getattr(scan_object, "func_ea", idaapi.BADADDR)
-                target_ea = getattr(scan_object, "ea", idaapi.BADADDR)
-                location = scan_object.function_name
-                if func_ea != idaapi.BADADDR and target_ea != idaapi.BADADDR:
-                    location = f"{scan_object.function_name}@{hex(target_ea)}"
-                scan_locations.append(location)
-                line_text = self._scan_object_decompiled_line(scan_object, cfunc_cache)
-                if line_text:
-                    scan_lines.append(line_text)
-
+                scan_locations.append(self._scan_object_location_label(scan_object))
+                scan_lines.append(self._scan_object_decompiled_line(scan_object, cfunc_cache))
+                scan_root_locations.append(
+                    self._scan_object_location_label(scan_object, root=True)
+                )
+                scan_root_lines.append(
+                    self._scan_object_decompiled_line(scan_object, cfunc_cache, root=True)
+                )
 
             writer.writerow(
                 [
@@ -2113,9 +2148,13 @@ class StructureBuilderForm(ida_kernwin.PluginForm):
                     *self._structure_table_debug_fields(member),
                     len(scanned_variables),
                     "; ".join(scan_locations),
-                    " || ".join(scan_lines),
+                    " || ".join(filter(None, scan_lines)),
+                    len(scanned_variables),
+                    "; ".join(scan_root_locations),
+                    " || ".join(filter(None, scan_root_lines)),
                 ]
             )
+
 
         return buffer.getvalue()
 

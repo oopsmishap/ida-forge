@@ -96,6 +96,52 @@ def test_recursive_downwards_object_visitor_leave_expr_checks_calls(monkeypatch)
     assert result == "downwards"
 
 
+def test_recursive_downwards_object_visitor_inherits_scan_root(monkeypatch):
+    visitor_module = _load_visitor_module()
+    root_obj = SimpleNamespace(
+        scan_root_function_ea=0x401000,
+        scan_root_ea=0x401234,
+        scan_root_function_name="sub_401000",
+        is_target=lambda expr: expr.name == "target",
+    )
+    child_obj = SimpleNamespace(
+        scan_root_function_ea=ida_idaapi.BADADDR,
+        scan_root_ea=ida_idaapi.BADADDR,
+        scan_root_function_name=None,
+        inherit_scan_root_from=lambda other: (
+            setattr(child_obj, "scan_root_function_ea", other.scan_root_function_ea),
+            setattr(child_obj, "scan_root_ea", other.scan_root_ea),
+            setattr(child_obj, "scan_root_function_name", other.scan_root_function_name),
+        ),
+    )
+    visitor = visitor_module.RecursiveDownwardsObjectVisitor.__new__(visitor_module.RecursiveDownwardsObjectVisitor)
+    visitor._cfunc = SimpleNamespace(entry_ea=0x401000)
+    visitor._objects = [root_obj]
+    visitor._skip = False
+    visitor._recurse_calls = False
+
+    x_expr = SimpleNamespace(name="new")
+    y_expr = SimpleNamespace(op=999, name="target")
+    asg_op = getattr(visitor_module.ctype, "asg", 1)
+    monkeypatch.setattr(visitor_module.ctype, "asg", asg_op, raising=False)
+    asg_expr = SimpleNamespace(op=asg_op, x=x_expr, y=y_expr)
+
+
+
+
+    monkeypatch.setattr(
+        visitor_module.ScanObject,
+        "create",
+        staticmethod(lambda _cfunc, expr: child_obj if expr is x_expr else None),
+    )
+
+    visitor.visit_expr(asg_expr)
+
+    assert child_obj.scan_root_function_ea == 0x401000
+    assert child_obj.scan_root_ea == 0x401234
+    assert child_obj.scan_root_function_name == "sub_401000"
+
+
 def test_recursive_downwards_object_visitor_retries_deferred_child_arguments(monkeypatch):
     visitor_module = _load_visitor_module()
     visitor = visitor_module.RecursiveDownwardsObjectVisitor.__new__(

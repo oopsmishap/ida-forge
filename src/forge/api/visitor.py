@@ -92,12 +92,14 @@ class DownwardsObjectVisitor(ObjectVisitor):
                         f"Remove object {obj} from scanning at {print_expr_address(x_cexpr, self.parents)}"
                     )
                     self._objects.remove(obj)
-                return 0
             elif obj.is_target(y_cexpr):
                 new_obj = ScanObject.create(self._cfunc, x_cexpr)
                 if new_obj:
+                    if hasattr(new_obj, "inherit_scan_root_from"):
+                        new_obj.inherit_scan_root_from(obj)
                     self._objects.append(new_obj)
                 return 0
+
         return 0
 
     def leave_expr(self, cexpr: ida_hexrays.cexpr_t):
