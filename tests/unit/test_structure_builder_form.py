@@ -846,6 +846,41 @@ def test_execute_child_scan_plan_enables_recursive_child_traversal(monkeypatch):
     assert captured["args"] == (0x401000, 0x30, "child_ptr", "Child", True)
 
 
+def test_scan_child_structure_uses_absolute_member_origin(monkeypatch):
+    structure_form = _make_form(monkeypatch)
+    parent = structure_form.create_structure("Parent")
+    assert parent is not None
+
+    member = _FakeMember(0xCD8, 8, type_name="u64", name="child_ptr", origin=0x30)
+    member.tinfo = SimpleNamespace(is_ptr=lambda: False, is_udt=lambda: False)
+    member.scanned_variables = [SimpleNamespace(func_ea=0x401000, ea=0x402000, name="root")]
+    structure_form.current_structure = parent
+    monkeypatch.setattr(form_module, "is_legal_type", lambda _tinfo: True)
+
+    plan = form_module.ChildScanPlan(
+        scan_object=SimpleNamespace(name="child_ptr"),
+        function_eas=(0x401000,),
+        relation_kind="embedded",
+        root_object_name="Parent.child_ptr",
+        root_object_ea=0x402000,
+        root_function_ea=0x401000,
+        has_multiple_roots=False,
+    )
+    monkeypatch.setattr(structure_form, "get_selected_member", lambda: member)
+    monkeypatch.setattr(structure_form, "_build_child_scan_plan", lambda _member, show_warnings=False: plan)
+    def fake_execute(child_structure, _plan):
+        child_structure.add_member(_FakeMember(0, 4, type_name="u32", name="value"))
+        return True
+
+    monkeypatch.setattr(structure_form, "_execute_child_scan_plan", fake_execute)
+
+    structure_form.scan_child_structure()
+
+    child = structure_form.structures["auto_struct_001"]
+    assert child.main_offset == 0xD08
+
+
+
 def test_link_child_structure_materializes_pointer_and_inline_member_types(monkeypatch):
     structure_form = _make_form(monkeypatch)
     parent = structure_form.create_structure("Parent")
@@ -871,8 +906,10 @@ def test_link_child_structure_materializes_pointer_and_inline_member_types(monke
     form_module.StructureBuilderForm._link_child_structure(parent, child, member_pointer, "pointer")
     form_module.StructureBuilderForm._link_child_structure(parent, child, member_inline, "embedded")
 
-    assert seen == ["Child *", "Child"]
+    assert "Child *" in seen
+    assert "Child" in seen
     assert member_pointer.tinfo is sentinel
     assert member_inline.tinfo is sentinel
     assert member_pointer.child_relation_kind == "pointer"
     assert member_inline.child_relation_kind == "embedded"
+

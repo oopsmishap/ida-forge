@@ -1107,6 +1107,25 @@ class StructureBuilderForm(ida_kernwin.PluginForm):
         if hasattr(member, "invalidate_score"):
             member.invalidate_score()
 
+    @staticmethod
+    def _materialize_child_member_type(
+        member: AbstractMember,
+        child_structure: Structure,
+        relation_kind: str,
+    ) -> None:
+        child_type_name = child_structure.created_type_name or child_structure.name
+        type_decl = f"{child_type_name} *" if relation_kind == "pointer" else child_type_name
+        tinfo = parse_user_tinfo(type_decl)
+        if tinfo is None:
+            return
+        member.tinfo = tinfo
+        member.is_array = False
+        if hasattr(member, "invalidate_score"):
+            member.invalidate_score()
+
+    @staticmethod
+    def _child_scan_origin(member: AbstractMember) -> int:
+        return getattr(member, "origin", 0) + member.offset
 
     @staticmethod
     def _link_child_structure(
@@ -1122,6 +1141,11 @@ class StructureBuilderForm(ida_kernwin.PluginForm):
             parent_member_name=parent_member_name,
             relation_kind=relation_kind,
         )
+        child_structure.add_parent_relationship(relationship)
+        member.linked_child_structure_name = child_structure.name
+        member.child_relation_kind = relation_kind
+        StructureBuilderForm._materialize_child_member_type(member, child_structure, relation_kind)
+
         child_structure.add_parent_relationship(relationship)
         member.linked_child_structure_name = child_structure.name
         member.child_relation_kind = relation_kind
@@ -1161,11 +1185,13 @@ class StructureBuilderForm(ida_kernwin.PluginForm):
         if child_structure is None:
             return
 
-        if child_structure.main_offset != selected_member.offset:
-            child_structure.set_main_offset(selected_member.offset)
+        child_origin = self._child_scan_origin(selected_member)
+        if child_structure.main_offset != child_origin:
+            child_structure.set_main_offset(child_origin)
 
         existing_member_count = len(child_structure.members)
         scanned_any = self._execute_child_scan_plan(child_structure, plan)
+
         scan_produced_results = len(child_structure.members) > existing_member_count
         if not scanned_any or (created_now and not scan_produced_results):
             if created_now and child_structure.name in self.structures:
