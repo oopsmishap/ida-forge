@@ -234,6 +234,27 @@ def test_relationship_helpers_update_parent_child_links_and_members():
     assert member.linked_child_structure_name is None
     assert member.child_relation_kind is None
 
+def test_rename_created_type_updates_type_name_when_canonical(monkeypatch):
+    structure = Structure("Parent")
+    structure.created_type_name = "Parent"
+    rename_calls = []
+
+    class FakeTinfo:
+        def get_named_type(self, _idati, name):
+            return name == "Parent"
+
+        def rename_type(self, new_name, ntf_flags=0):
+            rename_calls.append((new_name, ntf_flags))
+            return 0
+
+    monkeypatch.setattr(structure_module.ida_typeinf, "tinfo_t", lambda: FakeTinfo())
+    monkeypatch.setattr(structure_module.ida_typeinf, "get_idati", lambda: object())
+
+    assert structure.rename_created_type("Parent", "Inventory") is True
+    assert structure.created_type_name == "Inventory"
+    assert rename_calls == [("Inventory", 0)]
+
+
 
 def test_get_unresolved_child_names_only_returns_missing_or_untyped_children():
     parent = Structure("Parent")

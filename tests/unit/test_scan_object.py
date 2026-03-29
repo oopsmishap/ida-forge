@@ -16,15 +16,25 @@ from forge.api.scan_object import (
 
 
 class FakeType:
-    def __init__(self, name: str, pointed=None):
+    def __init__(self, name: str, pointed=None, array_element=None):
         self._name = name
         self._pointed = pointed
+        self._array_element = array_element
 
     def dstr(self):
         return self._name
 
+    def is_ptr(self):
+        return self._pointed is not None
+
+    def is_array(self):
+        return self._array_element is not None
+
     def get_pointed_object(self):
         return self._pointed
+
+    def get_array_element(self):
+        return self._array_element
 
 
 class FakeLvar:
@@ -93,6 +103,34 @@ def test_structure_pointer_and_reference_targets_match_type_and_offset():
     ref_expr = FakeExpr(ctype.memref, m=4, x=SimpleNamespace(type=FakeType("MyStruct")))
 
     assert StructurePointerObject("MyStruct", 8).is_target(ptr_expr) is True
+    assert StructureReferenceObject("MyStruct", 4).is_target(ref_expr) is True
+
+
+def test_structure_pointer_and_reference_targets_ignore_type_wrappers():
+    pointed = FakeType("const struct MyStruct")
+    ptr_expr = FakeExpr(
+        ctype.memptr,
+        m=8,
+        x=SimpleNamespace(type=FakeType("const struct MyStruct *", pointed=pointed)),
+    )
+    double_ptr_expr = FakeExpr(
+        ctype.memptr,
+        m=8,
+        x=SimpleNamespace(
+            type=FakeType(
+                "MyStruct **",
+                pointed=FakeType("MyStruct *", pointed=FakeType("MyStruct")),
+            )
+        ),
+    )
+    ref_expr = FakeExpr(
+        ctype.memref,
+        m=4,
+        x=SimpleNamespace(type=FakeType("MyStruct[4]", array_element=pointed)),
+    )
+
+    assert StructurePointerObject("MyStruct", 8).is_target(ptr_expr) is True
+    assert StructurePointerObject("MyStruct", 8).is_target(double_ptr_expr) is False
     assert StructureReferenceObject("MyStruct", 4).is_target(ref_expr) is True
 
 
@@ -178,6 +216,29 @@ def test_call_argument_object_create_scan_object_walks_wrappers(monkeypatch):
     obj = CallArgumentObject(0x1000, 0)
 
     assert obj.create_scan_object(FakeCfunc([]), call) is inner
+
+def test_call_argument_object_create_scan_object_preserves_numeric_offset(monkeypatch):
+    base = SimpleNamespace(
+        tinfo=FakeType("FixtureScene *", pointed=FakeType("FixtureScene")),
+        name="this",
+        ea=0x10,
+    )
+    monkeypatch.setattr(ScanObject, "create", staticmethod(lambda _cfunc, expr: base if expr is not None else None))
+
+    inner = FakeExpr(
+        ctype.cast,
+        x=FakeExpr(ctype.add, x=FakeExpr(ctype.var), y=FakeNumberExpr(0x538)),
+    )
+    call = FakeExpr(ctype.call, a=[inner])
+    obj = CallArgumentObject(0x1000, 0)
+
+    derived = obj.create_scan_object(FakeCfunc([]), call)
+
+    assert isinstance(derived, StructureReferenceObject)
+    assert derived.struct_name == "FixtureScene"
+    assert derived.offset == 0x538
+    assert derived.ea == 0x10
+
 
 
 

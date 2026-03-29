@@ -174,6 +174,37 @@ def test_structure_renamed_clears_auto_named_flag(monkeypatch):
     assert structure_form.structures["Inventory"] is auto_named
     assert fake_filter.cleared is True
 
+def test_structure_renamed_syncs_created_type_name_when_canonical(monkeypatch):
+    structure_form = _make_form(monkeypatch)
+    structure = structure_form.create_structure("manual")
+    assert structure is not None
+
+    structure.created_type_name = "manual"
+    rename_calls = []
+
+    def fake_rename_created_type(old_name, new_name):
+        rename_calls.append((old_name, new_name))
+        structure.created_type_name = new_name
+        return True
+
+    monkeypatch.setattr(structure, "rename_created_type", fake_rename_created_type)
+
+    fake_filter = _FakeFilter()
+    structure_form.ui = SimpleNamespace(
+        input_name=_FakeLineEdit("Inventory"),
+        input_filter=fake_filter,
+    )
+    structure_form.current_structure = structure
+
+    structure_form.structure_renamed()
+
+    assert rename_calls == [("manual", "Inventory")]
+    assert structure.name == "Inventory"
+    assert structure.created_type_name == "Inventory"
+    assert structure_form.structures["Inventory"] is structure
+    assert fake_filter.cleared is True
+
+
 
 
 def test_duplicate_structure_copies_provenance_and_outbound_relationships(monkeypatch):
