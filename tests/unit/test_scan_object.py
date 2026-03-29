@@ -8,11 +8,12 @@ from forge.api.scan_object import (
     GlobalVariableObject,
     MemoryAllocationObject,
     ObjectType,
+    ReturnedObject,
     ScanObject,
     StructurePointerObject,
     StructureReferenceObject,
     VariableObject,
-)
+ )
 
 
 class FakeType:
@@ -132,6 +133,17 @@ def test_structure_pointer_and_reference_targets_ignore_type_wrappers():
     assert StructurePointerObject("MyStruct", 8).is_target(ptr_expr) is True
     assert StructurePointerObject("MyStruct", 8).is_target(double_ptr_expr) is False
     assert StructureReferenceObject("MyStruct", 4).is_target(ref_expr) is True
+
+
+def test_structure_member_targets_ignore_incomplete_expressions():
+    ptr_expr = FakeExpr(ctype.memptr, m=8)
+    ref_expr = FakeExpr(ctype.memref, m=4)
+    call_expr = FakeExpr(ctype.call)
+
+    assert StructurePointerObject("MyStruct", 8).is_target(ptr_expr) is False
+    assert StructureReferenceObject("MyStruct", 4).is_target(ref_expr) is False
+    assert CallArgumentObject(0x1000, 0).is_target(call_expr) is False
+    assert ReturnedObject(0x1000).is_target(call_expr) is False
 
 
 
@@ -348,3 +360,9 @@ def test_get_argument_index_resolves_formal_argument_ordinals():
     assert hexrays_real.get_argument_index(cfunc, 2) is None
 
 
+
+
+def test_memory_allocation_create_ignores_cast_without_inner_call(monkeypatch):
+    monkeypatch.setattr(ScanObject, "get_expression_address", staticmethod(lambda _cfunc, expr: expr.ea))
+    bad_cast = FakeExpr(ctype.cast, x=None)
+    assert MemoryAllocationObject.create(FakeCfunc([]), bad_cast) is None

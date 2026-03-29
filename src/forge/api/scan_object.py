@@ -249,16 +249,12 @@ class StructurePointerObject(ScanObject):
     def is_target(self, cexpr: ida_hexrays.cexpr_t) -> bool:
         """
         Checks if expression is a pointer member of a structure
-
-        :param cexpr: ida_hexrays.cexpr_t
-        :return: returns True if expression is a pointer member of a structure
         """
-        pointed_type = _unwrap_struct_type(cexpr.x.type)
-        return (
-            cexpr.op == ctype.memptr
-            and cexpr.m == self.offset
-            and _type_name_matches(pointed_type, self.struct_name)
-        )
+        if cexpr.op != ctype.memptr or not hasattr(cexpr, "x") or cexpr.x is None:
+            return False
+        pointed_type = _unwrap_struct_type(getattr(cexpr.x, "type", None))
+        return cexpr.m == self.offset and _type_name_matches(pointed_type, self.struct_name)
+
 
 
 class StructureReferenceObject(ScanObject):
@@ -282,16 +278,12 @@ class StructureReferenceObject(ScanObject):
     def is_target(self, cexpr: ida_hexrays.cexpr_t) -> bool:
         """
         Checks if expression is a member of a structure
-
-        :param cexpr: The expression to check
-        :return: True if expression is a member of the structure, False otherwise
         """
-        struct_type = _unwrap_struct_type(cexpr.x.type)
-        return (
-            cexpr.op == ctype.memref
-            and cexpr.m == self.offset
-            and _type_name_matches(struct_type, self.struct_name)
-        )
+        if cexpr.op != ctype.memref or not hasattr(cexpr, "x") or cexpr.x is None:
+            return False
+        struct_type = _unwrap_struct_type(getattr(cexpr.x, "type", None))
+        return cexpr.m == self.offset and _type_name_matches(struct_type, self.struct_name)
+
 
 
 class GlobalVariableObject(ScanObject):
@@ -330,11 +322,11 @@ class CallArgumentObject(ScanObject):
     def is_target(self, cexpr: ida_hexrays.cexpr_t) -> bool:
         """
         Checks if expression is the call to the function containing the argument
-
-        :param cexpr: ida_hexrays.cexpr_t
-        :return: True if expression is the call to the function containing the argument
         """
-        return cexpr.op == ctype.call and cexpr.x.obj_ea == self.func_ea
+        if cexpr.op != ctype.call or not hasattr(cexpr, "x") or cexpr.x is None:
+            return False
+        return getattr(cexpr.x, "obj_ea", idaapi.BADADDR) == self.func_ea
+
 
     def create_scan_object(
         self, cfunc: ida_hexrays.cfunc_t, cexpr: ida_hexrays.cexpr_t
@@ -404,11 +396,11 @@ class ReturnedObject(ScanObject):
     def is_target(self, cexpr: ida_hexrays.cexpr_t) -> bool:
         """
         Checks if expression is a call and its object address is the same as the function address
-
-        :param cexpr: ida_hexrays.cexpr_t
-        :return: Returns True if expression is a call and its object address is the same as the function address
         """
-        return cexpr.op == ctype.call and cexpr.x.obj_ea == self.__func_ea
+        if cexpr.op != ctype.call or not hasattr(cexpr, "x") or cexpr.x is None:
+            return False
+        return getattr(cexpr.x, "obj_ea", idaapi.BADADDR) == self.__func_ea
+
 
 
 class MemoryAllocationObject(ScanObject):
@@ -430,12 +422,18 @@ class MemoryAllocationObject(ScanObject):
         """
         if cexpr.op == ctype.call:
             call_expr = cexpr
-        elif cexpr.op == ctype.cast and cexpr.x.op == ctype.call:
+        elif (
+            cexpr.op == ctype.cast
+            and hasattr(cexpr, "x")
+            and cexpr.x is not None
+            and cexpr.x.op == ctype.call
+        ):
             call_expr = cexpr.x
         else:
             return None
 
-        func_name = ida_name.get_short_name(call_expr.x.obj_ea)
+        func_name = ida_name.get_short_name(getattr(call_expr.x, "obj_ea", idaapi.BADADDR))
+
         if "malloc" in func_name or "operator new" in func_name or "operator_new" in func_name:
             # if we find `malloc` or `new` we get the size of the allocation
             size_expr = call_expr.a[0] if len(call_expr.a) else None
