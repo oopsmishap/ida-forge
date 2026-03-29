@@ -72,6 +72,27 @@ def test_recursive_downwards_object_visitor_skips_invalid_callee_ordinal(monkeyp
     assert prepared_calls == []
 
 
+def test_recursive_downwards_object_visitor_leave_expr_checks_calls(monkeypatch):
+    visitor_module = _load_visitor_module()
+    visitor = visitor_module.RecursiveDownwardsObjectVisitor.__new__(
+        visitor_module.RecursiveDownwardsObjectVisitor
+    )
+    visitor._skip = False
+    seen = []
+
+    monkeypatch.setattr(visitor, "_check_call", lambda cexpr: seen.append(cexpr), raising=False)
+    monkeypatch.setattr(
+        visitor_module.DownwardsObjectVisitor,
+        "leave_expr",
+        lambda self, cexpr: "downwards",
+    )
+
+    result = visitor.leave_expr(SimpleNamespace(op=visitor_module.ctype.var))
+
+    assert seen and seen[0].op == visitor_module.ctype.var
+    assert result == "downwards"
+
+
 def test_recursive_downwards_object_visitor_retries_deferred_child_arguments(monkeypatch):
     visitor_module = _load_visitor_module()
     visitor = visitor_module.RecursiveDownwardsObjectVisitor.__new__(
