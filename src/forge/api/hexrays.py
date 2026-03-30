@@ -265,10 +265,16 @@ def to_function_offset_str(ea: int) -> str:
     :param int ea: the address to convert
     :return: the nice string representation of the address
     """
-    func_start_ea = idc.get_func_attr(ea, idc.FUNCATTR_START)
-    func_name = idc.get_name(func_start_ea)
+    func = ida_funcs.get_func(ea)
+    if func is None:
+        return "<no-function>"
+
+    func_start_ea = func.start_ea
+    func_name = idc.get_name(func_start_ea) or to_hex(func_start_ea)
     offset = ea - func_start_ea
-    return f"{func_name}+{offset:#x}"
+    if offset == 0:
+        return func_name
+    return f"{func_name}{offset:+#x}"
 
 
 # Enums

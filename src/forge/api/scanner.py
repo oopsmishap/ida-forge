@@ -216,24 +216,32 @@ class ScanVisitor(ObjectVisitor):
         recurse_calls: bool | None = None,
     ):
         if recurse_calls is None:
-            super().__init__(cfunc, obj, None, True)
+            DownwardsObjectVisitor.__init__(self, cfunc, obj, None, True)
         else:
-            super().__init__(cfunc, obj, None, True, recurse_calls=recurse_calls)
+            RecursiveDownwardsObjectVisitor.__init__(self, cfunc, obj, None, True, None, recurse_calls=recurse_calls)
+
         self._origin = origin
         self._structure = structure
 
 
+
     @staticmethod
     def _describe_tinfo(tinfo: Optional[ida_typeinf.tinfo_t]) -> str:
-        return "<none>" if tinfo is None else tinfo.dstr()
+        if tinfo is None:
+            return "<none>"
+        return getattr(tinfo, "dstr", lambda: str(tinfo))()
 
     @staticmethod
     def _is_unknown_tinfo(tinfo: Optional[ida_typeinf.tinfo_t]) -> bool:
-        return (
-            tinfo is None
-            or tinfo.dstr() == "?"
-            or tinfo.get_size() == ida_typeinf.BADSIZE
-        )
+        if tinfo is None:
+            return True
+
+        dstr = getattr(tinfo, "dstr", lambda: str(tinfo))()
+        if dstr == "?":
+            return True
+
+        get_size = getattr(tinfo, "get_size", None)
+        return get_size is not None and get_size() == ida_typeinf.BADSIZE
 
     @staticmethod
     def _is_structure_like_tinfo(tinfo: Optional[ida_typeinf.tinfo_t]) -> bool:
@@ -248,6 +256,7 @@ class ScanVisitor(ObjectVisitor):
         if self._is_structure_like_tinfo(obj_tinfo) and not self._is_structure_like_tinfo(tinfo):
             return obj_tinfo
         return tinfo
+
     @staticmethod
     def _create_byte_array_tinfo(size: int) -> ida_typeinf.tinfo_t:
         if size <= 1:
@@ -303,8 +312,15 @@ class ScanVisitor(ObjectVisitor):
             expr_ea = find_expr_address(cexpr, self.parents)
             log_warning(f"Type {obj.tinfo.dstr()} @ {to_hex(expr_ea)} is not supported")
             return
-        elif cexpr.type.is_ptr():
+
+        parent_ops = self._get_parent_context().ops
+        has_pointer_context = cexpr.type.is_ptr() or any(
+            op in (ctype.ptr, ctype.idx, ctype.add) for op in parent_ops
+        )
+        if has_pointer_context:
             member = self._extract_member_from_ptr(cexpr, obj)
+            if member is None:
+                member = self._extract_member_from_expr(cexpr, obj)
         else:
             member = self._extract_member_from_expr(cexpr, obj)
 
@@ -326,8 +342,9 @@ class ScanVisitor(ObjectVisitor):
         expr_ea = find_expr_address(cexpr, self.parents)
 
         if offset < 0:
-            log_warning(f"Considered to be impossible: offset: {offset}, obj: {to_hex(expr_ea)}")
-            raise AssertionError
+            log_warning(f"Negative offset encountered: {offset}, obj: {to_hex(expr_ea)}")
+            offset = -offset
+
 
         applicable = not self.crippled
         scan_obj = ScannedObject.create(obj, expr_ea, self._origin, applicable)
@@ -505,15 +522,8 @@ class ScanVisitor(ObjectVisitor):
                     # ((void (__some_call*)(..., *(TYPE*)(expr + x), ...)
                     log_debug(f"object passed as argument to function at {hex(second_expr.ea)}")
                     return self._get_member(offset, cexpr, obj, first_expr.type)
-                _, tinfo = get_func_argument_info(second_expr, first_expr)
-                if tinfo is None:
-                    log_warning(
-                        f"Failed to get function argument info for {second_expr.dstr()} @ {hex(second_expr.ea)}",
-                        True,
-                    )
-                    tinfo = types["u8"].ptr
+                tinfo = self._parse_call(second_expr, first_expr)
                 return self._get_member(offset, cexpr, obj, tinfo)
-            return self._get_member(offset, cexpr, obj, tinfo)
 
         if context.op_at(0) == ctype.call and context.expr_at(0) is not None:
             # `void (__some_call*)(..., (TYPE)(expr + x), ...)`
@@ -589,6 +599,15 @@ class ScanVisitor(ObjectVisitor):
         if tinfo is not None:
             log_debug(f"Argument {idx} type: {tinfo.dstr()}")
             return self._deref_tinfo(tinfo)
+
+        arg_tinfo = getattr(arg_cexpr, "type", None)
+        if not self._is_unknown_tinfo(arg_tinfo):
+            log_debug(
+                "Could not infer argument type from call expression; "
+                f"using expression type {self._describe_tinfo(arg_tinfo)} "
+                f"for argument {idx} at {to_hex(call_cexpr.ea)}"
+            )
+            return self._deref_tinfo(arg_tinfo)
 
         log_warning(
             "Could not infer argument type from call expression; "
