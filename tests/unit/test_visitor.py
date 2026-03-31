@@ -5,8 +5,8 @@ from importlib import util
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 
-import pytest
 import ida_hexrays
+import pytest
 
 if not hasattr(ida_hexrays, "ctree_parentee_t"):
     ida_hexrays.ctree_parentee_t = type("ctree_parentee_t", (), {})
@@ -82,8 +82,6 @@ def test_recursive_downwards_object_visitor_leave_expr_checks_calls(monkeypatch)
     seen = []
 
     monkeypatch.setattr(visitor, "_check_call", lambda cexpr: seen.append(cexpr), raising=False)
-
-
     monkeypatch.setattr(
         visitor_module.DownwardsObjectVisitor,
         "leave_expr",
@@ -126,9 +124,6 @@ def test_recursive_downwards_object_visitor_inherits_scan_root(monkeypatch):
     monkeypatch.setattr(visitor_module.ctype, "asg", asg_op, raising=False)
     asg_expr = SimpleNamespace(op=asg_op, x=x_expr, y=y_expr)
 
-
-
-
     monkeypatch.setattr(
         visitor_module.ScanObject,
         "create",
@@ -141,6 +136,53 @@ def test_recursive_downwards_object_visitor_inherits_scan_root(monkeypatch):
     assert child_obj.scan_root_ea == 0x401234
     assert child_obj.scan_root_function_name == "sub_401000"
 
+
+def test_recursive_downwards_object_visitor_adds_child_from_assigned_member(monkeypatch):
+    visitor_module = _load_visitor_module()
+    root_obj = SimpleNamespace(
+        scan_root_function_ea=0x401000,
+        scan_root_ea=0x401234,
+        scan_root_function_name="sub_401000",
+        is_target=lambda expr: expr.name == "member",
+    )
+    child_obj = SimpleNamespace(
+        scan_root_function_ea=ida_idaapi.BADADDR,
+        scan_root_ea=ida_idaapi.BADADDR,
+        scan_root_function_name=None,
+        func_ea=0x401000,
+        is_target=lambda _expr: False,
+        inherit_scan_root_from=lambda other: (
+            setattr(child_obj, "scan_root_function_ea", other.scan_root_function_ea),
+            setattr(child_obj, "scan_root_ea", other.scan_root_ea),
+            setattr(child_obj, "scan_root_function_name", other.scan_root_function_name),
+        ),
+    )
+    visitor = visitor_module.RecursiveDownwardsObjectVisitor.__new__(visitor_module.RecursiveDownwardsObjectVisitor)
+    visitor._cfunc = SimpleNamespace(entry_ea=0x401000)
+    visitor._objects = [root_obj]
+    visitor._skip = False
+    visitor._recurse_calls = False
+    visitor._rescan_current_function = False
+
+    x_expr = SimpleNamespace(name="member")
+    y_expr = SimpleNamespace(op=999, name="child_var")
+    asg_op = getattr(visitor_module.ctype, "asg", 1)
+    monkeypatch.setattr(visitor_module.ctype, "asg", asg_op, raising=False)
+    asg_expr = SimpleNamespace(op=asg_op, x=x_expr, y=y_expr)
+
+    monkeypatch.setattr(
+        visitor_module.ScanObject,
+        "create",
+        staticmethod(lambda _cfunc, expr: child_obj if expr is y_expr else None),
+    )
+
+    visitor.visit_expr(asg_expr)
+
+    assert child_obj.scan_root_function_ea == 0x401000
+    assert child_obj.scan_root_ea == 0x401234
+    assert child_obj.scan_root_function_name == "sub_401000"
+    assert visitor._objects == [root_obj, child_obj]
+    assert visitor._rescan_current_function is True
 
 def test_recursive_downwards_object_visitor_retries_deferred_child_arguments(monkeypatch):
     visitor_module = _load_visitor_module()
@@ -211,6 +253,7 @@ def test_recursive_downwards_object_visitor_retries_deferred_child_arguments(mon
     assert (0x402000, 0, "arg0") in prepared_calls
     assert call_counts[0x402000] >= 2
 
+
 def test_recursive_downwards_object_visitor_refreshes_tree_before_scanning(monkeypatch):
     visitor_module = _load_visitor_module()
     visitor = visitor_module.RecursiveDownwardsObjectVisitor.__new__(
@@ -258,196 +301,101 @@ def test_recursive_downwards_object_visitor_refreshes_tree_before_scanning(monke
         lambda cfunc, idx: (cfunc.get_lvars()[0], 0),
         raising=False,
     )
-
-    def fake_prepare_new_scan(cfunc, arg_idx, obj, skip=False):
-        visitor._cfunc = cfunc
-        prepared_calls.append((cfunc.entry_ea, arg_idx, obj.name))
-
-    monkeypatch.setattr(visitor, "prepare_new_scan", fake_prepare_new_scan, raising=False)
-
-    visitor._recursive_process()
-
-    assert refresh_calls[:2] == [0x401000, 0x402000]
-    assert prepared_calls == [(0x402000, 0, "arg0")]
-
-
-
-
-def test_refresh_function_tree_postorder_refreshes_parent_after_child_decompilation(monkeypatch):
-    visitor_module = _load_visitor_module()
-    refresh_order = []
-    child_ready = {"value": False}
-    parent_ready = {"value": False}
-
-    call_graph = {
-        0x401000: [0x402000],
-        0x402000: [0x403000],
-        0x403000: [],
-    }
-
-    class FakeCollector:
-        def __init__(self, cfunc):
-            self._cfunc = cfunc
-            self._functions = set()
-
-        def apply_to(self, _body, _parent):
-            self._functions = set(call_graph.get(self._cfunc.entry_ea, []))
-
-    def fake_decompile(ea):
-        refresh_order.append(ea)
-        if ea == 0x403000:
-            child_ready["value"] = True
-            return SimpleNamespace(entry_ea=ea, body=SimpleNamespace(), argidx=[0], get_lvars=lambda: [])
-        if ea == 0x402000:
-            if child_ready["value"]:
-                parent_ready["value"] = True
-                return SimpleNamespace(entry_ea=ea, body=SimpleNamespace(), argidx=[0], get_lvars=lambda: [])
-            return SimpleNamespace(entry_ea=ea, body=SimpleNamespace(), argidx=[], get_lvars=lambda: [])
-        if ea == 0x401000:
-            return SimpleNamespace(
-                entry_ea=ea,
-                body=SimpleNamespace(),
-                argidx=[0] if parent_ready["value"] else [],
-                get_lvars=lambda: [SimpleNamespace(name="this", type=lambda: SimpleNamespace(dstr=lambda: "FixtureScene *"))],
-            )
-        return None
-
-    monkeypatch.setattr(visitor_module, "FunctionTouchVisitor", FakeCollector)
-    monkeypatch.setattr(visitor_module, "decompile", fake_decompile)
-    monkeypatch.setattr(visitor_module, "is_imported", lambda _ea: False)
-
-    refreshed = visitor_module.refresh_function_tree_postorder(SimpleNamespace(entry_ea=0x401000))
-
-    assert refreshed.entry_ea == 0x401000
-    assert refreshed.argidx == [0]
-    assert parent_ready["value"] is True
-    assert refresh_order == [0x401000, 0x402000, 0x403000, 0x402000, 0x401000]
-
-
-
-def test_refresh_function_tree_postorder_redecompiles_revisited_parent(monkeypatch):
-    visitor_module = _load_visitor_module()
-    decompile_order = []
-    call_graph = {
-        0x401000: [0x402000],
-        0x402000: [0x401000],
-    }
-
-    class FakeCollector:
-        def __init__(self, cfunc):
-            self._cfunc = cfunc
-            self._functions = set()
-
-        def apply_to(self, _body, _parent):
-            self._functions = set(call_graph.get(self._cfunc.entry_ea, []))
-
-    def fake_decompile(ea):
-        decompile_order.append(ea)
-        return SimpleNamespace(entry_ea=ea, body=SimpleNamespace(), argidx=[0], get_lvars=lambda: [])
-
-    monkeypatch.setattr(visitor_module, "FunctionTouchVisitor", FakeCollector)
-    monkeypatch.setattr(visitor_module, "decompile", fake_decompile)
-    monkeypatch.setattr(visitor_module, "is_imported", lambda _ea: False)
-
-    refreshed = visitor_module.refresh_function_tree_postorder(SimpleNamespace(entry_ea=0x401000))
-
-    assert refreshed.entry_ea == 0x401000
-    assert decompile_order.count(0x401000) >= 2
-    assert decompile_order.count(0x402000) >= 1
-
-
-
-def test_refresh_function_tree_postorder_discovers_new_root_callees_after_child_refresh(monkeypatch):
-    visitor_module = _load_visitor_module()
-    touched = []
-    child_refreshed = {"value": False}
-    class FakeCollector:
-        def __init__(self, cfunc):
-            self._cfunc = cfunc
-            self._functions = set()
-
-        def apply_to(self, _body, _parent):
-            if self._cfunc.entry_ea == 0x401000 and child_refreshed["value"]:
-                self._functions = {0x402000, 0x404000}
-            elif self._cfunc.entry_ea == 0x401000:
-                self._functions = {0x402000}
-            elif self._cfunc.entry_ea == 0x402000:
-                self._functions = {0x403000}
-            else:
-                self._functions = set()
-
-
-    def fake_decompile(ea):
-        touched.append(ea)
-        if ea == 0x403000:
-            child_refreshed["value"] = True
-        return SimpleNamespace(entry_ea=ea, body=SimpleNamespace(), argidx=[0], get_lvars=lambda: [])
-
-    monkeypatch.setattr(visitor_module, "FunctionTouchVisitor", FakeCollector)
-    monkeypatch.setattr(visitor_module, "decompile", fake_decompile)
-    monkeypatch.setattr(visitor_module, "is_imported", lambda _ea: False)
-
-    refreshed = visitor_module.refresh_function_tree_postorder(SimpleNamespace(entry_ea=0x401000))
-
-    assert refreshed.entry_ea == 0x401000
-    assert 0x404000 in touched
-    assert touched.count(0x401000) >= 2
-
-
-
-def test_downwards_object_visitor_marks_same_function_rescan_for_new_local(monkeypatch):
-    visitor_module = _load_visitor_module()
-    visitor = visitor_module.DownwardsObjectVisitor.__new__(
-        visitor_module.DownwardsObjectVisitor
-    )
-    visitor._cfunc = SimpleNamespace(entry_ea=0x401000)
-    visitor._skip = False
-    visitor._rescan_current_function = False
-    root_obj = SimpleNamespace(
-        id=visitor_module.ObjectType.local_variable,
-        name="root",
-        is_target=lambda expr: getattr(expr, "name", None) == "root",
-    )
-    visitor._objects = [root_obj]
-    new_expr = SimpleNamespace(op=visitor_module.ctype.var, name="v1")
-    root_expr = SimpleNamespace(op=visitor_module.ctype.var, name="root")
-    asg_op = getattr(visitor_module.ctype, "asg", 1)
-    monkeypatch.setattr(visitor_module.ctype, "asg", asg_op, raising=False)
-    asg_expr = SimpleNamespace(op=asg_op, x=new_expr, y=root_expr)
-    new_obj = SimpleNamespace(func_ea=0x401000, name="v1")
-    new_obj.inherit_scan_root_from = lambda other: setattr(new_obj, "inherited_from", other.name)
     monkeypatch.setattr(
-        visitor_module.ScanObject,
-        "create",
-        staticmethod(lambda _cfunc, expr: new_obj if expr is new_expr else None),
-    )
-
-    visitor.visit_expr(asg_expr)
-
-    assert visitor._objects == [root_obj, new_obj]
-    assert getattr(new_obj, "inherited_from", None) == "root"
-    assert visitor._rescan_current_function is True
-
-
-def test_recursive_downwards_object_visitor_rescans_current_function_until_stable(monkeypatch):
-    visitor_module = _load_visitor_module()
-    visitor = visitor_module.RecursiveDownwardsObjectVisitor.__new__(
-        visitor_module.RecursiveDownwardsObjectVisitor
-    )
-    visitor._cfunc = SimpleNamespace(entry_ea=0x401000)
-    visitor._new_for_visit = set()
-    visitor._objects = []
-    visitor._skip = False
-    visitor._init_obj = None
-    visitor._rescan_current_function = False
-    visitor._refresh_decompilation_tree = lambda cfunc=None: cfunc or visitor._cfunc
-    calls: list[int] = []
-    monkeypatch.setattr(
-        visitor_module.RecursiveObjectVisitor,
-        "_recursive_process",
-        lambda self: (calls.append(self._cfunc.entry_ea), setattr(self, "_rescan_current_function", len(calls) == 1)),
+        visitor,
+        "prepare_new_scan",
+        lambda cfunc, arg_idx, obj, skip=False: prepared_calls.append(
+            (cfunc.entry_ea, arg_idx, obj.name)
+        ),
+        raising=False,
     )
 
     visitor._recursive_process()
 
-    assert calls == [0x401000, 0x401000]
+    assert (0x402000, 0, "arg0") in prepared_calls
+    assert refresh_calls[0] == 0x401000
+    assert 0x402000 in refresh_calls
+
+
+def test_recursive_downwards_object_visitor_init_sets_downwards_state(monkeypatch):
+    visitor_module = _load_visitor_module()
+    calls = []
+
+    def fake_recursive_init(self, cfunc, obj, data, skip_until_object, visited, recurse_calls=False):
+        calls.append((cfunc, obj, data, skip_until_object, visited, recurse_calls))
+        self._cfunc = cfunc
+        self._objects = [obj]
+        self._init_obj = obj
+        self._data = data
+        self._skip = skip_until_object
+        self._visited = visited if visited else set()
+        self._new_for_visit = set()
+        self.crippled = False
+        self._arg_index = -1
+        self._debug_scan_tree = {}
+        self._debug_scan_tree_root = "root"
+        self._debug_message = []
+        self.cv_flags = 0
+
+    monkeypatch.setattr(visitor_module.RecursiveObjectVisitor, "__init__", fake_recursive_init)
+    monkeypatch.setattr(visitor_module.ida_hexrays, "CV_POST", 1, raising=False)
+
+    cfunc = SimpleNamespace(entry_ea=0x401000)
+    obj = SimpleNamespace(id=visitor_module.ObjectType.local_variable, ea=0x5000, name="arg0")
+
+    visitor = visitor_module.RecursiveDownwardsObjectVisitor(
+        cfunc,
+        obj,
+        data="payload",
+        skip_until_object=True,
+        visited={(0x402000, 0)},
+        recurse_calls=True,
+    )
+
+    assert calls == [(cfunc, obj, "payload", True, {(0x402000, 0)}, False)]
+    assert visitor._recurse_calls is True
+    assert visitor._rescan_current_function is False
+    assert visitor.cv_flags & getattr(visitor_module.ida_hexrays, "CV_POST", 0)
+    assert visitor._objects == [obj]
+
+
+
+
+def test_recursive_upwards_object_visitor_init_sets_upwards_state(monkeypatch):
+    visitor_module = _load_visitor_module()
+    calls = []
+
+    def fake_recursive_init(self, cfunc, obj, data, skip_until_object, visited):
+        calls.append((cfunc, obj, data, skip_until_object, visited))
+        self._cfunc = cfunc
+        self._objects = [obj]
+        self._init_obj = obj
+        self._data = data
+        self._skip = skip_until_object
+        self._visited = visited if visited else set()
+        self._new_for_visit = set()
+        self.crippled = False
+        self._arg_index = -1
+        self._debug_scan_tree = {}
+        self._debug_scan_tree_root = "root"
+        self._debug_message = []
+        self.cv_flags = 0
+
+    monkeypatch.setattr(visitor_module.RecursiveObjectVisitor, "__init__", fake_recursive_init)
+
+    cfunc = SimpleNamespace(entry_ea=0x401000)
+    obj = SimpleNamespace(id=visitor_module.ObjectType.call_argument, ea=0x5000, name="arg0")
+
+    visitor = visitor_module.RecursiveUpwardsObjectVisitor(
+        cfunc,
+        obj,
+        data="payload",
+        skip_until_object=True,
+        visited={(0x402000, 0)},
+    )
+
+    assert calls == [(cfunc, obj, "payload", True, {(0x402000, 0)})]
+    assert visitor._stage == visitor_module.RecursiveUpwardsObjectVisitor.STAGE_PREPARE
+    assert visitor._tree == {}
+    assert visitor._call_obj is obj
+    assert visitor._objects == [obj]

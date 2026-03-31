@@ -9,6 +9,8 @@ from forge.api.scan_object import (
     ObjectType,
     VariableObject,
     CallArgumentObject,
+    _extract_offset_expression,
+    _make_offset_scan_object,
 )
 from forge.util.logging import *
 
@@ -17,7 +19,7 @@ class ObjectVisitor(ida_hexrays.ctree_parentee_t):
     def __init__(
         self, cfunc: ida_hexrays.cfunc_t, obj: ScanObject, data, skip_until_object: bool
     ):
-        super(ObjectVisitor, self).__init__()
+        ida_hexrays.ctree_parentee_t.__init__(self)
         self._cfunc = cfunc
         self._objects = [obj]
         self._init_obj = obj
@@ -66,9 +68,40 @@ class DownwardsObjectVisitor(ObjectVisitor):
         data=None,
         skip_until_object: bool = False,
     ):
-        super(DownwardsObjectVisitor, self).__init__(cfunc, obj, data, skip_until_object)
-        self.cv_flags |= ida_hexrays.CV_POST
+        ObjectVisitor.__init__(self, cfunc, obj, data, skip_until_object)
+        self.cv_flags |= getattr(ida_hexrays, "CV_POST", 0)
         self._rescan_current_function = False
+
+    def _create_scan_object_from_expr(
+        self, expr: ida_hexrays.cexpr_t | None
+    ) -> ScanObject | None:
+        if expr is None:
+            return None
+
+        base_expr, offset = _extract_offset_expression(expr)
+        if base_expr is None:
+            return None
+
+        scan_object = ScanObject.create(self._cfunc, base_expr)
+        if scan_object is None:
+            return None
+
+        return _make_offset_scan_object(scan_object, offset)
+
+    def _append_scan_object(
+        self, new_obj: ScanObject | None, source_obj: ScanObject
+    ) -> None:
+        if new_obj is None or new_obj in self._objects:
+            return
+
+        if hasattr(new_obj, "inherit_scan_root_from"):
+            new_obj.inherit_scan_root_from(source_obj)
+        self._objects.append(new_obj)
+        if (
+            getattr(new_obj, "func_ea", ida_idaapi.BADADDR)
+            == getattr(self._cfunc, "entry_ea", ida_idaapi.BADADDR)
+        ):
+            self._rescan_current_function = True
 
     def visit_expr(self, cexpr: ida_hexrays.cexpr_t):
         if self._skip:
@@ -93,17 +126,14 @@ class DownwardsObjectVisitor(ObjectVisitor):
                         f"Remove object {obj} from scanning at {print_expr_address(x_cexpr, self.parents)}"
                     )
                     self._objects.remove(obj)
+                else:
+                    self._append_scan_object(
+                        self._create_scan_object_from_expr(y_cexpr), obj
+                    )
             elif obj.is_target(y_cexpr):
-                new_obj = ScanObject.create(self._cfunc, x_cexpr)
-                if new_obj and new_obj not in self._objects:
-                    if hasattr(new_obj, "inherit_scan_root_from"):
-                        new_obj.inherit_scan_root_from(obj)
-                    self._objects.append(new_obj)
-                    if (
-                        getattr(new_obj, "func_ea", ida_idaapi.BADADDR)
-                        == getattr(self._cfunc, "entry_ea", ida_idaapi.BADADDR)
-                    ):
-                        self._rescan_current_function = True
+                self._append_scan_object(
+                    self._create_scan_object_from_expr(x_cexpr), obj
+                )
                 return 0
 
         return 0
@@ -156,7 +186,7 @@ class UpwardsObjectVisitor(ObjectVisitor):
         data=None,
         skip_until_object=False,
     ):
-        super(UpwardsObjectVisitor, self).__init__(cfunc, obj, data, skip_until_object)
+        ObjectVisitor.__init__(self, cfunc, obj, data, skip_until_object)
         self._stage = self.STAGE_PREPARE
         self._tree = {}
         self._call_obj = obj if obj.id == ObjectType.call_argument else None
@@ -205,12 +235,12 @@ class UpwardsObjectVisitor(ObjectVisitor):
 
     def process(self):
         self._stage = self.STAGE_PREPARE
-        self.cv_flags &= ~ida_hexrays.CV_POST
-        super(UpwardsObjectVisitor, self).process()
+        self.cv_flags &= ~getattr(ida_hexrays, "CV_POST", 0)
+        super().process()
         self._stage = self.STAGE_PARSING
-        self.cv_flags |= ida_hexrays.CV_POST
+        self.cv_flags |= getattr(ida_hexrays, "CV_POST", 0)
         self._prepare()
-        super(UpwardsObjectVisitor, self).process()
+        super().process()
 
     def _is_initial_object(self, cexpr: ida_hexrays.cexpr_t):
         return (
@@ -248,7 +278,7 @@ class RecursiveObjectVisitor(ObjectVisitor):
         skip_until_object=False,
         visited=None,
     ):
-        super(RecursiveObjectVisitor, self).__init__(cfunc, obj, data, skip_until_object)
+        ObjectVisitor.__init__(self, cfunc, obj, data, skip_until_object)
         self._visited = visited if visited else set()
         self._new_for_visit = set()
         self.crippled = False
@@ -258,7 +288,7 @@ class RecursiveObjectVisitor(ObjectVisitor):
         self._debug_message = []
 
     def visit_expr(self, cexpr: ida_hexrays.cexpr_t):
-        return super(RecursiveObjectVisitor, self).visit_expr(cexpr)
+        return super().visit_expr(cexpr)
 
     # noinspection PyAttributeOutsideInit
     def set_callbacks(
@@ -269,7 +299,7 @@ class RecursiveObjectVisitor(ObjectVisitor):
         finish=None,
         finish_iteration=None,
     ):
-        super(RecursiveObjectVisitor, self).set_callbacks(manipulate)
+        super().set_callbacks(manipulate)
         if start:
             self._start = start.__get__(self, RecursiveDownwardsObjectVisitor)
         if start_iteration:
@@ -316,12 +346,12 @@ class RecursiveObjectVisitor(ObjectVisitor):
 
     def _recursive_process(self):
         self._start_iteration()
-        super(RecursiveObjectVisitor, self).process()
+        super().process()
         self._finish_iteration()
 
     def _manipulate(self, cexpr, obj):
         self._check_call(cexpr)
-        super(RecursiveObjectVisitor, self)._manipulate(cexpr, obj)
+        super()._manipulate(cexpr, obj)
 
     def _check_call(self, cexpr: ida_hexrays.cexpr_t):
         raise NotImplementedError
@@ -379,10 +409,11 @@ class RecursiveDownwardsObjectVisitor(RecursiveObjectVisitor, DownwardsObjectVis
         visited=None,
         recurse_calls: bool = False,
     ):
-        super(RecursiveDownwardsObjectVisitor, self).__init__(
-            cfunc, obj, data, skip_until_object, visited
-        )
+        RecursiveObjectVisitor.__init__(self, cfunc, obj, data, skip_until_object, visited)
+        self.cv_flags |= getattr(ida_hexrays, "CV_POST", 0)
+        self._rescan_current_function = False
         self._recurse_calls = recurse_calls
+
 
 
     def _check_call(self, cexpr: ida_hexrays.cexpr_t):
@@ -413,7 +444,7 @@ class RecursiveDownwardsObjectVisitor(RecursiveObjectVisitor, DownwardsObjectVis
     def leave_expr(self, cexpr):
         if getattr(self, "_recurse_calls", False):
             self._check_call(cexpr)
-        return super(RecursiveDownwardsObjectVisitor, self).leave_expr(cexpr)
+        return super().leave_expr(cexpr)
 
 
     def _refresh_decompilation_tree(self, cfunc: ida_hexrays.cfunc_t | None = None) -> ida_hexrays.cfunc_t | None:
@@ -427,7 +458,7 @@ class RecursiveDownwardsObjectVisitor(RecursiveObjectVisitor, DownwardsObjectVis
         self._cfunc = self._refresh_decompilation_tree(self._cfunc)
         while True:
             self._rescan_current_function = False
-            super(RecursiveDownwardsObjectVisitor, self)._recursive_process()
+            super()._recursive_process()
             if not self._rescan_current_function:
                 break
             self._cfunc = self._refresh_decompilation_tree(self._cfunc)
@@ -472,7 +503,7 @@ class RecursiveDownwardsObjectVisitor(RecursiveObjectVisitor, DownwardsObjectVis
             self._skip = saved_skip
             self._init_obj = saved_init_obj
             self._cfunc = self._refresh_decompilation_tree()
-            super(RecursiveDownwardsObjectVisitor, self)._recursive_process()
+            super()._recursive_process()
             if self._new_for_visit:
                 pending_visits.extend(self._new_for_visit)
                 self._new_for_visit.clear()
@@ -517,7 +548,7 @@ class RecursiveDownwardsObjectVisitor(RecursiveObjectVisitor, DownwardsObjectVis
                 self._skip = saved_skip
                 self._init_obj = saved_init_obj
                 self._cfunc = self._refresh_decompilation_tree()
-                super(RecursiveDownwardsObjectVisitor, self)._recursive_process()
+                super()._recursive_process()
                 if self._new_for_visit:
                     pending_visits.extend(self._new_for_visit)
                     self._new_for_visit.clear()
@@ -538,10 +569,13 @@ class RecursiveUpwardsObjectVisitor(RecursiveObjectVisitor, UpwardsObjectVisitor
         skip_until_object=False,
         visited=None,
     ):
-        super(RecursiveUpwardsObjectVisitor, self).__init__(cfunc, obj, data, skip_until_object, visited)
+        RecursiveObjectVisitor.__init__(self, cfunc, obj, data, skip_until_object, visited)
+        self._stage = self.STAGE_PREPARE
+        self._tree = {}
+        self._call_obj = obj if obj.id == ObjectType.call_argument else None
 
     def prepare_new_scan(self, cfunc, arg_idx, obj, skip=False):
-        super(RecursiveUpwardsObjectVisitor, self).prepare_new_scan(cfunc, arg_idx, obj, skip)
+        super().prepare_new_scan(cfunc, arg_idx, obj, skip)
         self._call_obj = obj if obj.id == ObjectType.call_argument else None
 
     def _check_call(self, cexpr: ida_hexrays.cexpr_t):
@@ -568,7 +602,7 @@ class RecursiveUpwardsObjectVisitor(RecursiveObjectVisitor, UpwardsObjectVisitor
         return super().leave_expr(cexpr)
 
     def _recursive_process(self):
-        super(RecursiveUpwardsObjectVisitor, self)._recursive_process()
+        super()._recursive_process()
 
         while self._new_for_visit:
             new_visit = list(self._new_for_visit)
@@ -590,7 +624,7 @@ class RecursiveUpwardsObjectVisitor(RecursiveObjectVisitor, UpwardsObjectVisitor
 
 class FunctionTouchVisitor(ida_hexrays.ctree_parentee_t):
     def __init__(self, cfunc: ida_hexrays.cfunc_t):
-        super().__init__()
+        ida_hexrays.ctree_parentee_t.__init__(self)
         self._functions = set()
         self._cfunc = cfunc
         self._visited = set()  # Keep track of visited functions
