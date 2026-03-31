@@ -522,7 +522,7 @@ class ScanVisitor(ObjectVisitor):
                     # ((void (__some_call*)(..., *(TYPE*)(expr + x), ...)
                     log_debug(f"object passed as argument to function at {hex(second_expr.ea)}")
                     return self._get_member(offset, cexpr, obj, first_expr.type)
-                tinfo = self._parse_call(second_expr, first_expr)
+                tinfo = self._parse_call(second_expr, first_expr, types["u8"].ptr)
                 return self._get_member(offset, cexpr, obj, tinfo)
 
         if context.op_at(0) == ctype.call and context.expr_at(0) is not None:
@@ -531,7 +531,7 @@ class ScanVisitor(ObjectVisitor):
             log_debug(
                 f"function call with cast, parent: {call_parent.type.dstr()} {call_parent.dstr()}, cexpr: {cexpr.type.dstr()} {cexpr.dstr()}"
             )
-            tinfo = self._parse_call(call_parent, cexpr)
+            tinfo = self._parse_call(call_parent, cexpr, types["char"].type)
             return self._get_member(offset, cexpr, obj, tinfo)
 
         if context.op_at(0) == ctype.asg and context.expr_at(0) is not None:
@@ -593,6 +593,7 @@ class ScanVisitor(ObjectVisitor):
         self,
         call_cexpr: ida_hexrays.cexpr_t,
         arg_cexpr: ida_hexrays.cexpr_t,
+        fallback_tinfo: Optional[ida_typeinf.tinfo_t] = None,
     ) -> Optional[ida_typeinf.tinfo_t]:
         """Infer the argument type used at a call site."""
         idx, tinfo = get_func_argument_info(call_cexpr, arg_cexpr)
@@ -608,6 +609,13 @@ class ScanVisitor(ObjectVisitor):
                 f"for argument {idx} at {to_hex(call_cexpr.ea)}"
             )
             return self._deref_tinfo(arg_tinfo)
+
+        if fallback_tinfo is not None:
+            log_warning(
+                "Could not infer argument type from call expression; "
+                f"falling back to {self._describe_tinfo(fallback_tinfo)} for argument {idx} at {to_hex(call_cexpr.ea)}"
+            )
+            return fallback_tinfo
 
         log_warning(
             "Could not infer argument type from call expression; "

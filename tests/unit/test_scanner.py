@@ -285,7 +285,7 @@ def test_extract_member_uses_argument_expression_type_without_warning(monkeypatc
             return SimpleNamespace(dstr=lambda: "void *")
 
         def __getitem__(self, key):
-            return SimpleNamespace(type=SimpleNamespace(dstr=lambda: key))
+            return SimpleNamespace(type=SimpleNamespace(dstr=lambda: key), ptr=SimpleNamespace(dstr=lambda: f"{key} *"))
 
     monkeypatch.setattr(scanner_module, "types", _FakeTypes())
 
@@ -309,7 +309,7 @@ def test_extract_member_uses_argument_expression_type_without_warning(monkeypatc
     assert "warning" not in captured
 
 
-def test_extract_member_warns_when_call_argument_type_is_unknown(monkeypatch):
+def test_extract_member_falls_back_to_char_for_direct_call_context(monkeypatch):
     scanner_module = _load_scanner_module()
     visitor = scanner_module.ScanVisitor.__new__(scanner_module.ScanVisitor)
     scanner_module.ctype = SimpleNamespace(cast=1, ptr=2, idx=2, add=3, num=4, asg=5, var=6, call=7)
@@ -317,9 +317,7 @@ def test_extract_member_warns_when_call_argument_type_is_unknown(monkeypatch):
     captured = {}
 
     def fake_get_member(offset, cexpr, obj, tinfo, obj_ea=None):
-        captured["offset"] = offset
         captured["tinfo"] = tinfo
-        captured["obj_ea"] = obj_ea
         return "member"
 
     def fake_warning(message=None, display_messagebox=False):
@@ -337,14 +335,17 @@ def test_extract_member_warns_when_call_argument_type_is_unknown(monkeypatch):
             return SimpleNamespace(dstr=lambda: "void *")
 
         def __getitem__(self, key):
-            return SimpleNamespace(type=SimpleNamespace(dstr=lambda: key))
+            return SimpleNamespace(type=SimpleNamespace(dstr=lambda: key), ptr=SimpleNamespace(dstr=lambda: f"{key} *"))
 
     monkeypatch.setattr(scanner_module, "types", _FakeTypes())
 
     unknown_type = SimpleNamespace(dstr=lambda: "?", get_size=lambda: scanner_module.ida_typeinf.BADSIZE)
-    leaf = SimpleNamespace(op=scanner_module.ctype.var, type=unknown_type)
-    first_expr = SimpleNamespace(op=scanner_module.ctype.ptr, x=leaf, type=unknown_type)
-    second_expr = SimpleNamespace(
+    leaf = SimpleNamespace(
+        op=scanner_module.ctype.var,
+        type=unknown_type,
+        dstr=lambda: "leaf",
+    )
+    call_expr = SimpleNamespace(
         op=scanner_module.ctype.call,
         x=SimpleNamespace(obj_ea=0x5000),
         a=[leaf],
@@ -352,14 +353,64 @@ def test_extract_member_warns_when_call_argument_type_is_unknown(monkeypatch):
         dstr=lambda: "callee(arg)",
         type=SimpleNamespace(dstr=lambda: "__int64"),
     )
-    context = scanner_module.ParentExpressionContext([first_expr, second_expr])
+    context = scanner_module.ParentExpressionContext([call_expr])
 
     result = visitor._extract_member(leaf, SimpleNamespace(name="v2"), 0, context)
 
     assert result == "member"
-    assert captured["offset"] == 0
     assert captured["tinfo"].dstr() == "char"
     assert captured["warning"] == "Could not infer argument type from call expression; falling back to char for argument 0 at 0x401234"
+    assert captured["display_messagebox"] is False
+
+
+def test_extract_member_uses_pointer_fallback_for_call_context(monkeypatch):
+    scanner_module = _load_scanner_module()
+    visitor = scanner_module.ScanVisitor.__new__(scanner_module.ScanVisitor)
+    scanner_module.ctype = SimpleNamespace(cast=1, ptr=2, idx=2, add=3, num=4, asg=5, var=6, call=7)
+
+    captured = {}
+
+    def fake_get_member(offset, cexpr, obj, tinfo, obj_ea=None):
+        captured["tinfo"] = tinfo
+        return "member"
+
+    def fake_warning(message=None, display_messagebox=False):
+        captured["warning"] = message
+        captured["display_messagebox"] = display_messagebox
+
+    visitor._get_member = fake_get_member
+    visitor._describe_tinfo = lambda tinfo: getattr(tinfo, "dstr", lambda: str(tinfo))()
+    visitor._deref_tinfo = lambda tinfo: tinfo
+    monkeypatch.setattr(scanner_module, "log_warning", fake_warning)
+    monkeypatch.setattr(scanner_module, "get_func_argument_info", lambda *_args, **_kwargs: (0, None))
+
+    class _FakeTypes:
+        def get_ptr(self):
+            return SimpleNamespace(dstr=lambda: "void *")
+
+        def __getitem__(self, key):
+            return SimpleNamespace(type=SimpleNamespace(dstr=lambda: key), ptr=SimpleNamespace(dstr=lambda: f"{key} *"))
+
+    monkeypatch.setattr(scanner_module, "types", _FakeTypes())
+
+    unknown_type = SimpleNamespace(dstr=lambda: "?", get_size=lambda: scanner_module.ida_typeinf.BADSIZE)
+    leaf = SimpleNamespace(op=scanner_module.ctype.var, type=SimpleNamespace(dstr=lambda: "void *"))
+    ptr_expr = SimpleNamespace(op=scanner_module.ctype.ptr, x=leaf, type=unknown_type)
+    call_expr = SimpleNamespace(
+        op=scanner_module.ctype.call,
+        x=SimpleNamespace(obj_ea=0x5000),
+        a=[leaf],
+        ea=0x401234,
+        dstr=lambda: "callee(arg)",
+        type=SimpleNamespace(dstr=lambda: "__int64"),
+    )
+    context = scanner_module.ParentExpressionContext([ptr_expr, call_expr])
+
+    result = visitor._extract_member(leaf, SimpleNamespace(name="v2"), 0, context)
+
+    assert result == "member"
+    assert captured["tinfo"].dstr() == "u8 *"
+    assert captured["warning"] == "Could not infer argument type from call expression; falling back to u8 * for argument 0 at 0x401234"
     assert captured["display_messagebox"] is False
 
 
