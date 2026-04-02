@@ -894,6 +894,40 @@ def test_build_child_scan_plan_uses_created_parent_type(monkeypatch):
 
 
 
+
+def test_build_child_scan_plan_preserves_distinct_scan_locations(monkeypatch):
+    structure_form = _make_form(monkeypatch)
+    parent = structure_form.create_structure("Parent")
+    assert parent is not None
+
+    parent.created_type_name = "Parent_t"
+    member = _FakeMember(0x30, 8, type_name="u64", name="child_ptr")
+    member.tinfo = SimpleNamespace(is_ptr=lambda: False, is_udt=lambda: False)
+    member.scanned_variables = {
+        _FakeScanObject(
+            func_ea=0x401000,
+            ea=0x402000,
+            name="root",
+            function_name="root_func",
+        ),
+        _FakeScanObject(
+            func_ea=0x401000,
+            ea=0x402010,
+            name="root",
+            function_name="root_func",
+        ),
+    }
+    parent.add_member(member)
+    structure_form.current_structure = parent
+    monkeypatch.setattr(form_module, "is_legal_type", lambda _tinfo: True)
+
+    plan = structure_form._build_child_scan_plan(member)
+
+    assert plan is not None
+    assert plan.function_eas == (0x401000,)
+    assert plan.has_multiple_roots is True
+    assert plan.root_object_ea in {0x402000, 0x402010}
+
 def test_build_child_scan_plan_accepts_inferred_primitive_member(monkeypatch):
     structure_form = _make_form(monkeypatch)
     parent = structure_form.create_structure("auto_struct_001")

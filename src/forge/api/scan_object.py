@@ -239,10 +239,17 @@ class ScanObject:
         return expr.ea
 
     def __hash__(self):
-        return hash((self.id, self.name))
+        # Preserve distinct scan evidence for the same variable at different locations.
+        return hash((self.id, self.name, self.func_ea, self.ea))
 
     def __eq__(self, rhs):
-        return self.id == rhs.id and self.name == rhs.name
+        return (
+            isinstance(rhs, ScanObject)
+            and self.id == rhs.id
+            and self.name == rhs.name
+            and self.func_ea == rhs.func_ea
+            and self.ea == rhs.ea
+        )
 
     def __repr__(self):
         return self.name
@@ -279,7 +286,7 @@ class StructurePointerObject(ScanObject):
     """
 
     def __init__(self, struct_name: str, offset: int):
-        super(StructurePointerObject, self).__init__()
+        super().__init__()
         self.struct_name = struct_name
         self.offset = offset
         self.id = ObjectType.structure_pointer
