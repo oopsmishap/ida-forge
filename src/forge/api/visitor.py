@@ -152,10 +152,18 @@ class DownwardsObjectVisitor(ObjectVisitor):
             cexpr = cexpr.y
             if cexpr.op == ctype.cast:
                 cexpr = cexpr.x
-        return (
-            self._init_obj.is_target(cexpr)
-            and find_expr_address(cexpr, self.parents) == self._start_ea
-        )
+
+        target_matches = getattr(self._init_obj, "is_target", None)
+        if callable(target_matches):
+            initial_match = target_matches(cexpr)
+        else:
+            initial_match = getattr(self._init_obj, "ea", ida_idaapi.BADADDR) == find_expr_address(
+                cexpr, self.parents
+            )
+
+
+        return initial_match and find_expr_address(cexpr, self.parents) == self._start_ea
+
 
     def _is_object_overwritten(self, cexpr: ida_hexrays.cexpr_t) -> bool:
         if len(self._objects) < 2:

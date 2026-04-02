@@ -184,6 +184,20 @@ def test_recursive_downwards_object_visitor_adds_child_from_assigned_member(monk
     assert visitor._objects == [root_obj, child_obj]
     assert visitor._rescan_current_function is True
 
+def test_initial_object_accepts_legacy_scanned_variable_without_is_target(monkeypatch):
+    visitor_module = _load_visitor_module()
+    monkeypatch.setattr(visitor_module, "ctype", SimpleNamespace(asg=1, cast=2, var=3), raising=False)
+    visitor = visitor_module.RecursiveDownwardsObjectVisitor.__new__(visitor_module.RecursiveDownwardsObjectVisitor)
+    visitor.parents = []
+    visitor._start_ea = 0x402000
+    visitor._init_obj = SimpleNamespace(ea=0x402000)
+
+    monkeypatch.setattr(visitor_module, "find_expr_address", lambda _cexpr, _parents: 0x402000)
+
+    assert visitor._is_initial_object(SimpleNamespace(op=visitor_module.ctype.var, ea=0x402000)) is True
+
+
+
 def test_recursive_downwards_object_visitor_retries_deferred_child_arguments(monkeypatch):
     visitor_module = _load_visitor_module()
     visitor = visitor_module.RecursiveDownwardsObjectVisitor.__new__(
