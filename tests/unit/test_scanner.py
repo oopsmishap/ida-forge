@@ -309,6 +309,41 @@ def test_scanned_object_create_inherits_scan_root_metadata(monkeypatch):
     assert scanned.scan_root_ea == 0x401234
     assert scanned.scan_root_function_name == "sub_401000"
 
+def test_scanned_object_create_accepts_legacy_scanned_variable_object(monkeypatch):
+    scanner_module = _load_scanner_module()
+    monkeypatch.setattr(
+        scanner_module.ida_funcs,
+        "get_func",
+        lambda _ea: SimpleNamespace(start_ea=0x401000),
+        raising=False,
+    )
+
+    monkeypatch.setattr(
+        scanner_module.ida_hexrays,
+        "lvar_locator_t",
+        lambda location, defea: SimpleNamespace(location=location, defea=defea),
+        raising=False,
+    )
+
+    source = SimpleNamespace(
+        name="arg0",
+        ea=0x402000,
+        func_ea=0x401000,
+        scan_root_function_ea=0x401000,
+        scan_root_ea=0x402000,
+        scan_root_function_name="sub_401000",
+        _ScannedVariableObject__lvar=SimpleNamespace(location="stack", defea=0x1234),
+    )
+
+    scanned = scanner_module.ScannedObject.create(source, 0x401234, 0x0)
+
+    assert scanned.name == "arg0"
+    assert scanned.ea == 0x401234
+    assert scanned.scan_root_function_ea == 0x401000
+    assert scanned.scan_root_ea == 0x402000
+    assert scanned.scan_root_function_name == "sub_401000"
+
+
 
 def test_extract_member_uses_argument_expression_type_without_warning(monkeypatch):
     scanner_module = _load_scanner_module()

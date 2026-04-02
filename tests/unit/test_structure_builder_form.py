@@ -1167,6 +1167,60 @@ def test_execute_child_scan_plan_runs_for_each_scan_location(monkeypatch):
         (0x401000, 0x30, 0x402010, 0x401000, "root_b", "Child", True),
     ]
 
+def test_execute_child_scan_plan_normalizes_legacy_scan_variables(monkeypatch):
+    structure_form = _make_form(monkeypatch)
+    child = structure_form.create_structure("Child")
+    assert child is not None
+    child.main_offset = 0x30
+
+    legacy_lvar = SimpleNamespace(location="stack", defea=0x1234)
+    legacy_scan_variable = SimpleNamespace(
+        name="root_a",
+        ea=0x402000,
+        func_ea=0x401000,
+        _ScannedVariableObject__lvar=legacy_lvar,
+    )
+    plan = SimpleNamespace(
+        function_eas=(0x401000,),
+        scan_object=SimpleNamespace(name="child_ptr"),
+        scan_variables=(legacy_scan_variable,),
+    )
+
+    monkeypatch.setattr(
+        structure_form,
+        "_prepare_scan_cfunc",
+        lambda _ea: SimpleNamespace(entry_ea=0x401000, treeitems=[], eamap={}, body=None),
+    )
+
+    captured = {}
+
+    class FakeVisitor:
+        def __init__(self, cfunc, origin, obj, structure, recurse_calls=False):
+            captured["args"] = (
+                cfunc.entry_ea,
+                origin,
+                getattr(obj, "name", None),
+                getattr(obj, "ea", None),
+                getattr(obj, "id", None),
+                getattr(obj, "lvar", None),
+                structure.name,
+                recurse_calls,
+            )
+
+        def process(self):
+            return None
+
+    monkeypatch.setattr(form_module, "NewDeepScanVisitor", FakeVisitor)
+
+    assert structure_form._execute_child_scan_plan(child, plan) is True
+    assert captured["args"][0:4] == (0x401000, 0x30, "root_a", 0x402000)
+    assert captured["args"][4] == import_module("forge.api.scan_object").ObjectType.local_variable
+    assert captured["args"][5] is legacy_lvar
+    assert captured["args"][6:] == ("Child", True)
+
+
+
+
 
 
 

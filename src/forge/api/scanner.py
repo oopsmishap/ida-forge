@@ -90,26 +90,60 @@ class ScannedObject:
         origin: int,
         applicable: bool = True,
     ) -> "ScannedObject":
-        if obj.id == ObjectType.global_object:
+        obj_id = getattr(obj, "id", None)
+        if obj_id is None:
+            legacy_lvar = getattr(obj, "lvar", getattr(obj, "_ScannedVariableObject__lvar", None))
+            if legacy_lvar is not None:
+                result = ScannedVariableObject(
+                    legacy_lvar, getattr(obj, "name", ""), expression_address, origin, applicable
+                )
+            else:
+                legacy_obj_ea = getattr(
+                    obj, "object_ea", getattr(obj, "_ScannedGlobalObject__obj_ea", None)
+                )
+                if legacy_obj_ea is not None:
+                    result = ScannedGlobalObject(
+                        legacy_obj_ea, getattr(obj, "name", ""), expression_address, origin, applicable
+                    )
+                else:
+                    legacy_struct_name = getattr(
+                        obj, "struct_name", getattr(obj, "_ScannedStructureMemberObject__struct_name", None)
+                    )
+                    legacy_struct_offset = getattr(
+                        obj, "offset", getattr(obj, "_ScannedStructureMemberObject__struct_offset", None)
+                    )
+                    if legacy_struct_name is None or legacy_struct_offset is None:
+                        raise AssertionError(f"Unsupported scan object type: {obj_id}")
+                    result = ScannedStructureMemberObject(
+                        legacy_struct_name,
+                        legacy_struct_offset,
+                        getattr(obj, "name", ""),
+                        expression_address,
+                        origin,
+                        applicable,
+                    )
+        elif obj_id == ObjectType.global_object:
             result = ScannedGlobalObject(
                 obj.object_ea, obj.name, expression_address, origin, applicable
             )
-        elif obj.id == ObjectType.local_variable:
+        elif obj_id == ObjectType.local_variable:
             result = ScannedVariableObject(
                 obj.lvar, obj.name, expression_address, origin, applicable
             )
-        elif obj.id in (ObjectType.structure_pointer, ObjectType.structure_reference):
+        elif obj_id in (ObjectType.structure_pointer, ObjectType.structure_reference):
             result = ScannedStructureMemberObject(
                 obj.struct_name, obj.name, expression_address, origin, applicable
             )
         else:
-            raise AssertionError(f"Unsupported scan object type: {obj.id}")
+            raise AssertionError(f"Unsupported scan object type: {obj_id}")
 
         for attr in ("scan_root_function_ea", "scan_root_ea", "scan_root_function_name"):
             value = getattr(obj, attr, None)
             if value is not None and value != idaapi.BADADDR:
                 setattr(result, attr, value)
         return result
+
+
 
 
 

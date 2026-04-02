@@ -1,18 +1,23 @@
 from __future__ import annotations
 
-
-
 from dataclasses import dataclass
+from types import SimpleNamespace
 
 import ida_hexrays
 import idaapi
 
 from forge.api.hexrays import decompile, is_legal_type
 from forge.api.members import AbstractMember, parse_user_tinfo
-from forge.api.scan_object import ScanObject, StructurePointerObject, StructureReferenceObject
+from forge.api.scan_object import (
+    ObjectType,
+    ScanObject,
+    StructurePointerObject,
+    StructureReferenceObject,
+)
 from forge.api.scanner import NewDeepScanVisitor
 from forge.api.structure import Structure
 from forge.util.logging import log_warning
+
 
 from .dialogs import ScannedVariableChooser
 
@@ -92,6 +97,48 @@ class ChildScanMixin:
                 return resolved
 
         return None
+
+    @staticmethod
+    def _normalize_scan_variable(scan_variable: ScanObject) -> ScanObject:
+        if getattr(scan_variable, "id", None) is not None:
+            return scan_variable
+
+        proxy = SimpleNamespace(
+            name=getattr(scan_variable, "name", None),
+            ea=getattr(scan_variable, "ea", idaapi.BADADDR),
+            func_ea=getattr(scan_variable, "func_ea", idaapi.BADADDR),
+            tinfo=getattr(scan_variable, "tinfo", None),
+            scan_root_ea=getattr(scan_variable, "scan_root_ea", idaapi.BADADDR),
+            scan_root_function_ea=getattr(
+                scan_variable, "scan_root_function_ea", idaapi.BADADDR
+            ),
+            scan_root_function_name=getattr(scan_variable, "scan_root_function_name", None),
+        )
+
+        legacy_lvar = getattr(scan_variable, "_ScannedVariableObject__lvar", None)
+        if legacy_lvar is not None:
+            proxy.id = ObjectType.local_variable
+            proxy.lvar = legacy_lvar
+            return proxy
+
+        legacy_obj_ea = getattr(scan_variable, "_ScannedGlobalObject__obj_ea", None)
+        if legacy_obj_ea is not None:
+            proxy.id = ObjectType.global_object
+            proxy.object_ea = legacy_obj_ea
+            return proxy
+
+        legacy_struct_name = getattr(scan_variable, "_ScannedStructureMemberObject__struct_name", None)
+        legacy_struct_offset = getattr(
+            scan_variable, "_ScannedStructureMemberObject__struct_offset", None
+        )
+        if legacy_struct_name is not None and legacy_struct_offset is not None:
+            proxy.id = ObjectType.structure_reference
+            proxy.struct_name = legacy_struct_name
+            proxy.offset = legacy_struct_offset
+            return proxy
+
+        return proxy
+
 
 
     def _build_child_scan_plan(
@@ -222,12 +269,15 @@ class ChildScanMixin:
     ) -> bool:
         scanned_any = False
         visitor_cls = getattr(_form_module(), "NewDeepScanVisitor", NewDeepScanVisitor)
+        scanned_any = False
+        visitor_cls = getattr(_form_module(), "NewDeepScanVisitor", NewDeepScanVisitor)
         evidence_by_function: dict[int, list[ScanObject]] = {}
         for scan_variable in getattr(plan, "scan_variables", ()) or ():
-            func_ea = getattr(scan_variable, "func_ea", idaapi.BADADDR)
+            normalized = self._normalize_scan_variable(scan_variable)
+            func_ea = getattr(normalized, "func_ea", idaapi.BADADDR)
             if func_ea == idaapi.BADADDR:
                 continue
-            evidence_by_function.setdefault(func_ea, []).append(scan_variable)
+            evidence_by_function.setdefault(func_ea, []).append(normalized)
         for func_ea in plan.function_eas:
             cfunc = self._prepare_scan_cfunc(func_ea)
             if cfunc is None:
@@ -244,6 +294,8 @@ class ChildScanMixin:
                 )
                 visitor.process()
                 scanned_any = True
+        return scanned_any
+
 
         return scanned_any
 
