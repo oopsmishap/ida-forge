@@ -198,6 +198,20 @@ def test_initial_object_accepts_legacy_scanned_variable_without_is_target(monkey
 
 
 
+def test_leave_expr_accepts_legacy_scanned_variable_without_is_target(monkeypatch):
+    visitor_module = _load_visitor_module()
+    visitor = visitor_module.RecursiveDownwardsObjectVisitor.__new__(visitor_module.RecursiveDownwardsObjectVisitor)
+    visitor._skip = False
+    visitor._objects = [SimpleNamespace(ea=0x402000, id=visitor_module.ObjectType.local_variable)]
+
+    seen = []
+    monkeypatch.setattr(visitor, "_manipulate", lambda cexpr, obj: seen.append((cexpr.ea, obj.ea)), raising=False)
+    monkeypatch.setattr(visitor_module, "find_expr_address", lambda _cexpr, _parents: 0x402000)
+
+    assert visitor.leave_expr(SimpleNamespace(op=999, ea=0x402000)) == 0
+    assert seen == [(0x402000, 0x402000)]
+
+
 def test_recursive_downwards_object_visitor_retries_deferred_child_arguments(monkeypatch):
     visitor_module = _load_visitor_module()
     visitor = visitor_module.RecursiveDownwardsObjectVisitor.__new__(

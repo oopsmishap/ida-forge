@@ -103,6 +103,20 @@ class DownwardsObjectVisitor(ObjectVisitor):
         ):
             self._rescan_current_function = True
 
+
+    def _matches_object(self, obj: ScanObject, cexpr: ida_hexrays.cexpr_t) -> bool:
+        target_matches = getattr(obj, "is_target", None)
+        if callable(target_matches):
+            return target_matches(cexpr)
+
+        obj_ea = getattr(obj, "ea", ida_idaapi.BADADDR)
+        if obj_ea == ida_idaapi.BADADDR:
+            return False
+
+        parents = getattr(self, "parents", [])
+        return obj_ea == find_expr_address(cexpr, parents)
+
+
     def visit_expr(self, cexpr: ida_hexrays.cexpr_t):
         if self._skip:
             if self._is_initial_object(cexpr):
@@ -120,7 +134,7 @@ class DownwardsObjectVisitor(ObjectVisitor):
             y_cexpr: ida_hexrays.cexpr_t = cexpr.y
 
         for obj in self._objects:
-            if obj.is_target(x_cexpr):
+            if self._matches_object(obj, x_cexpr):
                 if self._is_object_overwritten(y_cexpr):
                     log_info(
                         f"Remove object {obj} from scanning at {print_expr_address(x_cexpr, self.parents)}"
@@ -130,7 +144,7 @@ class DownwardsObjectVisitor(ObjectVisitor):
                     self._append_scan_object(
                         self._create_scan_object_from_expr(y_cexpr), obj
                     )
-            elif obj.is_target(y_cexpr):
+            elif self._matches_object(obj, y_cexpr):
                 self._append_scan_object(
                     self._create_scan_object_from_expr(x_cexpr), obj
                 )
@@ -138,14 +152,16 @@ class DownwardsObjectVisitor(ObjectVisitor):
 
         return 0
 
+
     def leave_expr(self, cexpr: ida_hexrays.cexpr_t):
         if self._skip:
             return 0
         for obj in self._objects:
-            if obj.is_target(cexpr) and obj.id != ObjectType.returned_object:
+            if self._matches_object(obj, cexpr) and obj.id != ObjectType.returned_object:
                 self._manipulate(cexpr, obj)
                 return 0
         return 0
+
 
     def _is_initial_object(self, cexpr: ida_hexrays.cexpr_t):
         if cexpr.op == ctype.asg:
@@ -153,16 +169,10 @@ class DownwardsObjectVisitor(ObjectVisitor):
             if cexpr.op == ctype.cast:
                 cexpr = cexpr.x
 
-        target_matches = getattr(self._init_obj, "is_target", None)
-        if callable(target_matches):
-            initial_match = target_matches(cexpr)
-        else:
-            initial_match = getattr(self._init_obj, "ea", ida_idaapi.BADADDR) == find_expr_address(
-                cexpr, self.parents
-            )
+        return self._matches_object(self._init_obj, cexpr) and find_expr_address(
+            cexpr, self.parents
+        ) == self._start_ea
 
-
-        return initial_match and find_expr_address(cexpr, self.parents) == self._start_ea
 
 
     def _is_object_overwritten(self, cexpr: ida_hexrays.cexpr_t) -> bool:
@@ -178,9 +188,10 @@ class DownwardsObjectVisitor(ObjectVisitor):
             return True
 
         for obj in self._objects:
-            if obj.is_target(e.a[0]):
+            if self._matches_object(obj, e.a[0]):
                 return False
         return True
+
 
 
 class UpwardsObjectVisitor(ObjectVisitor):
@@ -203,7 +214,7 @@ class UpwardsObjectVisitor(ObjectVisitor):
         if self._stage == self.STAGE_PARSING:
             return 0
 
-        if self._call_obj and self._call_obj.is_target(cexpr):
+        if self._call_obj and self._matches_object(self._call_obj, cexpr):
             obj = self._call_obj.create_scan_object(self._cfunc, cexpr)
             if obj:
                 self._objects.append(obj)
@@ -236,10 +247,11 @@ class UpwardsObjectVisitor(ObjectVisitor):
             return 1
 
         for obj in self._objects:
-            if obj.is_target(cexpr):
+            if self._matches_object(obj, cexpr):
                 self._manipulate(cexpr, obj)
                 return 0
         return 0
+
 
     def process(self):
         self._stage = self.STAGE_PREPARE
@@ -251,10 +263,10 @@ class UpwardsObjectVisitor(ObjectVisitor):
         super().process()
 
     def _is_initial_object(self, cexpr: ida_hexrays.cexpr_t):
-        return (
-            self._init_obj.is_target(cexpr)
-            and find_expr_address(cexpr, self.parents) == self._start_ea
-        )
+        return self._matches_object(self._init_obj, cexpr) and find_expr_address(
+            cexpr, self.parents
+        ) == self._start_ea
+
 
     def _add_object_assignment(self, from_obj, to_obj):
         if from_obj in self._tree:
