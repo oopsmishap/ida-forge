@@ -1046,6 +1046,39 @@ def test_build_child_scan_plan_allows_ambiguous_member_evidence_when_parent_name
     assert plan.scan_object.struct_name == "Parent"
     assert plan.has_multiple_roots is True
 
+def test_build_child_scan_plan_prefers_scan_root_evidence(monkeypatch):
+    structure_form = _make_form(monkeypatch)
+    parent = structure_form.create_structure("Parent")
+    assert parent is not None
+
+    parent.created_type_name = "Parent_t"
+    member = _FakeMember(0x30, 8, type_name="u64", name="child_ptr")
+    member.tinfo = SimpleNamespace(is_ptr=lambda: False, is_udt=lambda: False)
+    member.scanned_variables = [
+        _FakeScanObject(
+            func_ea=0x401000,
+            ea=0x402000,
+            name="root",
+            function_name="use_func",
+            root_func_ea=0x400800,
+            root_ea=0x400ABC,
+            root_function_name="seed_func",
+        ),
+    ]
+    structure_form.current_structure = parent
+    monkeypatch.setattr(form_module, "is_legal_type", lambda _tinfo: True)
+
+    plan = structure_form._build_child_scan_plan(member)
+
+    assert plan is not None
+    assert plan.function_eas == (0x400800,)
+    assert plan.root_object_ea == 0x400ABC
+    assert plan.root_function_ea == 0x400800
+    assert len(plan.scan_variables) == 1
+    assert plan.scan_variables[0].ea == 0x400ABC
+    assert plan.scan_variables[0].func_ea == 0x400800
+
+
 
 def test_update_action_states_enables_child_scan_actions_for_scannable_member(monkeypatch):
     structure_form = _make_form(monkeypatch)

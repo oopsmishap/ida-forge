@@ -168,6 +168,18 @@ class ChildScanMixin:
         )
         return seeded
 
+    @staticmethod
+    def _seed_evidence(scan_variable: ScanObject) -> ScanObject:
+        seeded = copy.copy(scan_variable)
+        root_ea = getattr(scan_variable, "scan_root_ea", idaapi.BADADDR)
+        if root_ea != idaapi.BADADDR:
+            seeded.ea = root_ea
+        root_func_ea = getattr(scan_variable, "scan_root_function_ea", idaapi.BADADDR)
+        if root_func_ea != idaapi.BADADDR:
+            seeded.func_ea = root_func_ea
+        return seeded
+
+
 
 
 
@@ -195,6 +207,11 @@ class ChildScanMixin:
         if not scanned_variables:
             warn("The selected row does not have scan evidence for child scanning yet.")
             return None
+
+        seeded_scan_variables = tuple(
+            self._seed_evidence(self._normalize_scan_variable(scan_variable))
+            for scan_variable in scanned_variables
+        )
 
         tinfo = getattr(member, "tinfo", None)
         if tinfo is None:
@@ -246,7 +263,7 @@ class ChildScanMixin:
             sorted(
                 {
                     getattr(scan_variable, "func_ea", idaapi.BADADDR)
-                    for scan_variable in scanned_variables
+                    for scan_variable in seeded_scan_variables
                     if getattr(scan_variable, "func_ea", idaapi.BADADDR) != idaapi.BADADDR
                 }
             )
@@ -257,10 +274,10 @@ class ChildScanMixin:
 
         scan_object.name = member.name
         scan_object.tinfo = tinfo
-        representative = scanned_variables[0]
+        representative = seeded_scan_variables[0]
         expression_eas = {
             getattr(scan_variable, "ea", idaapi.BADADDR)
-            for scan_variable in scanned_variables
+            for scan_variable in seeded_scan_variables
             if getattr(scan_variable, "ea", idaapi.BADADDR) != idaapi.BADADDR
         }
         member_name = member.name or f"member_{member.offset:X}"
@@ -276,8 +293,9 @@ class ChildScanMixin:
                 root_function_ea if root_function_ea != idaapi.BADADDR else None
             ),
             has_multiple_roots=len(function_eas) > 1 or len(expression_eas) > 1,
-            scan_variables=tuple(scanned_variables),
+            scan_variables=seeded_scan_variables,
         )
+
 
 
     def _create_or_get_child_structure(
