@@ -1584,14 +1584,23 @@ class StructureBuilderForm(ChildScanMixin, ida_kernwin.PluginForm):
         pseudocode = cfunc.get_pseudocode()
         tag_remove = getattr(ida_lines, "tag_remove", lambda value: value)
 
+        def _pseudocode_line_text(entry) -> str:
+            raw_line = getattr(entry, "line", None)
+            if raw_line is None:
+                raw_line = getattr(entry, "text", None)
+            if raw_line is None:
+                raw_line = entry
+            return " ".join(tag_remove(str(raw_line)).split())
+
         def _line_for_item(item) -> str | None:
             try:
                 line_no, _column = cfunc.find_item_coords(item)
             except Exception:
                 return None
             if 1 <= line_no <= len(pseudocode):
-                return " ".join(tag_remove(str(pseudocode[line_no - 1])).split())
+                return _pseudocode_line_text(pseudocode[line_no - 1])
             return None
+
 
         candidates = []
         for item in getattr(cfunc, "treeitems", []):

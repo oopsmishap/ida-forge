@@ -793,6 +793,59 @@ def test_build_structure_table_debug_csv_falls_back_for_root_labels_and_lines(mo
     assert row["scan_root_locations"] == "root_func@0x400abc"
     assert row["scan_root_lines"] == "if (ok) {"
 
+def test_build_structure_table_debug_csv_reads_simpleline_line_text(monkeypatch):
+    structure_form = _make_form(monkeypatch)
+    parent = structure_form.create_structure("Parent")
+    assert parent is not None
+
+    member = _FakeMember(
+        0x30,
+        8,
+        type_name="Child *",
+        name="child_ptr",
+        comment="linked",
+        score=13,
+        origin=0x20,
+    )
+    scan_object = _FakeScanObject(
+        func_ea=0x401000,
+        ea=0x401234,
+        name="child_ptr_scan",
+        function_name="child_func",
+        root_func_ea=0x400800,
+        root_ea=0x400ABC,
+        root_function_name="root_func",
+    )
+    member.scanned_variables = {scan_object}
+    parent.add_member(member)
+    structure_form.current_structure = parent
+    monkeypatch.setattr(structure_form, "get_selected_members", lambda rows=None: [])
+
+    class _FakeSimpleLine:
+        def __init__(self, line: str):
+            self.line = line
+
+        def __str__(self) -> str:
+            return "<ida_kernwin.simpleline_t proxy>"
+
+    fake_cfunc = SimpleNamespace(
+        treeitems=[SimpleNamespace(ea=0x401234), SimpleNamespace(ea=0x400ABC)],
+        find_item_coords=lambda _item: (2, 0) if getattr(_item, "ea", None) == 0x401234 else (1, 0),
+        get_pseudocode=lambda: [
+            _FakeSimpleLine("if (ok) {"),
+            _FakeSimpleLine("    parent->child = value;"),
+        ],
+    )
+    monkeypatch.setattr(form_module, "decompile", lambda func_ea: fake_cfunc if func_ea in (0x401000, 0x400800) else None)
+
+    csv_text = structure_form._build_structure_table_debug_csv()
+    rows = list(csv.reader(io.StringIO(csv_text)))
+    row = dict(zip(rows[0], rows[1]))
+
+    assert row["scan_lines"] == "parent->child = value;"
+    assert row["scan_root_lines"] == "if (ok) {"
+
+
 def test_copy_structure_table_debug_csv_writes_clipboard(monkeypatch):
     structure_form = _make_form(monkeypatch)
     parent = structure_form.create_structure("Parent")
