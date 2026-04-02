@@ -623,23 +623,38 @@ class ScanVisitor(ObjectVisitor):
         )
         return types["char"].type
 
-    def _parse_left_assignee(self, x, offset):
+    def _parse_left_assignee(self, x, offset, scale: int = 1):
         if x is None:
             return None
 
         if x.op == ctype.cast and getattr(x, "x", None) is not None:
-            return self._parse_left_assignee(x.x, offset)
+            return self._parse_left_assignee(x.x, offset, scale)
 
         if x.op in (ctype.ptr, ctype.idx) and getattr(x, "x", None) is not None:
-            return self._parse_left_assignee(x.x, offset)
+            next_scale = scale
+            x_type = getattr(x, "type", None)
+            get_ptrarr_objsize = getattr(x_type, "get_ptrarr_objsize", None)
+            if callable(get_ptrarr_objsize):
+                try:
+                    next_scale = get_ptrarr_objsize() or scale
+                except Exception:
+                    next_scale = scale
+
+            index_expr = getattr(x, "y", None)
+            if x.op == ctype.idx and index_expr is not None and index_expr.op == ctype.num:
+                return self._parse_left_assignee(
+                    x.x, offset + index_expr.numval() * next_scale, next_scale
+                )
+            return self._parse_left_assignee(x.x, offset, next_scale)
 
         if x.op == ctype.add and getattr(x, "x", None) is not None and getattr(x, "y", None) is not None:
             if x.x.op == ctype.num:
-                return self._parse_left_assignee(x.y, offset + x.x.numval())
+                return self._parse_left_assignee(x.y, offset + x.x.numval() * scale, scale)
             if x.y.op == ctype.num:
-                return self._parse_left_assignee(x.x, offset + x.y.numval())
+                return self._parse_left_assignee(x.x, offset + x.y.numval() * scale, scale)
 
         return (x, offset)
+
 
 
 class NewShallowScanVisitor(ScanVisitor, DownwardsObjectVisitor):

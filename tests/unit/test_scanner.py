@@ -96,6 +96,32 @@ def test_parse_left_assignee_handles_cast_pointer_assignment():
     assert base is leaf
     assert offset == 0
 
+def test_parse_left_assignee_scales_nested_pointer_arithmetic_offsets():
+    scanner_module = _load_scanner_module()
+    visitor = scanner_module.ScanVisitor.__new__(scanner_module.ScanVisitor)
+    scanner_module.ctype = SimpleNamespace(cast=1, ptr=2, idx=2, add=3, num=4, asg=5, var=6)
+
+    leaf = SimpleNamespace(op=scanner_module.ctype.var)
+    add = SimpleNamespace(
+        op=scanner_module.ctype.add,
+        x=leaf,
+        y=SimpleNamespace(op=scanner_module.ctype.num, numval=lambda: 2),
+    )
+    cast = SimpleNamespace(op=scanner_module.ctype.cast, x=add)
+    ptr = SimpleNamespace(
+        op=scanner_module.ctype.ptr,
+        x=cast,
+        type=SimpleNamespace(get_ptrarr_objsize=lambda: 8),
+    )
+
+    parsed = visitor._parse_left_assignee(ptr, 0)
+
+    assert parsed is not None
+    base, offset = parsed
+    assert base is leaf
+    assert offset == 16
+
+
 
 def test_extract_member_recognizes_cast_pointer_assignment_on_left_hand_side():
     scanner_module = _load_scanner_module()
