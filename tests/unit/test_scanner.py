@@ -259,6 +259,33 @@ def test_manipulate_falls_back_to_expr_when_no_pointer_context(monkeypatch):
     assert len(expr_calls) == 1
     assert structure_adds == ["expr"]
 
+def test_manipulate_handles_missing_object_tinfo(monkeypatch):
+    scanner_module = _load_scanner_module()
+    visitor = scanner_module.ScanVisitor.__new__(scanner_module.ScanVisitor)
+    scanner_module.ctype = SimpleNamespace(ptr=1, idx=2, add=3, asg=4)
+
+    monkeypatch.setattr(scanner_module.ObjectVisitor, "_manipulate", lambda self, cexpr, obj: None)
+
+    ptr_calls = []
+    expr_calls = []
+    structure_adds = []
+    visitor._structure = SimpleNamespace(add_member=lambda member: structure_adds.append(member))
+    visitor._extract_member_from_ptr = lambda cexpr, obj: ptr_calls.append((cexpr, obj)) or "member"
+    visitor._extract_member_from_expr = lambda cexpr, obj: expr_calls.append((cexpr, obj)) or "expr"
+    visitor._get_parent_context = lambda: scanner_module.ParentExpressionContext(
+        [SimpleNamespace(op=scanner_module.ctype.ptr), SimpleNamespace(op=scanner_module.ctype.asg)]
+    )
+
+    cexpr = SimpleNamespace(type=SimpleNamespace(is_ptr=lambda: False), dstr=lambda: "v2")
+    obj = SimpleNamespace(name="v2")
+
+    visitor._manipulate(cexpr, obj)
+
+    assert len(ptr_calls) == 1
+    assert expr_calls == []
+    assert structure_adds == ["member"]
+
+
 
 def test_scanned_object_create_inherits_scan_root_metadata(monkeypatch):
     scanner_module = _load_scanner_module()

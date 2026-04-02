@@ -305,13 +305,13 @@ class ScanVisitor(ObjectVisitor):
     def _manipulate(self, cexpr: ida_hexrays.cexpr_t, obj: ScanObject) -> None:
         super()._manipulate(cexpr, obj)
 
-        member = None
-
-        if obj.tinfo and not is_legal_type(obj.tinfo):
+        obj_tinfo = getattr(obj, "tinfo", None)
+        if obj_tinfo and not is_legal_type(obj_tinfo):
             # TODO: if this is triggered look into why and how to solve it
             expr_ea = find_expr_address(cexpr, self.parents)
-            log_warning(f"Type {obj.tinfo.dstr()} @ {to_hex(expr_ea)} is not supported")
+            log_warning(f"Type {obj_tinfo.dstr()} @ {to_hex(expr_ea)} is not supported")
             return
+
 
         parent_ops = self._get_parent_context().ops
         has_pointer_context = cexpr.type.is_ptr() or any(
