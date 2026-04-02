@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import copy
+
+
 from dataclasses import dataclass
 
 import ida_hexrays
@@ -30,6 +33,8 @@ class ChildScanPlan:
     root_object_ea: int | None
     root_function_ea: int | None
     has_multiple_roots: bool
+    scan_variables: tuple[ScanObject, ...] = ()
+
 
 
 class ChildScanMixin:
@@ -157,7 +162,9 @@ class ChildScanMixin:
                 root_function_ea if root_function_ea != idaapi.BADADDR else None
             ),
             has_multiple_roots=len(function_eas) > 1 or len(expression_eas) > 1,
+            scan_variables=tuple(scanned_variables),
         )
+
 
     def _create_or_get_child_structure(
         self,
@@ -178,20 +185,32 @@ class ChildScanMixin:
     ) -> bool:
         scanned_any = False
         visitor_cls = getattr(_form_module(), "NewDeepScanVisitor", NewDeepScanVisitor)
+        evidence_by_function: dict[int, list[ScanObject]] = {}
+        for scan_variable in getattr(plan, "scan_variables", ()) or ():
+            func_ea = getattr(scan_variable, "func_ea", idaapi.BADADDR)
+            if func_ea == idaapi.BADADDR:
+                continue
+            evidence_by_function.setdefault(func_ea, []).append(scan_variable)
         for func_ea in plan.function_eas:
             cfunc = self._prepare_scan_cfunc(func_ea)
             if cfunc is None:
                 continue
-            visitor = visitor_cls(
-                cfunc,
-                child_structure.main_offset,
-                plan.scan_object,
-                child_structure,
-                recurse_calls=True,
-            )
-            visitor.process()
-            scanned_any = True
+            scan_variables = evidence_by_function.get(func_ea) or [plan.scan_object]
+            for scan_variable in scan_variables:
+                scan_object = copy.copy(plan.scan_object)
+                scan_object.ea = getattr(scan_variable, "ea", idaapi.BADADDR)
+                scan_object.func_ea = getattr(scan_variable, "func_ea", idaapi.BADADDR)
+                visitor = visitor_cls(
+                    cfunc,
+                    child_structure.main_offset,
+                    scan_object,
+                    child_structure,
+                    recurse_calls=True,
+                )
+                visitor.process()
+                scanned_any = True
         return scanned_any
+
 
     @staticmethod
     def _materialize_child_member_type(

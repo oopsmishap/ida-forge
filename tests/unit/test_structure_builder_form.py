@@ -927,6 +927,9 @@ def test_build_child_scan_plan_preserves_distinct_scan_locations(monkeypatch):
     assert plan.function_eas == (0x401000,)
     assert plan.has_multiple_roots is True
     assert plan.root_object_ea in {0x402000, 0x402010}
+    assert len(plan.scan_variables) == 2
+    assert {scan_variable.ea for scan_variable in plan.scan_variables} == {0x402000, 0x402010}
+
 
 def test_build_child_scan_plan_accepts_inferred_primitive_member(monkeypatch):
     structure_form = _make_form(monkeypatch)
@@ -1093,6 +1096,55 @@ def test_execute_child_scan_plan_enables_recursive_child_traversal(monkeypatch):
 
     assert structure_form._execute_child_scan_plan(child, plan) is True
     assert captured["args"] == (0x401000, 0x30, "child_ptr", "Child", True)
+
+def test_execute_child_scan_plan_runs_for_each_scan_location(monkeypatch):
+    structure_form = _make_form(monkeypatch)
+    child = structure_form.create_structure("Child")
+    assert child is not None
+    child.main_offset = 0x30
+
+    plan = SimpleNamespace(
+        function_eas=(0x401000,),
+        scan_object=SimpleNamespace(name="child_ptr"),
+        scan_variables=(
+            SimpleNamespace(func_ea=0x401000, ea=0x402000, name="root_a"),
+            SimpleNamespace(func_ea=0x401000, ea=0x402010, name="root_b"),
+        ),
+    )
+
+    monkeypatch.setattr(
+        structure_form,
+        "_prepare_scan_cfunc",
+        lambda _ea: SimpleNamespace(entry_ea=0x401000),
+    )
+
+    captured = []
+
+    class FakeVisitor:
+        def __init__(self, cfunc, origin, obj, structure, recurse_calls=False):
+            captured.append(
+                (
+                    cfunc.entry_ea,
+                    origin,
+                    obj.ea,
+                    obj.func_ea,
+                    obj.name,
+                    structure.name,
+                    recurse_calls,
+                )
+            )
+
+        def process(self):
+            return None
+
+    monkeypatch.setattr(form_module, "NewDeepScanVisitor", FakeVisitor)
+
+    assert structure_form._execute_child_scan_plan(child, plan) is True
+    assert captured == [
+        (0x401000, 0x30, 0x402000, 0x401000, "child_ptr", "Child", True),
+        (0x401000, 0x30, 0x402010, 0x401000, "child_ptr", "Child", True),
+    ]
+
 
 
 def test_scan_child_structure_uses_absolute_member_origin(monkeypatch):
