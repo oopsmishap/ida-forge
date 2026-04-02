@@ -1298,6 +1298,52 @@ def test_execute_child_scan_plan_normalizes_legacy_scan_variables(monkeypatch):
     assert captured["args"][5] is None
     assert captured["args"][6:] == ("Child", True)
 
+def test_execute_child_scan_plan_prefers_inferred_child_roots(monkeypatch):
+    structure_form = _make_form(monkeypatch)
+    child = structure_form.create_structure("Child")
+    assert child is not None
+    child.main_offset = 0x30
+
+    inferred_root = SimpleNamespace(name="child_var", ea=0x500123, func_ea=0x402000)
+    plan = SimpleNamespace(
+        function_eas=(0x401000,),
+        scan_object=SimpleNamespace(name="child_ptr", id="member"),
+        scan_variables=(SimpleNamespace(func_ea=0x401000, ea=0x402000),),
+    )
+
+    monkeypatch.setattr(
+        structure_form,
+        "_prepare_scan_cfunc",
+        lambda ea: SimpleNamespace(entry_ea=ea),
+    )
+    monkeypatch.setattr(
+        structure_form,
+        "_infer_child_scan_roots",
+        lambda cfunc, scan_object: (inferred_root,),
+    )
+
+    captured = {}
+
+    class FakeVisitor:
+        def __init__(self, cfunc, origin, obj, structure, recurse_calls=False):
+            captured["args"] = (
+                cfunc.entry_ea,
+                origin,
+                obj.name,
+                obj.ea,
+                structure.name,
+                recurse_calls,
+            )
+
+        def process(self):
+            return None
+
+    monkeypatch.setattr(form_module, "NewDeepScanVisitor", FakeVisitor)
+
+    assert structure_form._execute_child_scan_plan(child, plan) is True
+    assert captured["args"] == (0x402000, 0x30, "child_var", 0x500123, "Child", True)
+
+
 
 
 

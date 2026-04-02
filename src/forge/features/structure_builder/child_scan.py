@@ -7,17 +7,20 @@ from types import SimpleNamespace
 import ida_hexrays
 import idaapi
 
-from forge.api.hexrays import decompile, is_legal_type
+from forge.api.hexrays import ctype, decompile, is_legal_type
 from forge.api.members import AbstractMember, parse_user_tinfo
 from forge.api.scan_object import (
     ObjectType,
     ScanObject,
     StructurePointerObject,
     StructureReferenceObject,
+    _extract_offset_expression,
  )
 from forge.api.scanner import NewDeepScanVisitor
 from forge.api.structure import Structure
 from forge.util.logging import log_warning
+
+
 
 
 
@@ -40,6 +43,8 @@ class ChildScanPlan:
     root_function_ea: int | None
     has_multiple_roots: bool
     scan_variables: tuple[ScanObject, ...] = ()
+
+
 
 
 
@@ -178,6 +183,46 @@ class ChildScanMixin:
         if root_func_ea != idaapi.BADADDR:
             seeded.func_ea = root_func_ea
         return seeded
+
+    @staticmethod
+    def _infer_child_scan_roots(cfunc: ida_hexrays.cfunc_t, scan_object: ScanObject) -> tuple[ScanObject, ...]:
+        try:
+            from forge.api.visitor import RecursiveUpwardsObjectVisitor
+        except ImportError:
+            return ()
+
+        class _ChildSourceInferenceVisitor(RecursiveUpwardsObjectVisitor):
+            def __init__(self, source_cfunc, source_obj: ScanObject):
+                super().__init__(source_cfunc, source_obj, skip_until_object=True)
+                self.roots: list[ScanObject] = []
+
+            def _manipulate(self, cexpr, obj: ScanObject):
+                parent = self.parent_expr()
+                if parent is None or parent.op != ctype.asg or getattr(parent, "x", None) is not cexpr:
+                    return
+
+                rhs = getattr(parent, "y", None)
+                if rhs is None:
+                    return
+
+                root = ScanObject.create(self._cfunc, rhs)
+                if root is None and getattr(rhs, "op", None) == ctype.cast and getattr(rhs, "x", None) is not None:
+                    root = ScanObject.create(self._cfunc, rhs.x)
+                if root is None:
+                    base_expr, _offset = _extract_offset_expression(rhs)
+                    if base_expr is not None:
+                        root = ScanObject.create(self._cfunc, base_expr)
+                if root is None:
+                    return
+                if root not in self.roots:
+                    self.roots.append(root)
+
+        visitor = _ChildSourceInferenceVisitor(cfunc, scan_object)
+        visitor.process()
+        return tuple(visitor.roots)
+
+
+
 
 
 
@@ -339,16 +384,23 @@ class ChildScanMixin:
                         True,
                     )
                     continue
-                visitor = visitor_cls(
-                    cfunc,
-                    child_structure.main_offset,
-                    seeded_scan_object,
-                    child_structure,
-                    recurse_calls=True,
-                )
-                visitor.process()
-                scanned_any = True
+                inferred_roots = self._infer_child_scan_roots(cfunc, seeded_scan_object)
+                roots = inferred_roots or (seeded_scan_object,)
+                for root in roots:
+                    root_cfunc = self._prepare_scan_cfunc(
+                        getattr(root, "func_ea", idaapi.BADADDR)
+                    ) or cfunc
+                    visitor = visitor_cls(
+                        root_cfunc,
+                        child_structure.main_offset,
+                        root,
+                        child_structure,
+                        recurse_calls=True,
+                    )
+                    visitor.process()
+                    scanned_any = True
         return scanned_any
+
 
 
 
