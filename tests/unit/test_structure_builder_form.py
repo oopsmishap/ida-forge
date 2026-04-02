@@ -1070,7 +1070,8 @@ def test_execute_child_scan_plan_enables_recursive_child_traversal(monkeypatch):
 
     plan = SimpleNamespace(
         function_eas=(0x401000,),
-        scan_object=SimpleNamespace(name="child_ptr"),
+        scan_object=SimpleNamespace(name="child_ptr", id="member"),
+        scan_variables=(SimpleNamespace(func_ea=0x401000, ea=0x402000),),
     )
     captured = {}
 
@@ -1086,16 +1087,19 @@ def test_execute_child_scan_plan_enables_recursive_child_traversal(monkeypatch):
                 cfunc.entry_ea,
                 origin,
                 obj.name,
+                obj.ea,
                 structure.name,
                 recurse_calls,
             )
+
         def process(self):
             return None
 
     monkeypatch.setattr(form_module, "NewDeepScanVisitor", FakeVisitor)
 
     assert structure_form._execute_child_scan_plan(child, plan) is True
-    assert captured["args"] == (0x401000, 0x30, "child_ptr", "Child", True)
+    assert captured["args"] == (0x401000, 0x30, "child_ptr", 0x402000, "Child", True)
+
 
 def test_execute_child_scan_plan_runs_for_each_scan_location(monkeypatch):
     structure_form = _make_form(monkeypatch)
@@ -1105,7 +1109,7 @@ def test_execute_child_scan_plan_runs_for_each_scan_location(monkeypatch):
 
     plan = SimpleNamespace(
         function_eas=(0x401000,),
-        scan_object=SimpleNamespace(name="child_ptr"),
+        scan_object=SimpleNamespace(name="child_ptr", id="member"),
         scan_variables=(
             SimpleNamespace(func_ea=0x401000, ea=0x402000, name="root_a"),
             SimpleNamespace(func_ea=0x401000, ea=0x402010, name="root_b"),
@@ -1125,7 +1129,6 @@ def test_execute_child_scan_plan_runs_for_each_scan_location(monkeypatch):
             body=None,
         ),
     )
-
 
     captured = []
 
@@ -1148,24 +1151,12 @@ def test_execute_child_scan_plan_runs_for_each_scan_location(monkeypatch):
 
     monkeypatch.setattr(form_module, "NewDeepScanVisitor", FakeVisitor)
 
-    monkeypatch.setattr(
-        form_module.ScanObject,
-        "create",
-        staticmethod(
-            lambda cfunc, item: SimpleNamespace(
-                ea=getattr(item, "ea", -1),
-                func_ea=cfunc.entry_ea,
-                name="root_a" if getattr(item, "ea", -1) == 0x402000 else "root_b",
-            )
-        ),
-    )
-
-
     assert structure_form._execute_child_scan_plan(child, plan) is True
     assert captured == [
-        (0x401000, 0x30, 0x402000, 0x401000, "root_a", "Child", True),
-        (0x401000, 0x30, 0x402010, 0x401000, "root_b", "Child", True),
+        (0x401000, 0x30, 0x402000, 0x401000, "child_ptr", "Child", True),
+        (0x401000, 0x30, 0x402010, 0x401000, "child_ptr", "Child", True),
     ]
+
 
 def test_execute_child_scan_plan_normalizes_legacy_scan_variables(monkeypatch):
     structure_form = _make_form(monkeypatch)
@@ -1182,7 +1173,10 @@ def test_execute_child_scan_plan_normalizes_legacy_scan_variables(monkeypatch):
     )
     plan = SimpleNamespace(
         function_eas=(0x401000,),
-        scan_object=SimpleNamespace(name="child_ptr"),
+        scan_object=SimpleNamespace(
+            name="child_ptr",
+            id=import_module("forge.api.scan_object").ObjectType.structure_reference,
+        ),
         scan_variables=(legacy_scan_variable,),
     )
 
@@ -1213,10 +1207,11 @@ def test_execute_child_scan_plan_normalizes_legacy_scan_variables(monkeypatch):
     monkeypatch.setattr(form_module, "NewDeepScanVisitor", FakeVisitor)
 
     assert structure_form._execute_child_scan_plan(child, plan) is True
-    assert captured["args"][0:4] == (0x401000, 0x30, "root_a", 0x402000)
-    assert captured["args"][4] == import_module("forge.api.scan_object").ObjectType.local_variable
-    assert captured["args"][5] is legacy_lvar
+    assert captured["args"][0:4] == (0x401000, 0x30, "child_ptr", 0x402000)
+    assert captured["args"][4] == import_module("forge.api.scan_object").ObjectType.structure_reference
+    assert captured["args"][5] is None
     assert captured["args"][6:] == ("Child", True)
+
 
 
 

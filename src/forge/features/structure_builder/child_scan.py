@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 from dataclasses import dataclass
 from types import SimpleNamespace
 
@@ -13,10 +14,11 @@ from forge.api.scan_object import (
     ScanObject,
     StructurePointerObject,
     StructureReferenceObject,
-)
+ )
 from forge.api.scanner import NewDeepScanVisitor
 from forge.api.structure import Structure
 from forge.util.logging import log_warning
+
 
 
 from .dialogs import ScannedVariableChooser
@@ -138,6 +140,34 @@ class ChildScanMixin:
             return proxy
 
         return proxy
+
+    @staticmethod
+    def _seed_scan_object_from_evidence(
+        scan_object: ScanObject, evidence: ScanObject
+    ) -> ScanObject | None:
+        evidence_ea = getattr(evidence, "ea", idaapi.BADADDR)
+        evidence_func_ea = getattr(evidence, "func_ea", idaapi.BADADDR)
+        if evidence_ea == idaapi.BADADDR or evidence_func_ea == idaapi.BADADDR:
+            return None
+
+        seeded = copy.copy(scan_object)
+        seeded.ea = evidence_ea
+        seeded.func_ea = evidence_func_ea
+        seeded.scan_root_ea = getattr(
+            evidence, "scan_root_ea", getattr(seeded, "scan_root_ea", idaapi.BADADDR)
+        )
+        seeded.scan_root_function_ea = getattr(
+            evidence,
+            "scan_root_function_ea",
+            getattr(seeded, "scan_root_function_ea", idaapi.BADADDR),
+        )
+        seeded.scan_root_function_name = getattr(
+            evidence,
+            "scan_root_function_name",
+            getattr(seeded, "scan_root_function_name", None),
+        )
+        return seeded
+
 
 
 
@@ -269,8 +299,6 @@ class ChildScanMixin:
     ) -> bool:
         scanned_any = False
         visitor_cls = getattr(_form_module(), "NewDeepScanVisitor", NewDeepScanVisitor)
-        scanned_any = False
-        visitor_cls = getattr(_form_module(), "NewDeepScanVisitor", NewDeepScanVisitor)
         evidence_by_function: dict[int, list[ScanObject]] = {}
         for scan_variable in getattr(plan, "scan_variables", ()) or ():
             normalized = self._normalize_scan_variable(scan_variable)
@@ -284,11 +312,19 @@ class ChildScanMixin:
                 continue
             scan_variables = evidence_by_function.get(func_ea) or [plan.scan_object]
             for scan_variable in scan_variables:
-                resolved_scan_object = self._resolve_scan_variable_target(cfunc, scan_variable)
+                seeded_scan_object = self._seed_scan_object_from_evidence(
+                    plan.scan_object, scan_variable
+                )
+                if seeded_scan_object is None:
+                    log_warning(
+                        f"Skipping child scan evidence without a usable location in {hex(func_ea)}",
+                        True,
+                    )
+                    continue
                 visitor = visitor_cls(
                     cfunc,
                     child_structure.main_offset,
-                    resolved_scan_object or scan_variable,
+                    seeded_scan_object,
                     child_structure,
                     recurse_calls=True,
                 )
@@ -296,8 +332,6 @@ class ChildScanMixin:
                 scanned_any = True
         return scanned_any
 
-
-        return scanned_any
 
 
     @staticmethod
