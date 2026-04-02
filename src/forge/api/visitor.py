@@ -49,9 +49,7 @@ class ObjectVisitor(ida_hexrays.ctree_parentee_t):
         self.__manipulate(cexpr, obj)
 
     def __manipulate(self, cexpr, obj):
-        log_debug(
-            f"Expression {cexpr.opname} at {print_expr_address(cexpr, self.parents)} Id - {obj.id}"
-        )
+        log_debug(f"Expression {cexpr.opname} at {print_expr_address(cexpr, self.parents)} Id - {getattr(obj, 'id', None)}")
 
     def get_line(self) -> int:
         for p in reversed(self.parents):
@@ -157,10 +155,11 @@ class DownwardsObjectVisitor(ObjectVisitor):
         if self._skip:
             return 0
         for obj in self._objects:
-            if self._matches_object(obj, cexpr) and obj.id != ObjectType.returned_object:
+            if self._matches_object(obj, cexpr) and getattr(obj, 'id', None) != ObjectType.returned_object:
                 self._manipulate(cexpr, obj)
                 return 0
         return 0
+
 
 
     def _is_initial_object(self, cexpr: ida_hexrays.cexpr_t):
@@ -208,7 +207,7 @@ class UpwardsObjectVisitor(ObjectVisitor):
         ObjectVisitor.__init__(self, cfunc, obj, data, skip_until_object)
         self._stage = self.STAGE_PREPARE
         self._tree = {}
-        self._call_obj = obj if obj.id == ObjectType.call_argument else None
+        self._call_obj = obj if getattr(obj, 'id', None) == ObjectType.call_argument else None
 
     def visit_expr(self, cexpr: ida_hexrays.cexpr_t):
         if self._stage == self.STAGE_PARSING:
@@ -280,7 +279,7 @@ class UpwardsObjectVisitor(ObjectVisitor):
         while todo:
             obj = todo.pop()
             result.add(obj)
-            if obj.id == ObjectType.call_argument or obj not in self._tree:
+            if getattr(obj, 'id', None) == ObjectType.call_argument or obj not in self._tree:
                 continue
             o = self._tree[obj]
             todo |= o - result
@@ -592,11 +591,11 @@ class RecursiveUpwardsObjectVisitor(RecursiveObjectVisitor, UpwardsObjectVisitor
         RecursiveObjectVisitor.__init__(self, cfunc, obj, data, skip_until_object, visited)
         self._stage = self.STAGE_PREPARE
         self._tree = {}
-        self._call_obj = obj if obj.id == ObjectType.call_argument else None
+        self._call_obj = obj if getattr(obj, 'id', None) == ObjectType.call_argument else None
 
     def prepare_new_scan(self, cfunc, arg_idx, obj, skip=False):
         super().prepare_new_scan(cfunc, arg_idx, obj, skip)
-        self._call_obj = obj if obj.id == ObjectType.call_argument else None
+        self._call_obj = obj if getattr(obj, 'id', None) == ObjectType.call_argument else None
 
     def _check_call(self, cexpr: ida_hexrays.cexpr_t):
         if cexpr.op != ctype.var:

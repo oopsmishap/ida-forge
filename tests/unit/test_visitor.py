@@ -202,7 +202,7 @@ def test_leave_expr_accepts_legacy_scanned_variable_without_is_target(monkeypatc
     visitor_module = _load_visitor_module()
     visitor = visitor_module.RecursiveDownwardsObjectVisitor.__new__(visitor_module.RecursiveDownwardsObjectVisitor)
     visitor._skip = False
-    visitor._objects = [SimpleNamespace(ea=0x402000, id=visitor_module.ObjectType.local_variable)]
+    visitor._objects = [SimpleNamespace(ea=0x402000)]
 
     seen = []
     monkeypatch.setattr(visitor, "_manipulate", lambda cexpr, obj: seen.append((cexpr.ea, obj.ea)), raising=False)
