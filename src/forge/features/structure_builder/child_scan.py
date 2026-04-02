@@ -56,6 +56,44 @@ class ChildScanMixin:
 
         return refresh_function_tree_postorder(cfunc) or cfunc
 
+    @staticmethod
+    def _resolve_scan_variable_target(
+        cfunc: ida_hexrays.cfunc_t, scan_variable: ScanObject
+    ) -> ScanObject | None:
+        target_ea = getattr(scan_variable, "ea", idaapi.BADADDR)
+        if target_ea == idaapi.BADADDR:
+            return None
+
+        candidates = []
+        for item in getattr(cfunc, "treeitems", []):
+            if getattr(item, "ea", idaapi.BADADDR) == target_ea:
+                candidates.append(item)
+
+        eamap = getattr(cfunc, "eamap", None)
+        if not candidates and eamap is not None:
+            try:
+                candidates.extend(list(eamap.get(target_ea, [])))
+            except Exception:
+                pass
+
+        if not candidates:
+            body = getattr(cfunc, "body", None)
+            if body is not None and hasattr(body, "find_closest_addr"):
+                try:
+                    closest_item = body.find_closest_addr(target_ea)
+                except Exception:
+                    closest_item = None
+                if closest_item is not None:
+                    candidates.append(closest_item)
+
+        for item in candidates:
+            resolved = ScanObject.create(cfunc, item)
+            if resolved is not None:
+                return resolved
+
+        return None
+
+
     def _build_child_scan_plan(
         self,
         member: AbstractMember | None,
@@ -196,15 +234,17 @@ class ChildScanMixin:
                 continue
             scan_variables = evidence_by_function.get(func_ea) or [plan.scan_object]
             for scan_variable in scan_variables:
+                resolved_scan_object = self._resolve_scan_variable_target(cfunc, scan_variable)
                 visitor = visitor_cls(
                     cfunc,
                     child_structure.main_offset,
-                    scan_variable,
+                    resolved_scan_object or scan_variable,
                     child_structure,
                     recurse_calls=True,
                 )
                 visitor.process()
                 scanned_any = True
+
         return scanned_any
 
 

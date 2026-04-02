@@ -1115,8 +1115,17 @@ def test_execute_child_scan_plan_runs_for_each_scan_location(monkeypatch):
     monkeypatch.setattr(
         structure_form,
         "_prepare_scan_cfunc",
-        lambda _ea: SimpleNamespace(entry_ea=0x401000),
+        lambda _ea: SimpleNamespace(
+            entry_ea=0x401000,
+            treeitems=[
+                SimpleNamespace(ea=0x402000),
+                SimpleNamespace(ea=0x402010),
+            ],
+            eamap={},
+            body=None,
+        ),
     )
+
 
     captured = []
 
@@ -1139,12 +1148,25 @@ def test_execute_child_scan_plan_runs_for_each_scan_location(monkeypatch):
 
     monkeypatch.setattr(form_module, "NewDeepScanVisitor", FakeVisitor)
 
-    assert structure_form._execute_child_scan_plan(child, plan) is True
+    monkeypatch.setattr(
+        form_module.ScanObject,
+        "create",
+        staticmethod(
+            lambda cfunc, item: SimpleNamespace(
+                ea=getattr(item, "ea", -1),
+                func_ea=cfunc.entry_ea,
+                name="root_a" if getattr(item, "ea", -1) == 0x402000 else "root_b",
+            )
+        ),
+    )
 
+
+    assert structure_form._execute_child_scan_plan(child, plan) is True
     assert captured == [
         (0x401000, 0x30, 0x402000, 0x401000, "root_a", "Child", True),
         (0x401000, 0x30, 0x402010, 0x401000, "root_b", "Child", True),
     ]
+
 
 
 
