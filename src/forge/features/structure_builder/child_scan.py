@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import copy
 
 
 from dataclasses import dataclass
@@ -197,13 +196,10 @@ class ChildScanMixin:
                 continue
             scan_variables = evidence_by_function.get(func_ea) or [plan.scan_object]
             for scan_variable in scan_variables:
-                scan_object = copy.copy(plan.scan_object)
-                scan_object.ea = getattr(scan_variable, "ea", idaapi.BADADDR)
-                scan_object.func_ea = getattr(scan_variable, "func_ea", idaapi.BADADDR)
                 visitor = visitor_cls(
                     cfunc,
                     child_structure.main_offset,
-                    scan_object,
+                    scan_variable,
                     child_structure,
                     recurse_calls=True,
                 )

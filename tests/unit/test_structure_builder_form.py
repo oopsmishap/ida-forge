@@ -1140,9 +1140,10 @@ def test_execute_child_scan_plan_runs_for_each_scan_location(monkeypatch):
     monkeypatch.setattr(form_module, "NewDeepScanVisitor", FakeVisitor)
 
     assert structure_form._execute_child_scan_plan(child, plan) is True
+
     assert captured == [
-        (0x401000, 0x30, 0x402000, 0x401000, "child_ptr", "Child", True),
-        (0x401000, 0x30, 0x402010, 0x401000, "child_ptr", "Child", True),
+        (0x401000, 0x30, 0x402000, 0x401000, "root_a", "Child", True),
+        (0x401000, 0x30, 0x402010, 0x401000, "root_b", "Child", True),
     ]
 
 
