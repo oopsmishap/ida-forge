@@ -13,7 +13,7 @@ from forge.util.qt import QtWidgets
 
 import forge.api.types as forge_types
 from forge.api.hexrays import create_udt_padding_member
-from forge.api.members import AbstractMember, VirtualTable
+from forge.api.members import AbstractMember, VirtualTable, materialize_linked_child_member_type
 from forge.util.logging import log_debug, log_error, log_warning
 
 
@@ -131,6 +131,36 @@ class Structure:
         ):
             return
         self.parent_relationships.append(relationship)
+
+    def refresh_linked_member_types(
+        self, structures_by_name: Mapping[str, "Structure"]
+    ) -> bool:
+        for relationship in self.child_relationships:
+            child = structures_by_name.get(relationship.child_structure_name)
+            if child is None or child.created_type_name is None:
+                continue
+
+            member = self.get_member_by_offset(relationship.parent_member_offset)
+            if member is None:
+                continue
+
+            relation_kind = (
+                getattr(member, "child_relation_kind", None) or relationship.relation_kind
+            )
+            if materialize_linked_child_member_type(
+                member, child.created_type_name, relation_kind
+            ):
+                continue
+
+            member_name = member.name or f"member_{member.offset:X}"
+            log_warning(
+                f"Failed to materialize linked child type {child.created_type_name} for {self.name}.{member_name}",
+                True,
+            )
+            return False
+
+        return True
+
 
     def remove_relationships_with(self, structure_name: str) -> None:
         self.child_relationships = [
@@ -259,6 +289,8 @@ class Structure:
                 f"Cannot create type for {self.name}: unresolved child structures: {child_names}",
                 True,
             )
+            return None
+        if not self.refresh_linked_member_types(structures_by_name):
             return None
         return self.pack_structure(start=start, end=end)
 

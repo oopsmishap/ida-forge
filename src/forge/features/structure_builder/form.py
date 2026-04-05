@@ -791,6 +791,11 @@ class StructureBuilderForm(ChildScanMixin, ida_kernwin.PluginForm):
             return
         self.set_structure(child_name)
 
+    def _refresh_all_linked_member_types(self) -> None:
+        for structure in self.structures.values():
+            structure.refresh_linked_member_types(self.structures)
+
+
     def create_child_types(self):
         if self.current_structure is None:
             return
@@ -820,6 +825,7 @@ class StructureBuilderForm(ChildScanMixin, ida_kernwin.PluginForm):
 
             child_structure.create_type_if_ready(self.structures)
 
+        self._refresh_all_linked_member_types()
         self.update_structure_fields()
 
     def create_type_subtree(self):
@@ -827,6 +833,7 @@ class StructureBuilderForm(ChildScanMixin, ida_kernwin.PluginForm):
             return
 
         self.current_structure.create_subtree_types_postorder(self.structures)
+        self._refresh_all_linked_member_types()
         self.update_structure_fields()
 
     def update_structure_fields(self):
@@ -1771,6 +1778,7 @@ class StructureBuilderForm(ChildScanMixin, ida_kernwin.PluginForm):
             return
 
         self.current_structure.create_type_if_ready(self.structures)
+        self._refresh_all_linked_member_types()
         self.update_structure_fields()
 
     def structure_table_context_menu(self, point):

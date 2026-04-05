@@ -7,18 +7,20 @@ from types import SimpleNamespace
 import ida_hexrays
 import idaapi
 
+from forge.api import hexrays as hexrays_api
 from forge.api.hexrays import ctype, decompile, is_legal_type
-from forge.api.members import AbstractMember, parse_user_tinfo
+from forge.api.members import AbstractMember, materialize_linked_child_member_type
 from forge.api.scan_object import (
     ObjectType,
     ScanObject,
     StructurePointerObject,
     StructureReferenceObject,
     _extract_offset_expression,
+    _make_offset_scan_object,
  )
 from forge.api.scanner import NewDeepScanVisitor
 from forge.api.structure import Structure
-from forge.util.logging import log_warning
+from forge.util.logging import log_debug, log_info, log_warning
 
 
 
@@ -43,6 +45,47 @@ class ChildScanPlan:
     root_function_ea: int | None
     has_multiple_roots: bool
     scan_variables: tuple[ScanObject, ...] = ()
+
+@dataclass(frozen=True)
+class ChildScanInferenceSeed:
+    function_ea: int
+    evidence_ea: int
+    scan_object: ScanObject
+    parent_object: ScanObject
+    caller_path: tuple[int, ...] = ()
+
+
+@dataclass(frozen=True)
+class ChildScanRootCandidate:
+    function_ea: int
+    evidence_ea: int
+    root: ScanObject
+    caller_path: tuple[int, ...] = ()
+
+@dataclass(frozen=True)
+class ChildScanResolvedMemberAnchor:
+    evidence_expr: object
+    member_expr: object
+    parent_expr: object
+    member_offset: int
+
+
+def _get_argument_index(cfunc: ida_hexrays.cfunc_t, lvar_idx: int) -> int | None:
+    getter = getattr(hexrays_api, "get_argument_index", None)
+    if callable(getter):
+        return getter(cfunc, lvar_idx)
+
+    for idx, candidate in enumerate(getattr(cfunc, "argidx", ())):
+        if candidate == lvar_idx:
+            return idx
+    return None
+
+
+def _get_funcs_calling_address(ea: int) -> set[int]:
+    getter = getattr(hexrays_api, "get_funcs_calling_address", None)
+    if callable(getter):
+        return getter(ea)
+    return set()
 
 
 
@@ -184,43 +227,557 @@ class ChildScanMixin:
             seeded.func_ea = root_func_ea
         return seeded
 
+
     @staticmethod
-    def _infer_child_scan_roots(cfunc: ida_hexrays.cfunc_t, scan_object: ScanObject) -> tuple[ScanObject, ...]:
-        try:
-            from forge.api.visitor import RecursiveUpwardsObjectVisitor
-        except ImportError:
+    def _coerce_ctree_expr(item):
+        expr = getattr(item, "e", None)
+        if expr is None:
+            expr = getattr(item, "cexpr", None)
+        if expr is not None and hasattr(expr, "op"):
+            return expr
+        if hasattr(item, "op"):
+            return item
+        return None
+
+    @classmethod
+    def _iter_items_near_ea(cls, cfunc: ida_hexrays.cfunc_t, target_ea: int) -> tuple[object, ...]:
+        if target_ea == idaapi.BADADDR:
             return ()
 
-        class _ChildSourceInferenceVisitor(RecursiveUpwardsObjectVisitor):
-            def __init__(self, source_cfunc, source_obj: ScanObject):
-                super().__init__(source_cfunc, source_obj, skip_until_object=True)
-                self.roots: list[ScanObject] = []
+        items: list[object] = []
+        seen: set[int] = set()
 
-            def _manipulate(self, cexpr, obj: ScanObject):
-                parent = self.parent_expr()
-                if parent is None or parent.op != ctype.asg or getattr(parent, "x", None) is not cexpr:
-                    return
+        def add(item) -> None:
+            if item is None:
+                return
+            item_id = id(item)
+            if item_id in seen:
+                return
+            seen.add(item_id)
+            items.append(item)
 
-                rhs = getattr(parent, "y", None)
-                if rhs is None:
-                    return
+        for item in getattr(cfunc, "treeitems", []):
+            if getattr(item, "ea", idaapi.BADADDR) == target_ea:
+                add(item)
 
-                root = ScanObject.create(self._cfunc, rhs)
-                if root is None and getattr(rhs, "op", None) == ctype.cast and getattr(rhs, "x", None) is not None:
-                    root = ScanObject.create(self._cfunc, rhs.x)
-                if root is None:
-                    base_expr, _offset = _extract_offset_expression(rhs)
-                    if base_expr is not None:
-                        root = ScanObject.create(self._cfunc, base_expr)
-                if root is None:
-                    return
-                if root not in self.roots:
-                    self.roots.append(root)
+        eamap = getattr(cfunc, "eamap", None)
+        if eamap is not None:
+            try:
+                for item in eamap.get(target_ea, []):
+                    add(item)
+            except Exception:
+                pass
 
-        visitor = _ChildSourceInferenceVisitor(cfunc, scan_object)
-        visitor.process()
-        return tuple(visitor.roots)
+        body = getattr(cfunc, "body", None)
+        if body is not None and hasattr(body, "find_closest_addr"):
+            try:
+                add(body.find_closest_addr(target_ea))
+            except Exception:
+                pass
 
+        return tuple(items)
+
+    @staticmethod
+    def _expression_ea(cfunc: ida_hexrays.cfunc_t, expr) -> int:
+        if expr is None:
+            return idaapi.BADADDR
+
+        expr_ea = getattr(expr, "ea", idaapi.BADADDR)
+        if expr_ea != idaapi.BADADDR:
+            return expr_ea
+
+        try:
+            return ScanObject.get_expression_address(cfunc, expr)
+        except Exception:
+            return idaapi.BADADDR
+
+    @classmethod
+    def _iter_assignment_expressions(cls, cfunc: ida_hexrays.cfunc_t):
+        asg_op = getattr(ctype, "asg", None)
+        if asg_op is None:
+            return
+
+        for item in getattr(cfunc, "treeitems", []):
+            expr = cls._coerce_ctree_expr(item)
+            if expr is not None and getattr(expr, "op", None) == asg_op:
+                yield expr
+
+    @classmethod
+    def _iter_call_expressions(cls, cfunc: ida_hexrays.cfunc_t, callee_ea: int):
+        call_op = getattr(ctype, "call", None)
+        if call_op is None:
+            return
+
+        for item in getattr(cfunc, "treeitems", []):
+            expr = cls._coerce_ctree_expr(item)
+            if expr is None or getattr(expr, "op", None) != call_op:
+                continue
+            callee = getattr(getattr(expr, "x", None), "obj_ea", idaapi.BADADDR)
+            if callee == callee_ea:
+                yield expr
+
+    @staticmethod
+    def _parse_member_assignment_target(expr, offset: int = 0, scale: int = 1):
+        if expr is None:
+            return None
+
+        cast_op = getattr(ctype, "cast", None)
+        ref_op = getattr(ctype, "ref", None)
+        memref_op = getattr(ctype, "memref", None)
+        memptr_op = getattr(ctype, "memptr", None)
+        ptr_op = getattr(ctype, "ptr", None)
+        idx_op = getattr(ctype, "idx", None)
+        add_op = getattr(ctype, "add", None)
+        sub_op = getattr(ctype, "sub", None)
+        num_op = getattr(ctype, "num", None)
+
+        if expr.op in tuple(op for op in (cast_op, ref_op) if op is not None) and getattr(expr, "x", None) is not None:
+            return ChildScanMixin._parse_member_assignment_target(expr.x, offset, scale)
+
+        if expr.op in tuple(op for op in (memref_op, memptr_op) if op is not None) and getattr(expr, "x", None) is not None:
+            return expr.x, offset + getattr(expr, "m", 0)
+
+        if expr.op in tuple(op for op in (ptr_op, idx_op) if op is not None) and getattr(expr, "x", None) is not None:
+            next_scale = scale
+            expr_type = getattr(expr, "type", None)
+            get_ptrarr_objsize = getattr(expr_type, "get_ptrarr_objsize", None)
+            if callable(get_ptrarr_objsize):
+                try:
+                    next_scale = get_ptrarr_objsize() or scale
+                except Exception:
+                    next_scale = scale
+
+            index_expr = getattr(expr, "y", None)
+            if expr.op == idx_op and index_expr is not None and getattr(index_expr, "op", None) == num_op:
+                return ChildScanMixin._parse_member_assignment_target(
+                    expr.x, offset + index_expr.numval() * next_scale, next_scale
+                )
+            return ChildScanMixin._parse_member_assignment_target(expr.x, offset, next_scale)
+
+        if expr.op in tuple(op for op in (add_op, sub_op) if op is not None):
+            left = getattr(expr, "x", None)
+            right = getattr(expr, "y", None)
+            if left is not None and getattr(left, "op", None) == num_op and right is not None:
+                delta = left.numval()
+                if expr.op == sub_op:
+                    delta = -delta
+                return ChildScanMixin._parse_member_assignment_target(
+                    right, offset + delta * scale, scale
+                )
+            if right is not None and getattr(right, "op", None) == num_op and left is not None:
+                delta = right.numval()
+                if expr.op == sub_op:
+                    delta = -delta
+                return ChildScanMixin._parse_member_assignment_target(
+                    left, offset + delta * scale, scale
+                )
+
+        return expr, offset
+
+    @classmethod
+    def _member_expression_matches(cls, scan_object: ScanObject, expr) -> bool:
+        matcher = getattr(scan_object, "is_target", None)
+        if callable(matcher):
+            try:
+                if matcher(expr):
+                    return True
+            except Exception:
+                pass
+
+        parsed_target = cls._parse_member_assignment_target(expr)
+        if parsed_target is None:
+            return False
+
+        _parent_expr, member_offset = parsed_target
+        return member_offset == getattr(scan_object, "offset", None)
+
+    @staticmethod
+    def _iter_expr_children(expr):
+        for attr in ("x", "y", "z"):
+            child = getattr(expr, attr, None)
+            if child is not None and hasattr(child, "op"):
+                yield child
+
+        for child in getattr(expr, "a", ()) or ():
+            if child is not None and hasattr(child, "op"):
+                yield child
+
+    @classmethod
+    def _iter_descendant_expressions(cls, expr):
+        stack = list(cls._iter_expr_children(expr))
+        seen: set[int] = set()
+        while stack:
+            current = stack.pop()
+            current_id = id(current)
+            if current_id in seen:
+                continue
+            seen.add(current_id)
+            yield current
+            stack.extend(cls._iter_expr_children(current))
+
+    @classmethod
+    def _iter_parent_expressions(cls, cfunc: ida_hexrays.cfunc_t, expr):
+        body = getattr(cfunc, "body", None)
+        if body is None or not hasattr(body, "find_parent_of"):
+            return
+
+        current = expr
+        seen: set[int] = set()
+        while current is not None:
+            specific = getattr(current, "to_specific_type", current)
+            try:
+                parent_item = body.find_parent_of(specific)
+            except Exception:
+                break
+            parent_expr = cls._coerce_ctree_expr(parent_item)
+            if parent_expr is None or parent_expr is current or id(parent_expr) in seen:
+                break
+            seen.add(id(parent_expr))
+            yield parent_expr
+            current = parent_expr
+
+    @classmethod
+    def _iter_related_member_expressions(cls, cfunc: ida_hexrays.cfunc_t, expr):
+        seen: set[int] = set()
+
+        def emit(candidate):
+            if candidate is None or not hasattr(candidate, "op"):
+                return None
+            candidate_id = id(candidate)
+            if candidate_id in seen:
+                return None
+            seen.add(candidate_id)
+            return candidate
+
+        first = emit(expr)
+        if first is not None:
+            yield first
+
+        for candidate in cls._iter_descendant_expressions(expr):
+            emitted = emit(candidate)
+            if emitted is not None:
+                yield emitted
+
+        for candidate in cls._iter_parent_expressions(cfunc, expr):
+            emitted = emit(candidate)
+            if emitted is not None:
+                yield emitted
+
+    @classmethod
+    def _expand_matching_member_anchor(
+        cls, cfunc: ida_hexrays.cfunc_t, expr, target_offset: int
+    ):
+        anchor_expr = expr
+        for parent_expr in cls._iter_parent_expressions(cfunc, expr):
+            parsed_target = cls._parse_member_assignment_target(parent_expr)
+            if parsed_target is None:
+                break
+            _base_expr, member_offset = parsed_target
+            if member_offset != target_offset:
+                break
+            anchor_expr = parent_expr
+        return anchor_expr
+
+    @classmethod
+    def _resolve_member_anchor(
+        cls, cfunc: ida_hexrays.cfunc_t, scan_object: ScanObject
+    ) -> ChildScanResolvedMemberAnchor | None:
+        target_ea = getattr(scan_object, "ea", idaapi.BADADDR)
+        if target_ea == idaapi.BADADDR:
+            return None
+
+        target_offset = getattr(scan_object, "offset", None)
+        if target_offset is None:
+            return None
+
+        for item in cls._iter_items_near_ea(cfunc, target_ea):
+            evidence_expr = cls._coerce_ctree_expr(item)
+            if evidence_expr is None:
+                continue
+            for candidate in cls._iter_related_member_expressions(cfunc, evidence_expr):
+                parsed_target = cls._parse_member_assignment_target(candidate)
+                if parsed_target is None:
+                    continue
+                _base_expr, member_offset = parsed_target
+                if member_offset != target_offset:
+                    continue
+                anchor_expr = cls._expand_matching_member_anchor(
+                    cfunc, candidate, target_offset
+                )
+                parsed_anchor = cls._parse_member_assignment_target(anchor_expr)
+                if parsed_anchor is None:
+                    continue
+                parent_expr, anchor_offset = parsed_anchor
+                return ChildScanResolvedMemberAnchor(
+                    evidence_expr=evidence_expr,
+                    member_expr=anchor_expr,
+                    parent_expr=parent_expr,
+                    member_offset=anchor_offset,
+                )
+
+        return None
+
+    @classmethod
+    def _create_scan_object_from_expr(
+        cls, cfunc: ida_hexrays.cfunc_t, expr
+    ) -> ScanObject | None:
+        if expr is None:
+            return None
+
+        scan_object = ScanObject.create(cfunc, expr)
+        if scan_object is None:
+            base_expr, offset = _extract_offset_expression(expr)
+            if base_expr is None:
+                return None
+            base_object = ScanObject.create(cfunc, base_expr)
+            if base_object is None:
+                return None
+            scan_object = _make_offset_scan_object(base_object, offset)
+
+        setattr(scan_object, "func_ea", getattr(cfunc, "entry_ea", idaapi.BADADDR))
+        return scan_object
+
+    @staticmethod
+    def _scan_object_matches_expr(scan_object: ScanObject, expr) -> bool:
+        matcher = getattr(scan_object, "is_target", None)
+        if callable(matcher):
+            try:
+                return bool(matcher(expr))
+            except Exception:
+                return False
+
+        obj_ea = getattr(scan_object, "ea", idaapi.BADADDR)
+        expr_ea = getattr(expr, "ea", idaapi.BADADDR)
+        return obj_ea != idaapi.BADADDR and expr_ea != idaapi.BADADDR and obj_ea == expr_ea
+
+    @staticmethod
+    def _resolve_parent_argument_index(
+        cfunc: ida_hexrays.cfunc_t, parent_object: ScanObject
+    ) -> int | None:
+        if getattr(parent_object, "id", None) != ObjectType.local_variable:
+            return None
+
+        lvar = getattr(parent_object, "lvar", None)
+        if lvar is not None and hasattr(lvar, "is_arg_var") and not lvar.is_arg_var:
+            return None
+
+        index = getattr(parent_object, "index", None)
+        if index is None:
+            return None
+
+        return _get_argument_index(cfunc, index)
+
+    @classmethod
+    def _build_child_scan_inference_seed(
+        cls,
+        cfunc: ida_hexrays.cfunc_t,
+        scan_object: ScanObject,
+        *,
+        parent_expr=None,
+        evidence_ea: int | None = None,
+        caller_path: tuple[int, ...] = (),
+    ) -> ChildScanInferenceSeed | None:
+        if parent_expr is None:
+            resolved_anchor = cls._resolve_member_anchor(cfunc, scan_object)
+            if resolved_anchor is None:
+                return None
+            parent_expr = resolved_anchor.parent_expr
+            evidence_ea = cls._expression_ea(cfunc, resolved_anchor.member_expr)
+            source_ea = cls._expression_ea(cfunc, resolved_anchor.evidence_expr)
+            function_ea = getattr(cfunc, "entry_ea", idaapi.BADADDR)
+            if resolved_anchor.member_expr is resolved_anchor.evidence_expr:
+                log_debug(
+                    "Child scan resolved parent-member anchor "
+                    f"0x{resolved_anchor.member_offset:X} directly at {hex(evidence_ea)} in {hex(function_ea)}"
+                )
+            else:
+                log_debug(
+                    "Child scan recovered parent-member anchor "
+                    f"0x{resolved_anchor.member_offset:X} at {hex(evidence_ea)} from descendant evidence {hex(source_ea)} in {hex(function_ea)}"
+                )
+
+        parent_object = cls._create_scan_object_from_expr(cfunc, parent_expr)
+        if parent_object is None:
+            log_debug(
+                "Child scan failed to derive a parent object from "
+                f"{hex(cls._expression_ea(cfunc, parent_expr))} in {hex(getattr(cfunc, 'entry_ea', idaapi.BADADDR))}"
+            )
+            return None
+
+        seeded_scan_object = copy.copy(scan_object)
+        seeded_scan_object.func_ea = getattr(cfunc, "entry_ea", idaapi.BADADDR)
+        if evidence_ea is None or evidence_ea == idaapi.BADADDR:
+            evidence_ea = cls._expression_ea(cfunc, parent_expr)
+        seeded_scan_object.ea = evidence_ea
+
+        return ChildScanInferenceSeed(
+            function_ea=getattr(cfunc, "entry_ea", idaapi.BADADDR),
+            evidence_ea=evidence_ea,
+            scan_object=seeded_scan_object,
+            parent_object=parent_object,
+            caller_path=caller_path,
+        )
+
+    @classmethod
+    def _infer_direct_child_roots(
+        cls, cfunc: ida_hexrays.cfunc_t, seed: ChildScanInferenceSeed
+    ) -> tuple[ChildScanRootCandidate, ...]:
+        target_offset = getattr(seed.scan_object, "offset", None)
+        if target_offset is None:
+            return ()
+
+        candidates: list[ChildScanRootCandidate] = []
+        for assignment in cls._iter_assignment_expressions(cfunc):
+            parsed_target = cls._parse_member_assignment_target(getattr(assignment, "x", None))
+            if parsed_target is None:
+                continue
+
+            parent_expr, member_offset = parsed_target
+            if member_offset != target_offset:
+                continue
+            if not cls._scan_object_matches_expr(seed.parent_object, parent_expr):
+                continue
+
+            root = cls._create_scan_object_from_expr(cfunc, getattr(assignment, "y", None))
+            if root is None:
+                continue
+
+            candidates.append(
+                ChildScanRootCandidate(
+                    function_ea=getattr(cfunc, "entry_ea", idaapi.BADADDR),
+                    evidence_ea=cls._expression_ea(cfunc, assignment),
+                    root=root,
+                    caller_path=seed.caller_path,
+                )
+            )
+
+        if candidates:
+            log_debug(
+                "Child scan found "
+                f"{len(candidates)} assignment-source root(s) for offset 0x{target_offset:X} in {hex(getattr(cfunc, 'entry_ea', idaapi.BADADDR))}"
+            )
+
+        return tuple(candidates)
+
+    def _propagate_child_scan_seed(
+        self,
+        cfunc: ida_hexrays.cfunc_t,
+        seed: ChildScanInferenceSeed,
+    ) -> tuple[ChildScanInferenceSeed, ...]:
+        arg_idx = self._resolve_parent_argument_index(cfunc, seed.parent_object)
+        if arg_idx is None:
+            return ()
+
+        propagated: list[ChildScanInferenceSeed] = []
+        for caller_ea in sorted(_get_funcs_calling_address(seed.function_ea)):
+            caller_cfunc = self._prepare_scan_cfunc(caller_ea)
+            if caller_cfunc is None:
+                continue
+
+            for call_expr in self._iter_call_expressions(caller_cfunc, seed.function_ea):
+                args = getattr(call_expr, "a", ())
+                if arg_idx < 0 or arg_idx >= len(args):
+                    continue
+
+                parent_expr = args[arg_idx]
+                caller_seed = self._build_child_scan_inference_seed(
+                    caller_cfunc,
+                    seed.scan_object,
+                    parent_expr=parent_expr,
+                    evidence_ea=self._expression_ea(caller_cfunc, parent_expr),
+                    caller_path=seed.caller_path + (seed.function_ea,),
+                )
+                if caller_seed is not None:
+                    log_debug(
+                        "Child scan propagated parent argument "
+                        f"{arg_idx} from {hex(seed.function_ea)} to caller {hex(caller_ea)}"
+                    )
+                    propagated.append(caller_seed)
+
+        return tuple(propagated)
+
+    @staticmethod
+    def _scan_object_key(scan_object: ScanObject) -> tuple[object, ...]:
+        return (
+            getattr(scan_object, "id", None),
+            getattr(scan_object, "index", None),
+            getattr(scan_object, "object_ea", None),
+            getattr(scan_object, "struct_name", None),
+            getattr(scan_object, "offset", None),
+            getattr(scan_object, "arg_idx", None),
+            getattr(scan_object, "func_ea", None),
+            getattr(scan_object, "ea", None),
+            getattr(scan_object, "name", None),
+        )
+
+    @classmethod
+    def _child_scan_seed_key(cls, seed: ChildScanInferenceSeed) -> tuple[object, ...]:
+        return (
+            seed.function_ea,
+            seed.evidence_ea,
+            cls._scan_object_key(seed.scan_object),
+            cls._scan_object_key(seed.parent_object),
+        )
+
+    @classmethod
+    def _child_scan_root_key(
+        cls, candidate: ChildScanRootCandidate
+    ) -> tuple[object, ...]:
+        return candidate.function_ea, cls._scan_object_key(candidate.root)
+
+    def _infer_child_scan_roots(
+        self, cfunc: ida_hexrays.cfunc_t, scan_object: ScanObject
+    ) -> tuple[ScanObject, ...]:
+        initial_seed = self._build_child_scan_inference_seed(cfunc, scan_object)
+        if initial_seed is None:
+            log_debug(
+                "Child scan could not resolve a parent-member inference seed for "
+                f"offset 0x{getattr(scan_object, 'offset', -1):X} at {hex(getattr(cfunc, 'entry_ea', idaapi.BADADDR))}"
+            )
+            return ()
+
+        pending = [initial_seed]
+        visited = {self._child_scan_seed_key(initial_seed)}
+        candidates: list[ChildScanRootCandidate] = []
+
+        while pending:
+            seed = pending.pop(0)
+            seed_cfunc = (
+                cfunc
+                if seed.function_ea == getattr(cfunc, "entry_ea", idaapi.BADADDR)
+                else self._prepare_scan_cfunc(seed.function_ea)
+            )
+            if seed_cfunc is None:
+                continue
+
+            direct_roots = self._infer_direct_child_roots(seed_cfunc, seed)
+            if direct_roots:
+                candidates.extend(direct_roots)
+                continue
+
+            for caller_seed in self._propagate_child_scan_seed(seed_cfunc, seed):
+                seed_key = self._child_scan_seed_key(caller_seed)
+                if seed_key in visited:
+                    continue
+                visited.add(seed_key)
+                pending.append(caller_seed)
+
+        if not candidates:
+            log_debug(
+                "Child scan found no assignment-source roots for "
+                f"{getattr(scan_object, 'name', '<unnamed>')} starting in {hex(getattr(cfunc, 'entry_ea', idaapi.BADADDR))}"
+            )
+
+        inferred_roots: list[ScanObject] = []
+        seen_roots: set[tuple[object, ...]] = set()
+        for candidate in candidates:
+            root_key = self._child_scan_root_key(candidate)
+            if root_key in seen_roots:
+                continue
+            seen_roots.add(root_key)
+            inferred_roots.append(candidate.root)
+
+        return tuple(inferred_roots)
 
 
 
@@ -369,10 +926,12 @@ class ChildScanMixin:
             if func_ea == idaapi.BADADDR:
                 continue
             evidence_by_function.setdefault(func_ea, []).append(normalized)
+
         for func_ea in plan.function_eas:
             cfunc = self._prepare_scan_cfunc(func_ea)
             if cfunc is None:
                 continue
+
             scan_variables = evidence_by_function.get(func_ea) or [plan.scan_object]
             for scan_variable in scan_variables:
                 seeded_scan_object = self._seed_scan_object_from_evidence(
@@ -384,8 +943,22 @@ class ChildScanMixin:
                         True,
                     )
                     continue
+
                 inferred_roots = self._infer_child_scan_roots(cfunc, seeded_scan_object)
-                roots = inferred_roots or (seeded_scan_object,)
+                if inferred_roots:
+                    log_info(
+                        "Child scan inferred "
+                        f"{len(inferred_roots)} assignment root(s) for "
+                        f"{getattr(seeded_scan_object, 'name', '<unnamed>')} in {hex(func_ea)}"
+                    )
+                    roots = inferred_roots
+                else:
+                    log_warning(
+                        "Child scan fell back to seeded member evidence for "
+                        f"{getattr(seeded_scan_object, 'name', '<unnamed>')} in {hex(func_ea)}"
+                    )
+                    roots = (seeded_scan_object,)
+
                 for root in roots:
                     root_cfunc = self._prepare_scan_cfunc(
                         getattr(root, "func_ea", idaapi.BADADDR)
@@ -399,6 +972,7 @@ class ChildScanMixin:
                     )
                     visitor.process()
                     scanned_any = True
+
         return scanned_any
 
 
@@ -410,17 +984,22 @@ class ChildScanMixin:
         child_structure: Structure,
         relation_kind: str,
     ) -> None:
-        child_type_name = child_structure.created_type_name or child_structure.name
-        type_decl = f"{child_type_name} *" if relation_kind == "pointer" else child_type_name
-        parse_tinfo = getattr(_form_module(), "parse_user_tinfo", parse_user_tinfo)
-        tinfo = parse_tinfo(type_decl)
-        if tinfo is None:
+        child_type_name = child_structure.created_type_name
+        if not child_type_name:
+            log_debug(
+                "Deferring child member type materialization until "
+                f"{child_structure.name} has a created type name"
+            )
             return
 
-        member.tinfo = tinfo
-        member.is_array = False
-        if hasattr(member, "invalidate_score"):
-            member.invalidate_score()
+        if not materialize_linked_child_member_type(
+            member, child_type_name, relation_kind
+        ):
+            log_warning(
+                "Failed to materialize linked child member type "
+                f"{child_type_name} for {member.name or f'member_{member.offset:X}'}",
+                True,
+            )
 
     @staticmethod
     def _child_scan_origin(member: AbstractMember) -> int:

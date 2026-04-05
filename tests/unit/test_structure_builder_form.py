@@ -14,6 +14,7 @@ setattr(hexrays_api, "is_legal_type", lambda *_args, **_kwargs: True)
 setattr(scanner_api, "NewShallowScanVisitor", type("NewShallowScanVisitor", (), {}))
 
 form_module = import_module("forge.features.structure_builder.form")
+child_scan_module = import_module("forge.features.structure_builder.child_scan")
 structure_module = import_module("forge.api.structure")
 
 
@@ -109,6 +110,68 @@ class _FakeScanObject:
         )
 
 
+
+
+def _make_descendant_member_evidence(
+    target_offset: int,
+    leaf_offset: int,
+    *,
+    entry_ea: int = 0x401000,
+    evidence_ea: int = 0x401030,
+    anchor_ea: int = 0x401020,
+    parent_ea: int = 0x401010,
+ ) -> SimpleNamespace:
+    for op_name in ("var", "num", "add", "cast", "ptr"):
+        if not hasattr(child_scan_module.ctype, op_name):
+            setattr(child_scan_module.ctype, op_name, op_name)
+    ctype = child_scan_module.ctype
+    parent_expr = SimpleNamespace(op=ctype.var, ea=parent_ea)
+    anchor_add = SimpleNamespace(
+        op=ctype.add,
+        x=parent_expr,
+        y=SimpleNamespace(op=ctype.num, numval=lambda: target_offset),
+        ea=anchor_ea - 0xC,
+    )
+    anchor_cast = SimpleNamespace(op=ctype.cast, x=anchor_add, ea=anchor_ea - 4)
+    anchor_expr = SimpleNamespace(
+        op=ctype.ptr,
+        x=anchor_cast,
+        type=SimpleNamespace(get_ptrarr_objsize=lambda: 1),
+        ea=anchor_ea,
+    )
+    descendant_add = SimpleNamespace(
+        op=ctype.add,
+        x=anchor_expr,
+        y=SimpleNamespace(op=ctype.num, numval=lambda: leaf_offset),
+        ea=evidence_ea - 4,
+    )
+    descendant_expr = SimpleNamespace(
+        op=ctype.ptr,
+        x=descendant_add,
+        type=SimpleNamespace(get_ptrarr_objsize=lambda: 1),
+        ea=evidence_ea,
+    )
+    parent_map = {
+        id(anchor_add): anchor_cast,
+        id(anchor_cast): anchor_expr,
+        id(anchor_expr): descendant_add,
+        id(descendant_add): descendant_expr,
+    }
+    cfunc = SimpleNamespace(
+        entry_ea=entry_ea,
+        treeitems=[descendant_expr],
+        eamap={evidence_ea: [descendant_expr]},
+        body=SimpleNamespace(
+            find_parent_of=lambda expr: parent_map.get(id(expr)),
+            find_closest_addr=lambda _ea: descendant_expr,
+        ),
+    )
+    return SimpleNamespace(
+        cfunc=cfunc,
+        parent_expr=parent_expr,
+        anchor_expr=anchor_expr,
+        descendant_expr=descendant_expr,
+    )
 
 
 def _make_form(monkeypatch) -> form_module.StructureBuilderForm:
@@ -1351,6 +1414,311 @@ def test_execute_child_scan_plan_prefers_inferred_child_roots(monkeypatch):
 
 
 
+def test_build_child_scan_inference_seed_recovers_descendant_parent_member_anchors(
+    monkeypatch,
+ ):
+    structure_form = _make_form(monkeypatch)
+    offset_10 = _make_descendant_member_evidence(
+        0x10, 4, evidence_ea=0x401030, anchor_ea=0x401020, parent_ea=0x401010
+    )
+    offset_18 = _make_descendant_member_evidence(
+        0x18, 0x10, evidence_ea=0x401130, anchor_ea=0x401120, parent_ea=0x401110
+    )
+    parent_10 = SimpleNamespace(name="v1_parent")
+    parent_18 = SimpleNamespace(name="v0_parent")
+
+    monkeypatch.setattr(
+        child_scan_module.ChildScanMixin,
+        "_create_scan_object_from_expr",
+        classmethod(
+            lambda cls, _cfunc, expr: (
+                parent_10
+                if expr is offset_10.parent_expr
+                else parent_18 if expr is offset_18.parent_expr else None
+            )
+        ),
+    )
+
+    seed_10 = structure_form._build_child_scan_inference_seed(
+        offset_10.cfunc,
+        SimpleNamespace(offset=0x10, ea=offset_10.descendant_expr.ea, name="field_10"),
+    )
+    seed_18 = structure_form._build_child_scan_inference_seed(
+        offset_18.cfunc,
+        SimpleNamespace(offset=0x18, ea=offset_18.descendant_expr.ea, name="field_18"),
+    )
+
+    assert seed_10 is not None
+    assert seed_18 is not None
+    assert seed_10.parent_object is parent_10
+    assert seed_18.parent_object is parent_18
+    assert seed_10.evidence_ea == offset_10.anchor_expr.ea
+    assert seed_18.evidence_ea == offset_18.anchor_expr.ea
+    assert seed_10.scan_object.ea == offset_10.anchor_expr.ea
+    assert seed_18.scan_object.ea == offset_18.anchor_expr.ea
+
+
+def test_infer_child_scan_roots_recovers_descendant_seed_before_walking_callers(
+    monkeypatch,
+ ):
+    structure_form = _make_form(monkeypatch)
+    evidence = _make_descendant_member_evidence(0x10, 4)
+    scan_object = SimpleNamespace(
+        offset=0x10,
+        ea=evidence.descendant_expr.ea,
+        name="child_ptr",
+    )
+    parent_object = SimpleNamespace(
+        id=import_module("forge.api.scan_object").ObjectType.local_variable,
+        index=0,
+        lvar=SimpleNamespace(is_arg_var=True),
+        name="a1",
+    )
+    caller_seed = child_scan_module.ChildScanInferenceSeed(
+        function_ea=0x400800,
+        evidence_ea=0x400880,
+        scan_object=scan_object,
+        parent_object=SimpleNamespace(name="caller_parent"),
+        caller_path=(0x401000,),
+    )
+    inferred_root = SimpleNamespace(name="child_var", ea=0x500123, func_ea=0x400800)
+    caller_candidate = child_scan_module.ChildScanRootCandidate(
+        function_ea=0x400800,
+        evidence_ea=0x4008A0,
+        root=inferred_root,
+        caller_path=(0x401000,),
+    )
+    caller_cfunc = SimpleNamespace(entry_ea=0x400800)
+    seen = []
+
+    monkeypatch.setattr(
+        child_scan_module.ChildScanMixin,
+        "_create_scan_object_from_expr",
+        classmethod(
+            lambda cls, _cfunc, expr: parent_object if expr is evidence.parent_expr else None
+        ),
+    )
+
+    def fake_infer_direct(cfunc, seed):
+        seen.append((cfunc.entry_ea, seed.parent_object, seed.evidence_ea))
+        if cfunc.entry_ea == evidence.cfunc.entry_ea:
+            assert seed.parent_object is parent_object
+            assert seed.evidence_ea == evidence.anchor_expr.ea
+            return ()
+        assert seed is caller_seed
+        return (caller_candidate,)
+
+    monkeypatch.setattr(structure_form, "_infer_direct_child_roots", fake_infer_direct)
+    monkeypatch.setattr(
+        structure_form,
+        "_propagate_child_scan_seed",
+        lambda cfunc, seed: (caller_seed,) if seed.parent_object is parent_object else (),
+    )
+    monkeypatch.setattr(
+        structure_form,
+        "_prepare_scan_cfunc",
+        lambda ea: caller_cfunc if ea == 0x400800 else None,
+    )
+
+    roots = structure_form._infer_child_scan_roots(evidence.cfunc, scan_object)
+
+    assert roots == (inferred_root,)
+    assert seen == [
+        (0x401000, parent_object, evidence.anchor_expr.ea),
+        (0x400800, caller_seed.parent_object, 0x400880),
+    ]
+
+
+def test_infer_child_scan_roots_walks_callers_for_assignment_sources(monkeypatch):
+    structure_form = _make_form(monkeypatch)
+    scan_object = SimpleNamespace(offset=0x18, name="child_ptr")
+    initial_seed = child_scan_module.ChildScanInferenceSeed(
+        function_ea=0x401000,
+        evidence_ea=0x402000,
+        scan_object=scan_object,
+        parent_object=SimpleNamespace(name="arg_parent"),
+    )
+    caller_seed = child_scan_module.ChildScanInferenceSeed(
+        function_ea=0x400800,
+        evidence_ea=0x400880,
+        scan_object=scan_object,
+        parent_object=SimpleNamespace(name="caller_parent"),
+        caller_path=(0x401000,),
+    )
+    inferred_root = SimpleNamespace(name="child_var", ea=0x500123, func_ea=0x400800)
+    caller_candidate = child_scan_module.ChildScanRootCandidate(
+        function_ea=0x400800,
+        evidence_ea=0x4008A0,
+        root=inferred_root,
+        caller_path=(0x401000,),
+    )
+    callee_cfunc = SimpleNamespace(entry_ea=0x401000)
+    caller_cfunc = SimpleNamespace(entry_ea=0x400800)
+    seen = []
+
+    monkeypatch.setattr(
+        structure_form,
+        "_build_child_scan_inference_seed",
+        lambda cfunc, _scan_object, **_kwargs: initial_seed,
+    )
+
+    def fake_infer_direct(cfunc, seed):
+        seen.append((cfunc.entry_ea, seed.function_ea))
+        if cfunc.entry_ea == 0x401000:
+            return ()
+        return (caller_candidate,)
+
+    monkeypatch.setattr(structure_form, "_infer_direct_child_roots", fake_infer_direct)
+    monkeypatch.setattr(
+        structure_form,
+        "_propagate_child_scan_seed",
+        lambda cfunc, seed: (caller_seed,) if seed is initial_seed else (),
+    )
+    monkeypatch.setattr(
+        structure_form,
+        "_prepare_scan_cfunc",
+        lambda ea: caller_cfunc if ea == 0x400800 else None,
+    )
+
+    roots = structure_form._infer_child_scan_roots(callee_cfunc, scan_object)
+
+    assert roots == (inferred_root,)
+    assert seen == [(0x401000, 0x401000), (0x400800, 0x400800)]
+
+
+def test_infer_direct_child_roots_matches_pointer_arithmetic_assignment(monkeypatch):
+    structure_form = _make_form(monkeypatch)
+    ctype = child_scan_module.ctype
+    monkeypatch.setattr(child_scan_module.ctype, "ptr", "ptr", raising=False)
+    monkeypatch.setattr(child_scan_module.ctype, "asg", "asg", raising=False)
+    parent_expr = SimpleNamespace(op=ctype.var, ea=0x401050)
+    rhs_expr = SimpleNamespace(op=ctype.var, ea=0x401060)
+    index_expr = SimpleNamespace(op=ctype.num, numval=lambda: 3)
+    add_expr = SimpleNamespace(
+        op=ctype.add,
+        x=SimpleNamespace(op=ctype.cast, x=parent_expr),
+        y=index_expr,
+    )
+    lhs_expr = SimpleNamespace(
+        op=ctype.ptr,
+        x=add_expr,
+        type=SimpleNamespace(get_ptrarr_objsize=lambda: 8),
+    )
+    assignment = SimpleNamespace(op=ctype.asg, x=lhs_expr, y=rhs_expr, ea=0x401070)
+    cfunc = SimpleNamespace(entry_ea=0x401000, treeitems=[assignment])
+    parent_object = SimpleNamespace(name="parent")
+    root_object = SimpleNamespace(name="child_var", ea=0x500123, func_ea=0x401000)
+    seed = child_scan_module.ChildScanInferenceSeed(
+        function_ea=0x401000,
+        evidence_ea=0x402000,
+        scan_object=SimpleNamespace(offset=24),
+        parent_object=parent_object,
+    )
+
+    monkeypatch.setattr(
+        child_scan_module.ChildScanMixin,
+        "_scan_object_matches_expr",
+        staticmethod(lambda obj, expr: obj is parent_object and expr is parent_expr),
+    )
+    monkeypatch.setattr(
+        child_scan_module.ChildScanMixin,
+        "_create_scan_object_from_expr",
+        classmethod(lambda cls, _cfunc, expr: root_object if expr is rhs_expr else None),
+    )
+
+    candidates = structure_form._infer_direct_child_roots(cfunc, seed)
+
+    assert len(candidates) == 1
+    assert candidates[0].root is root_object
+    assert candidates[0].function_ea == 0x401000
+
+
+def test_create_scan_object_from_expr_unwraps_casted_offset_expression(monkeypatch):
+    ctype = child_scan_module.ctype
+    cfunc = SimpleNamespace(entry_ea=0x401000)
+    base_expr = SimpleNamespace(op=ctype.var, ea=0x401020)
+    offset_expr = SimpleNamespace(op=ctype.num, numval=lambda: 0x20)
+    wrapped_expr = SimpleNamespace(
+        op=ctype.cast,
+        x=SimpleNamespace(op=ctype.add, x=base_expr, y=offset_expr),
+    )
+    base_object = SimpleNamespace(name="child_base")
+    derived_object = SimpleNamespace(name="child_offset")
+
+    monkeypatch.setattr(
+        child_scan_module.ScanObject,
+        "create",
+        staticmethod(lambda _cfunc, expr: base_object if expr is base_expr else None),
+    )
+    monkeypatch.setattr(
+        child_scan_module,
+        "_make_offset_scan_object",
+        lambda obj, offset: derived_object if obj is base_object and offset == 0x20 else None,
+    )
+
+    result = child_scan_module.ChildScanMixin._create_scan_object_from_expr(cfunc, wrapped_expr)
+
+    assert result is derived_object
+    assert result.func_ea == 0x401000
+
+
+def test_execute_child_scan_plan_falls_back_to_seeded_member_when_inference_fails(monkeypatch):
+    structure_form = _make_form(monkeypatch)
+    child = structure_form.create_structure("Child")
+    assert child is not None
+    child.main_offset = 0x30
+
+    plan = SimpleNamespace(
+        function_eas=(0x401000,),
+        scan_object=SimpleNamespace(name="child_ptr", id="member"),
+        scan_variables=(SimpleNamespace(func_ea=0x401000, ea=0x402000),),
+    )
+    warnings = []
+
+    monkeypatch.setattr(
+        structure_form,
+        "_prepare_scan_cfunc",
+        lambda ea: SimpleNamespace(entry_ea=ea),
+    )
+    monkeypatch.setattr(
+        structure_form,
+        "_infer_child_scan_roots",
+        lambda cfunc, scan_object: (),
+    )
+    monkeypatch.setattr(
+        child_scan_module,
+        "log_warning",
+        lambda message=None, display_messagebox=False: warnings.append((message, display_messagebox)),
+    )
+
+    captured = {}
+
+    class FakeVisitor:
+        def __init__(self, cfunc, origin, obj, structure, recurse_calls=False):
+            captured["args"] = (
+                cfunc.entry_ea,
+                origin,
+                obj.name,
+                obj.ea,
+                structure.name,
+                recurse_calls,
+            )
+
+        def process(self):
+            return None
+
+    monkeypatch.setattr(form_module, "NewDeepScanVisitor", FakeVisitor)
+
+    assert structure_form._execute_child_scan_plan(child, plan) is True
+    assert captured["args"] == (0x401000, 0x30, "child_ptr", 0x402000, "Child", True)
+    assert any(
+        "fell back to seeded member evidence" in message
+        for message, _display in warnings
+        if message is not None
+    )
+
+
+
 def test_scan_child_structure_uses_absolute_member_origin(monkeypatch):
     structure_form = _make_form(monkeypatch)
     parent = structure_form.create_structure("Parent")
@@ -1392,6 +1760,7 @@ def test_link_child_structure_materializes_pointer_and_inline_member_types(monke
     child = structure_form.create_structure("Child")
     assert parent is not None
     assert child is not None
+    child.created_type_name = "ChildType"
 
     member_pointer = _FakeMember(0x30, 8, type_name="u64", name="child_ptr")
     member_inline = _FakeMember(0x40, 8, type_name="u64", name="child_inline")
@@ -1404,17 +1773,109 @@ def test_link_child_structure_materializes_pointer_and_inline_member_types(monke
         get_size=lambda: 8,
         is_funcptr=lambda: False,
     )
-    seen: list[str] = []
+    seen: list[tuple[str, str, str]] = []
 
-    monkeypatch.setattr(form_module, "parse_user_tinfo", lambda decl: seen.append(decl) or sentinel)
+    def fake_materialize(member, child_type_name, relation_kind):
+        seen.append((member.name, child_type_name, relation_kind))
+        member.tinfo = sentinel
+        return True
+
+    monkeypatch.setattr(
+        child_scan_module,
+        "materialize_linked_child_member_type",
+        fake_materialize,
+    )
 
     form_module.StructureBuilderForm._link_child_structure(parent, child, member_pointer, "pointer")
     form_module.StructureBuilderForm._link_child_structure(parent, child, member_inline, "embedded")
 
-    assert "Child *" in seen
-    assert "Child" in seen
+    assert ("child_ptr", "ChildType", "pointer") in seen
+    assert ("child_inline", "ChildType", "embedded") in seen
     assert member_pointer.tinfo is sentinel
     assert member_inline.tinfo is sentinel
     assert member_pointer.child_relation_kind == "pointer"
     assert member_inline.child_relation_kind == "embedded"
 
+
+def test_link_child_structure_defers_materialization_for_untyped_auto_child(
+    monkeypatch,
+ ):
+    structure_form = _make_form(monkeypatch)
+    parent = structure_form.create_structure("Parent")
+    child = structure_form.create_structure(" ")
+    assert parent is not None
+    assert child is not None
+
+    member = _FakeMember(0x30, 8, type_name="u64", name="child_ptr")
+    original_tinfo = SimpleNamespace(
+        dstr=lambda: "u64",
+        get_size=lambda: 8,
+        is_funcptr=lambda: False,
+    )
+    member.tinfo = original_tinfo
+    parent.add_member(member)
+    seen = []
+
+    monkeypatch.setattr(
+        child_scan_module,
+        "materialize_linked_child_member_type",
+        lambda *_args: seen.append(_args) or True,
+    )
+
+    form_module.StructureBuilderForm._link_child_structure(parent, child, member, "pointer")
+
+    assert seen == []
+    assert member.tinfo is original_tinfo
+    assert member.linked_child_structure_name == child.name
+    assert member.child_relation_kind == "pointer"
+
+
+def test_refresh_all_linked_member_types_materializes_deferred_child_links(
+    monkeypatch,
+ ):
+    structure_form = _make_form(monkeypatch)
+    parent = structure_form.create_structure("Parent")
+    child = structure_form.create_structure("Child")
+    assert parent is not None
+    assert child is not None
+    child.created_type_name = "ChildType"
+
+    member = _FakeMember(0x30, 8, type_name="u64", name="child_ptr")
+    original_tinfo = SimpleNamespace(
+        dstr=lambda: "u64",
+        get_size=lambda: 8,
+        is_funcptr=lambda: False,
+    )
+    sentinel = SimpleNamespace(
+        dstr=lambda: "ChildType",
+        get_size=lambda: 8,
+        is_funcptr=lambda: False,
+    )
+    member.tinfo = original_tinfo
+    parent.add_member(member)
+    relationship = parent.add_child_relationship(
+        child_structure_name="Child",
+        parent_member_offset=0x30,
+        parent_member_name="child_ptr",
+        relation_kind="pointer",
+    )
+    child.add_parent_relationship(relationship)
+    member.linked_child_structure_name = "Child"
+    member.child_relation_kind = "pointer"
+    seen = []
+
+    def fake_materialize(member, child_type_name, relation_kind):
+        seen.append((member.name, child_type_name, relation_kind))
+        member.tinfo = sentinel
+        return True
+
+    monkeypatch.setattr(
+        structure_module,
+        "materialize_linked_child_member_type",
+        fake_materialize,
+    )
+
+    structure_form._refresh_all_linked_member_types()
+
+    assert seen == [("child_ptr", "ChildType", "pointer")]
+    assert member.tinfo is sentinel

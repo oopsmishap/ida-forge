@@ -158,6 +158,24 @@ def parse_user_tinfo(declaration: str) -> Optional[ida_typeinf.tinfo_t]:
 
     return None
 
+def materialize_linked_child_member_type(
+    member, child_type_name: str | None, relation_kind: str
+ ) -> bool:
+    if not child_type_name:
+        return False
+
+    type_decl = f"{child_type_name} *" if relation_kind == "pointer" else child_type_name
+    tinfo = parse_user_tinfo(type_decl)
+    if tinfo is None:
+        return False
+
+    member.tinfo = tinfo
+    member.is_array = False
+    if hasattr(member, "invalidate_score"):
+        member.invalidate_score()
+    return True
+
+
 class AbstractMember:
     def __init__(self, offset: int, scanned_variable, origin: int, tinfo=None):
         self.offset: int = offset
