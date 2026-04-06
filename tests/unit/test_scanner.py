@@ -96,18 +96,18 @@ def test_parse_left_assignee_handles_cast_pointer_assignment():
     assert base is leaf
     assert offset == 0
 
-def test_parse_left_assignee_scales_nested_pointer_arithmetic_offsets():
+def test_parse_left_assignee_scales_nested_index_offsets():
     scanner_module = _load_scanner_module()
     visitor = scanner_module.ScanVisitor.__new__(scanner_module.ScanVisitor)
     scanner_module.ctype = SimpleNamespace(cast=1, ptr=2, idx=2, add=3, num=4, asg=5, var=6)
 
     leaf = SimpleNamespace(op=scanner_module.ctype.var)
-    add = SimpleNamespace(
-        op=scanner_module.ctype.add,
+    idx = SimpleNamespace(
+        op=scanner_module.ctype.idx,
         x=leaf,
         y=SimpleNamespace(op=scanner_module.ctype.num, numval=lambda: 2),
     )
-    cast = SimpleNamespace(op=scanner_module.ctype.cast, x=add)
+    cast = SimpleNamespace(op=scanner_module.ctype.cast, x=idx)
     ptr = SimpleNamespace(
         op=scanner_module.ctype.ptr,
         x=cast,
@@ -122,6 +122,108 @@ def test_parse_left_assignee_scales_nested_pointer_arithmetic_offsets():
     assert offset == 16
 
 
+
+
+def test_extract_member_from_ptr_uses_raw_add_offsets(monkeypatch):
+    scanner_module = _load_scanner_module()
+    visitor = scanner_module.ScanVisitor.__new__(scanner_module.ScanVisitor)
+    scanner_module.ctype = SimpleNamespace(cast=1, ptr=2, idx=3, add=4, num=5, var=6)
+
+    captured = {}
+
+    def fake_extract_member(cexpr, obj, offset, context):
+        captured["cexpr"] = cexpr
+        captured["offset"] = offset
+        return "member"
+
+    leaf = SimpleNamespace(
+        op=scanner_module.ctype.var,
+        type=SimpleNamespace(get_ptrarr_objsize=lambda: -1),
+    )
+    add_expr = SimpleNamespace(
+        op=scanner_module.ctype.add,
+        x=leaf,
+        y=SimpleNamespace(op=scanner_module.ctype.num, numval=lambda: 24),
+    )
+
+    visitor._extract_member = fake_extract_member
+    visitor._get_parent_context = lambda: scanner_module.ParentExpressionContext([add_expr])
+    visitor.parent_expr = lambda: add_expr
+
+    result = visitor._extract_member_from_ptr(leaf, SimpleNamespace(name="v2"))
+
+    assert result == "member"
+    assert captured["cexpr"] is add_expr
+    assert captured["offset"] == 24
+
+
+def test_extract_member_from_ptr_scales_index_offsets_only(monkeypatch):
+    scanner_module = _load_scanner_module()
+    visitor = scanner_module.ScanVisitor.__new__(scanner_module.ScanVisitor)
+    scanner_module.ctype = SimpleNamespace(cast=1, ptr=2, idx=3, add=4, num=5, var=6)
+
+    captured = {}
+
+    def fake_extract_member(cexpr, obj, offset, context):
+        captured["cexpr"] = cexpr
+        captured["offset"] = offset
+        return "member"
+
+    leaf = SimpleNamespace(
+        op=scanner_module.ctype.var,
+        type=SimpleNamespace(get_ptrarr_objsize=lambda: 8),
+    )
+    idx_expr = SimpleNamespace(
+        op=scanner_module.ctype.idx,
+        x=leaf,
+        y=SimpleNamespace(op=scanner_module.ctype.num, numval=lambda: 2),
+    )
+
+    visitor._extract_member = fake_extract_member
+    visitor._get_parent_context = lambda: scanner_module.ParentExpressionContext([idx_expr])
+    visitor.parent_expr = lambda: idx_expr
+
+    result = visitor._extract_member_from_ptr(leaf, SimpleNamespace(name="v2"))
+
+    assert result == "member"
+    assert captured["cexpr"] is idx_expr
+    assert captured["offset"] == 16
+
+
+def test_extract_member_from_ptr_uses_raw_cast_add_offsets(monkeypatch):
+    scanner_module = _load_scanner_module()
+    visitor = scanner_module.ScanVisitor.__new__(scanner_module.ScanVisitor)
+    scanner_module.ctype = SimpleNamespace(cast=1, ptr=2, idx=3, add=4, num=5, var=6)
+
+    captured = {}
+
+    def fake_extract_member(cexpr, obj, offset, context):
+        captured["cexpr"] = cexpr
+        captured["offset"] = offset
+        return "member"
+
+    leaf = SimpleNamespace(op=scanner_module.ctype.var)
+    cast_expr = SimpleNamespace(
+        op=scanner_module.ctype.cast,
+        x=leaf,
+        type=SimpleNamespace(is_ptr=lambda: True, get_ptrarr_objsize=lambda: -1),
+    )
+    num_expr = SimpleNamespace(op=scanner_module.ctype.num, numval=lambda: 24)
+    add_expr = SimpleNamespace(
+        op=scanner_module.ctype.add,
+        x=cast_expr,
+        y=num_expr,
+        theother=lambda other: num_expr if other is cast_expr else cast_expr,
+    )
+
+    visitor._extract_member = fake_extract_member
+    visitor._get_parent_context = lambda: scanner_module.ParentExpressionContext([cast_expr, add_expr])
+
+    result = visitor._extract_member_from_ptr(leaf, SimpleNamespace(name="v2"))
+
+    assert result == "member"
+    assert captured["cexpr"] is add_expr
+    assert captured["offset"] == 24
 
 def test_extract_member_recognizes_cast_pointer_assignment_on_left_hand_side():
     scanner_module = _load_scanner_module()
@@ -155,7 +257,7 @@ def test_extract_member_recognizes_cast_pointer_assignment_on_left_hand_side():
     assert captured["tinfo"].dstr() == "u64 **"
 
 
-def test_extract_member_normalizes_negative_offset(monkeypatch):
+def test_get_member_preserves_negative_offset(monkeypatch):
     scanner_module = _load_scanner_module()
     visitor = scanner_module.ScanVisitor.__new__(scanner_module.ScanVisitor)
 
@@ -165,7 +267,6 @@ def test_extract_member_normalizes_negative_offset(monkeypatch):
             self.tinfo = tinfo
             self.scan_obj = scan_obj
             self.origin = origin
-
 
     class FakeTinfo:
         def __init__(self, name):
@@ -179,10 +280,15 @@ def test_extract_member_normalizes_negative_offset(monkeypatch):
 
         def equals_to(self, other):
             return False
+
     import forge.api.members as members_module
     monkeypatch.setattr(members_module, "Member", FakeMember, raising=False)
     monkeypatch.setattr(members_module, "VoidMember", type("VoidMember", (), {}), raising=False)
-    monkeypatch.setattr(scanner_module.ScannedObject, "create", lambda obj, ea, origin, applicable: SimpleNamespace(obj=obj, ea=ea, origin=origin, applicable=applicable))
+    monkeypatch.setattr(
+        scanner_module.ScannedObject,
+        "create",
+        lambda obj, ea, origin, applicable: SimpleNamespace(obj=obj, ea=ea, origin=origin, applicable=applicable),
+    )
     monkeypatch.setattr(scanner_module.ida_typeinf, "tinfo_t", lambda value=None: value if value is not None else FakeTinfo("u32"))
 
     class FakeTypes:
@@ -195,7 +301,6 @@ def test_extract_member_normalizes_negative_offset(monkeypatch):
     monkeypatch.setattr(scanner_module, "types", FakeTypes())
     monkeypatch.setattr(scanner_module, "is_code", lambda *_args, **_kwargs: False)
 
-
     visitor.parents = []
     visitor._origin = 0x10
     visitor._structure = SimpleNamespace(add_member=lambda *_args, **_kwargs: None)
@@ -203,9 +308,8 @@ def test_extract_member_normalizes_negative_offset(monkeypatch):
 
     member = visitor._get_member(-32, SimpleNamespace(ea=0x1000), SimpleNamespace(id=scanner_module.ObjectType.local_variable, name="a1"), FakeTinfo("u32"))
 
-
     assert isinstance(member, FakeMember)
-    assert member.offset == 32
+    assert member.offset == -32
 
 
 def test_manipulate_prefers_pointer_context_even_without_pointer_tinfo(monkeypatch):
@@ -345,6 +449,29 @@ def test_scanned_object_create_accepts_legacy_scanned_variable_object(monkeypatc
 
 
 
+def test_scanned_object_identity_dedupes_duplicate_evidence(monkeypatch):
+    scanner_module = _load_scanner_module()
+    monkeypatch.setattr(
+        scanner_module.ida_funcs,
+        "get_func",
+        lambda _ea: SimpleNamespace(start_ea=0x401000),
+        raising=False,
+    )
+
+    left = scanner_module.ScannedGlobalObject(0x5000, "g_data", 0x401234, 0x20)
+    right = scanner_module.ScannedGlobalObject(0x5000, "g_data", 0x401234, 0x20)
+    legacy = SimpleNamespace(
+        func_ea=0x401000,
+        ea=0x401234,
+        id=None,
+        name="g_data",
+    )
+
+    assert left == right
+    assert left == legacy
+    assert len({left, right}) == 1
+
+
 def test_extract_member_uses_argument_expression_type_without_warning(monkeypatch):
     scanner_module = _load_scanner_module()
     visitor = scanner_module.ScanVisitor.__new__(scanner_module.ScanVisitor)
@@ -397,6 +524,47 @@ def test_extract_member_uses_argument_expression_type_without_warning(monkeypatc
     assert "warning" not in captured
 
 
+
+def test_extract_member_prefers_explicit_cast_type_for_call_arguments(monkeypatch):
+    scanner_module = _load_scanner_module()
+    visitor = scanner_module.ScanVisitor.__new__(scanner_module.ScanVisitor)
+    scanner_module.ctype = SimpleNamespace(cast=1, ptr=2, idx=2, add=3, num=4, asg=5, var=6, call=7)
+
+    captured = {}
+
+    def fake_get_member(offset, cexpr, obj, tinfo, obj_ea=None):
+        captured["offset"] = offset
+        captured["tinfo"] = tinfo
+        return "member"
+
+    def forbidden_parse_call(*_args, **_kwargs):
+        raise AssertionError("parse_call should not run when an explicit cast is present")
+
+    visitor._get_member = fake_get_member
+    visitor._describe_tinfo = lambda tinfo: getattr(tinfo, "dstr", lambda: str(tinfo))()
+    visitor._deref_tinfo = lambda tinfo: SimpleNamespace(dstr=lambda: "u64") if getattr(tinfo, "dstr", lambda: "")() == "u64 *" else tinfo
+    visitor._parse_call = forbidden_parse_call
+    monkeypatch.setattr(scanner_module, "get_func_argument_info", lambda *_args, **_kwargs: (0, None))
+
+    leaf = SimpleNamespace(op=scanner_module.ctype.var, type=SimpleNamespace(dstr=lambda: "void *"))
+    cast_expr = SimpleNamespace(op=scanner_module.ctype.cast, x=leaf, type=SimpleNamespace(dstr=lambda: "u64 *"))
+    ptr_expr = SimpleNamespace(op=scanner_module.ctype.ptr, x=cast_expr, type=SimpleNamespace(dstr=lambda: "u64 **"))
+    call_expr = SimpleNamespace(
+        op=scanner_module.ctype.call,
+        x=SimpleNamespace(obj_ea=0x5000),
+        a=[leaf],
+        ea=0x401234,
+        dstr=lambda: "callee(arg)",
+        type=SimpleNamespace(dstr=lambda: "__int64"),
+    )
+    context = scanner_module.ParentExpressionContext([cast_expr, ptr_expr, call_expr])
+
+    result = visitor._extract_member(leaf, SimpleNamespace(name="v2"), 8, context)
+
+    assert result == "member"
+    assert captured["offset"] == 8
+    assert captured["tinfo"].dstr() == "u64"
+
 def test_extract_member_falls_back_to_char_for_direct_call_context(monkeypatch):
     scanner_module = _load_scanner_module()
     visitor = scanner_module.ScanVisitor.__new__(scanner_module.ScanVisitor)
@@ -447,7 +615,7 @@ def test_extract_member_falls_back_to_char_for_direct_call_context(monkeypatch):
 
     assert result == "member"
     assert captured["tinfo"].dstr() == "char"
-    assert captured["warning"] == "Could not infer argument type from call expression; falling back to char for argument 0 at 0x401234"
+    assert captured["warning"] == "Argument 0 at 0x401234 has incomplete upstream type info; falling back to char"
     assert captured["display_messagebox"] is False
 
 
@@ -498,9 +666,83 @@ def test_extract_member_uses_pointer_fallback_for_call_context(monkeypatch):
 
     assert result == "member"
     assert captured["tinfo"].dstr() == "u8 *"
-    assert captured["warning"] == "Could not infer argument type from call expression; falling back to u8 * for argument 0 at 0x401234"
+    assert captured["warning"] == "Argument 0 at 0x401234 has incomplete upstream type info; falling back to u8 *"
     assert captured["display_messagebox"] is False
 
+
+
+def test_parse_call_uses_expression_type_after_incomplete_prototype(monkeypatch):
+    scanner_module = _load_scanner_module()
+    visitor = scanner_module.ScanVisitor.__new__(scanner_module.ScanVisitor)
+    visitor._deref_tinfo = lambda tinfo: tinfo
+    visitor._describe_tinfo = lambda tinfo: getattr(tinfo, "dstr", lambda: str(tinfo))()
+    debug_messages = []
+
+    incomplete_proto = SimpleNamespace(
+        dstr=lambda: "FixtureScene *",
+        is_ptr=lambda: True,
+        get_pointed_object=lambda: SimpleNamespace(
+            dstr=lambda: "?",
+            get_size=lambda: scanner_module.ida_typeinf.BADSIZE,
+        ),
+    )
+    arg_tinfo = SimpleNamespace(dstr=lambda: "u64 *", get_size=lambda: 8)
+
+    monkeypatch.setattr(scanner_module, "get_func_argument_info", lambda *_args, **_kwargs: (0, incomplete_proto))
+    monkeypatch.setattr(scanner_module, "log_debug", lambda message: debug_messages.append(message))
+
+    result = visitor._parse_call(
+        SimpleNamespace(ea=0x401234),
+        SimpleNamespace(type=arg_tinfo),
+    )
+
+    assert result is arg_tinfo
+    assert debug_messages == [
+        "Prototype type for argument 0 at 0x401234 is incomplete: FixtureScene *",
+        "Using expression type u64 * for argument 0 at 0x401234 after incomplete prototype type",
+    ]
+
+
+def test_infer_data_object_tinfo_uses_sized_byte_array_after_incomplete_guess(monkeypatch):
+    scanner_module = _load_scanner_module()
+    visitor = scanner_module.ScanVisitor.__new__(scanner_module.ScanVisitor)
+    visitor._describe_tinfo = lambda tinfo: getattr(tinfo, "dstr", lambda: str(tinfo))()
+    debug_messages = []
+
+    guessed_tinfo = SimpleNamespace(
+        dstr=lambda: "?",
+        get_size=lambda: scanner_module.ida_typeinf.BADSIZE,
+    )
+    current_tinfo = SimpleNamespace(
+        dstr=lambda: "forward_decl *",
+        is_ptr=lambda: True,
+        get_pointed_object=lambda: SimpleNamespace(
+            dstr=lambda: "struct Widget",
+            get_size=lambda: scanner_module.ida_typeinf.BADSIZE,
+            is_forward_decl=lambda: True,
+        ),
+    )
+    fallback_tinfo = SimpleNamespace(dstr=lambda: "u8[16]")
+
+    monkeypatch.setattr(scanner_module, "log_debug", lambda message: debug_messages.append(message))
+    monkeypatch.setattr(scanner_module.ida_typeinf, "tinfo_t", lambda: guessed_tinfo)
+    monkeypatch.setattr(
+        scanner_module.ida_typeinf,
+        "guess_tinfo",
+        lambda out, _ea: out is guessed_tinfo,
+        raising=False,
+    )
+    monkeypatch.setattr(scanner_module.ida_bytes, "get_item_size", lambda _ea: 16, raising=False)
+    visitor._create_byte_array_tinfo = lambda size: fallback_tinfo if size == 16 else None
+
+    result = visitor._infer_data_object_tinfo(0x5000, current_tinfo)
+
+    assert result is fallback_tinfo
+    assert debug_messages == [
+        "Object type at 0x5000 is incomplete: forward_decl *",
+        "Guessed object type from 0x5000 remained incomplete: ?",
+        "Object type for 0x5000 remained incomplete; falling back to sized byte array u8[16]",
+    ]
 
 def test_to_function_offset_str_uses_stable_fallback_for_non_function():
     hexrays_path = Path(__file__).resolve().parents[2] / "src" / "forge" / "api" / "hexrays.py"

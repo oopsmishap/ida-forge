@@ -427,3 +427,57 @@ def test_recursive_upwards_object_visitor_init_sets_upwards_state(monkeypatch):
     assert visitor._tree == {}
     assert visitor._call_obj is obj
     assert visitor._objects == [obj]
+
+
+def test_recursive_upwards_check_call_only_tracks_matched_argument(monkeypatch):
+    visitor_module = _load_visitor_module()
+    visitor = visitor_module.RecursiveUpwardsObjectVisitor.__new__(
+        visitor_module.RecursiveUpwardsObjectVisitor
+    )
+    visitor._cfunc = SimpleNamespace(
+        entry_ea=0x401000,
+        get_lvars=lambda: [
+            SimpleNamespace(is_arg_var=True),
+            SimpleNamespace(is_arg_var=True),
+        ],
+    )
+    visitor._objects = [SimpleNamespace(name="arg0") ]
+    recorded_visits = []
+    recorded_tree_edges = []
+
+    monkeypatch.setattr(
+        visitor,
+        "_matches_object",
+        lambda _obj, cexpr: cexpr.v.idx == 0,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        visitor_module,
+        "get_argument_index",
+        lambda _cfunc, idx: idx,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        visitor_module,
+        "get_funcs_calling_address",
+        lambda _ea: {0x402000},
+        raising=False,
+    )
+    monkeypatch.setattr(
+        visitor,
+        "_add_visit",
+        lambda func_ea, arg_idx: recorded_visits.append((func_ea, arg_idx)) or True,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        visitor,
+        "_add_scan_tree_info",
+        lambda func_ea, arg_idx: recorded_tree_edges.append((func_ea, arg_idx)),
+        raising=False,
+    )
+
+    visitor._check_call(SimpleNamespace(op=visitor_module.ctype.var, v=SimpleNamespace(idx=1)))
+    visitor._check_call(SimpleNamespace(op=visitor_module.ctype.var, v=SimpleNamespace(idx=0)))
+
+    assert recorded_visits == [(0x401000, 0)]
+    assert recorded_tree_edges == [(0x402000, 0)]

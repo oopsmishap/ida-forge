@@ -28,6 +28,21 @@ class GuessAllocationVisitor(RecursiveUpwardsObjectVisitor):
         super().__init__(cfunc, obj, skip_until_object=True)
         self._data = []
 
+    def _matches_object(self, obj: ScanObject, cexpr) -> bool:
+        base_matcher = getattr(super(), "_matches_object", None)
+        if callable(base_matcher):
+            return base_matcher(obj, cexpr)
+
+        target_matches = getattr(obj, "is_target", None)
+        if callable(target_matches):
+            return target_matches(cexpr)
+
+        obj_ea = getattr(obj, "ea", idaapi.BADADDR)
+        if obj_ea == idaapi.BADADDR:
+            return False
+
+        return obj_ea == find_expr_address(cexpr, getattr(self, "parents", []))
+    
     def _manipulate(self, cexpr, obj: ScanObject):
         if obj.id == ObjectType.local_variable:
             parent = self.parent_expr()
@@ -55,7 +70,6 @@ class GuessAllocationVisitor(RecursiveUpwardsObjectVisitor):
                     "GLOBAL",
                 ]
             )
-
 
     def _finish(self):
         chooser = StructureAllocationChoose(self._data)

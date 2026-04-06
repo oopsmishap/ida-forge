@@ -20,7 +20,8 @@ from forge.api.hexrays import (
     is_legal_type,
     to_hex,
 )
-from forge.api.scan_object import ScanObject, ObjectType
+from forge.api.scan_object import ScanObject, ObjectType, _extract_offset_expression
+from forge.api.tinfo import is_incomplete_tinfo
 from forge.api.types import types
 from forge.api.visitor import (
     DownwardsObjectVisitor,
@@ -162,8 +163,31 @@ class ScannedObject:
             to_hex(self.ea),
         ]
 
+    def identity_key(self) -> tuple[int, int, object, str]:
+        return (
+            self.func_ea,
+            self.ea,
+            getattr(self, "id", None),
+            self.name,
+        )
+
     def __hash__(self):
-        return hash((self.func_ea, self.name, self.ea))
+        return hash(self.identity_key())
+
+    def __eq__(self, other):
+        if other is None:
+            return False
+
+        other_identity_key = getattr(other, "identity_key", None)
+        if callable(other_identity_key):
+            return self.identity_key() == other_identity_key()
+
+        return self.identity_key() == (
+            getattr(other, "func_ea", None),
+            getattr(other, "ea", None),
+            getattr(other, "id", None),
+            getattr(other, "name", None),
+        )
 
     def __repr__(self):
         return f"{self.name} @ {hex(self.ea)}"
@@ -266,16 +290,15 @@ class ScanVisitor(ObjectVisitor):
         return getattr(tinfo, "dstr", lambda: str(tinfo))()
 
     @staticmethod
+    def _describe_call_argument(
+        idx: Optional[int], call_cexpr: ida_hexrays.cexpr_t
+    ) -> str:
+        label = f"argument {idx}" if idx is not None else "unmatched argument"
+        return f"{label} at {to_hex(call_cexpr.ea)}"
+
+    @staticmethod
     def _is_unknown_tinfo(tinfo: Optional[ida_typeinf.tinfo_t]) -> bool:
-        if tinfo is None:
-            return True
-
-        dstr = getattr(tinfo, "dstr", lambda: str(tinfo))()
-        if dstr == "?":
-            return True
-
-        get_size = getattr(tinfo, "get_size", None)
-        return get_size is not None and get_size() == ida_typeinf.BADSIZE
+        return is_incomplete_tinfo(tinfo)
 
     @staticmethod
     def _is_structure_like_tinfo(tinfo: Optional[ida_typeinf.tinfo_t]) -> bool:
@@ -313,6 +336,12 @@ class ScanVisitor(ObjectVisitor):
         if not self._is_unknown_tinfo(current_tinfo):
             return current_tinfo
 
+        if current_tinfo is not None:
+            log_debug(
+                f"Object type at {to_hex(obj_ea)} is incomplete: "
+                f"{self._describe_tinfo(current_tinfo)}"
+            )
+
         guessed_tinfo = ida_typeinf.tinfo_t()
         if ida_typeinf.guess_tinfo(guessed_tinfo, obj_ea):
             if not self._is_unknown_tinfo(guessed_tinfo):
@@ -321,12 +350,17 @@ class ScanVisitor(ObjectVisitor):
                 )
                 return guessed_tinfo
 
+            log_debug(
+                f"Guessed object type from {to_hex(obj_ea)} remained incomplete: "
+                f"{self._describe_tinfo(guessed_tinfo)}"
+            )
+
         item_size = ida_bytes.get_item_size(obj_ea)
         if item_size > 0:
             fallback_tinfo = self._create_byte_array_tinfo(item_size)
             log_debug(
-                f"Falling back to sized byte array for {to_hex(obj_ea)}: "
-                f"{fallback_tinfo.dstr()}"
+                f"Object type for {to_hex(obj_ea)} remained incomplete; "
+                f"falling back to sized byte array {fallback_tinfo.dstr()}"
             )
             return fallback_tinfo
 
@@ -377,7 +411,6 @@ class ScanVisitor(ObjectVisitor):
 
         if offset < 0:
             log_warning(f"Negative offset encountered: {offset}, obj: {to_hex(expr_ea)}")
-            offset = -offset
 
 
         applicable = not self.crippled
@@ -431,7 +464,11 @@ class ScanVisitor(ObjectVisitor):
             if first_parent.y.op != ctype.num:
                 return None
 
-            offset = first_parent.y.numval() * cexpr.type.get_ptrarr_objsize()
+            if first_parent.op == ctype.idx:
+                offset = first_parent.y.numval() * cexpr.type.get_ptrarr_objsize()
+            else:
+                # Hex-Rays add nodes already encode byte offsets.
+                offset = first_parent.y.numval()
             cexpr = self.parent_expr()
             if first_parent.op == ctype.add:
                 context.pop_front()
@@ -440,12 +477,7 @@ class ScanVisitor(ObjectVisitor):
             # `(TYPE)expr + offset`
             if second_parent.y.op != ctype.num:
                 return None
-            if first_parent.type.is_ptr():
-                size = first_parent.type.get_ptrarr_objsize()
-            else:
-                size = 1
-
-            offset = second_parent.theother(first_parent).numval() * size
+            offset = second_parent.theother(first_parent).numval()
             cexpr = second_parent
             context.pop_front(2)
         else:
@@ -514,9 +546,11 @@ class ScanVisitor(ObjectVisitor):
                         assignment_parent.x.type,
                     )
 
+        has_explicit_tinfo = False
         if context.op_at(0) == ctype.cast and context.expr_at(0) is not None:
             # `(TYPE)expr`
             tinfo = context.expr_at(0).type
+            has_explicit_tinfo = True
             cexpr = context.expr_at(0)
             context.pop_front()
         else:
@@ -529,6 +563,7 @@ class ScanVisitor(ObjectVisitor):
                 # `*(TYPE*)expr`
                 # `*(TYPE*)expr[idx]`
                 tinfo = context.expr_at(1).type
+                has_explicit_tinfo = True
                 cexpr = context.expr_at(0)
                 context.pop_front()
             else:
@@ -556,6 +591,8 @@ class ScanVisitor(ObjectVisitor):
                     # ((void (__some_call*)(..., *(TYPE*)(expr + x), ...)
                     log_debug(f"object passed as argument to function at {hex(second_expr.ea)}")
                     return self._get_member(offset, cexpr, obj, first_expr.type)
+                if has_explicit_tinfo:
+                    return self._get_member(offset, cexpr, obj, tinfo)
                 tinfo = self._parse_call(second_expr, first_expr, types["u8"].ptr)
                 return self._get_member(offset, cexpr, obj, tinfo)
 
@@ -565,6 +602,8 @@ class ScanVisitor(ObjectVisitor):
             log_debug(
                 f"function call with cast, parent: {call_parent.type.dstr()} {call_parent.dstr()}, cexpr: {cexpr.type.dstr()} {cexpr.dstr()}"
             )
+            if has_explicit_tinfo:
+                return self._get_member(offset, cexpr, obj, tinfo)
             tinfo = self._parse_call(call_parent, cexpr, types["char"].type)
             return self._get_member(offset, cexpr, obj, tinfo)
 
@@ -631,63 +670,46 @@ class ScanVisitor(ObjectVisitor):
     ) -> Optional[ida_typeinf.tinfo_t]:
         """Infer the argument type used at a call site."""
         idx, tinfo = get_func_argument_info(call_cexpr, arg_cexpr)
-        if tinfo is not None:
-            log_debug(f"Argument {idx} type: {tinfo.dstr()}")
+        argument_context = self._describe_call_argument(idx, call_cexpr)
+
+        if tinfo is not None and not self._is_unknown_tinfo(tinfo):
+            log_debug(
+                f"Recovered prototype type {self._describe_tinfo(tinfo)} for {argument_context}"
+            )
             return self._deref_tinfo(tinfo)
+
+        if tinfo is not None:
+            log_debug(
+                f"Prototype type for {argument_context} is incomplete: "
+                f"{self._describe_tinfo(tinfo)}"
+            )
+        elif idx is None:
+            log_debug(f"Could not match {argument_context} to a callable prototype")
 
         arg_tinfo = getattr(arg_cexpr, "type", None)
         if not self._is_unknown_tinfo(arg_tinfo):
+            reason = "incomplete prototype type" if tinfo is not None else "no prototype match"
             log_debug(
-                "Could not infer argument type from call expression; "
-                f"using expression type {self._describe_tinfo(arg_tinfo)} "
-                f"for argument {idx} at {to_hex(call_cexpr.ea)}"
+                f"Using expression type {self._describe_tinfo(arg_tinfo)} for "
+                f"{argument_context} after {reason}"
             )
             return self._deref_tinfo(arg_tinfo)
 
         if fallback_tinfo is not None:
             log_warning(
-                "Could not infer argument type from call expression; "
-                f"falling back to {self._describe_tinfo(fallback_tinfo)} for argument {idx} at {to_hex(call_cexpr.ea)}"
+                f"{argument_context.capitalize()} has incomplete upstream type info; "
+                f"falling back to {self._describe_tinfo(fallback_tinfo)}"
             )
             return fallback_tinfo
 
         log_warning(
-            "Could not infer argument type from call expression; "
-            f"falling back to char for argument {idx} at {to_hex(call_cexpr.ea)}"
+            f"{argument_context.capitalize()} has incomplete upstream type info; "
+            "falling back to char"
         )
         return types["char"].type
 
     def _parse_left_assignee(self, x, offset, scale: int = 1):
-        if x is None:
-            return None
-
-        if x.op == ctype.cast and getattr(x, "x", None) is not None:
-            return self._parse_left_assignee(x.x, offset, scale)
-
-        if x.op in (ctype.ptr, ctype.idx) and getattr(x, "x", None) is not None:
-            next_scale = scale
-            x_type = getattr(x, "type", None)
-            get_ptrarr_objsize = getattr(x_type, "get_ptrarr_objsize", None)
-            if callable(get_ptrarr_objsize):
-                try:
-                    next_scale = get_ptrarr_objsize() or scale
-                except Exception:
-                    next_scale = scale
-
-            index_expr = getattr(x, "y", None)
-            if x.op == ctype.idx and index_expr is not None and index_expr.op == ctype.num:
-                return self._parse_left_assignee(
-                    x.x, offset + index_expr.numval() * next_scale, next_scale
-                )
-            return self._parse_left_assignee(x.x, offset, next_scale)
-
-        if x.op == ctype.add and getattr(x, "x", None) is not None and getattr(x, "y", None) is not None:
-            if x.x.op == ctype.num:
-                return self._parse_left_assignee(x.y, offset + x.x.numval() * scale, scale)
-            if x.y.op == ctype.num:
-                return self._parse_left_assignee(x.x, offset + x.y.numval() * scale, scale)
-
-        return (x, offset)
+        return _extract_offset_expression(x, offset, scale, ctype)
 
 
 

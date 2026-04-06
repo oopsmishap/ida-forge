@@ -13,7 +13,7 @@ import ida_lines
 import ida_funcs
 import idaapi
 
-from forge.util.qt import QtCore, QtGui, QtWidgets, qt_exec
+from forge.util.qt import QtCore, QtGui, QtWidgets, qt_exec, qt_item_flags
 from .ui_form import Ui_view_form
 
 QSignalBlocker = QtCore.QSignalBlocker
@@ -65,8 +65,10 @@ class StructureBuilderForm(ChildScanMixin, ida_kernwin.PluginForm):
         self.current_structure: Structure | None = None
         self.layout = None
         self._shortcut_actions: list[QtGui.QAction] = []
-
+        self._last_table_selection_signature: tuple | None = None
     def show(self):
+        if self.ui is not None and not self._qt_widget_alive(self.ui):
+            self._reset_ui_state()
         return ida_kernwin.PluginForm.Show(self, "Structure Builder")
 
     def OnCreate(self, form):
@@ -81,6 +83,83 @@ class StructureBuilderForm(ChildScanMixin, ida_kernwin.PluginForm):
         self._install_shortcuts()
         self.update_action_states()
         self.update_structure_fields()
+
+    def OnClose(self, _form):
+        self._reset_ui_state()
+
+    def _reset_ui_state(self) -> None:
+        self.parent = None
+        self.ui = None
+        self.layout = None
+        self._shortcut_actions.clear()
+        self._last_table_selection_signature = None
+
+    @staticmethod
+    def _qt_widget_alive(widget) -> bool:
+        if widget is None:
+            return False
+        try:
+            object_name = getattr(widget, "objectName", None)
+            if callable(object_name):
+                object_name()
+            return True
+        except RuntimeError:
+            return False
+
+    def _get_table_widget(self):
+        if not self._qt_widget_alive(self.ui):
+            self._reset_ui_state()
+            return None
+
+        table = getattr(self.ui, "tbl_structure", None)
+        if not self._qt_widget_alive(table):
+            self._reset_ui_state()
+            return None
+        return table
+
+    def _get_tree_widget(self):
+        if not self._qt_widget_alive(self.ui):
+            self._reset_ui_state()
+            return None
+
+        tree = getattr(self.ui, "tree_structures", None)
+        if not self._qt_widget_alive(tree):
+            self._reset_ui_state()
+            return None
+        return tree
+
+    def ensure_ui(self) -> bool:
+        if self._get_table_widget() is not None and self._get_tree_widget() is not None:
+            return True
+
+        self._reset_ui_state()
+        self.show()
+        return self._get_table_widget() is not None and self._get_tree_widget() is not None
+
+    def _structure_table_selection_signature(self) -> tuple | None:
+        table = self._get_table_widget()
+        if table is None:
+            return None
+
+        try:
+            selected_rows = tuple(self.get_selected_rows())
+            return (
+                getattr(self.current_structure, "name", None),
+                selected_rows,
+                table.currentRow(),
+                table.currentColumn(),
+            )
+        except RuntimeError:
+            self._reset_ui_state()
+            return None
+
+    def _handle_structure_table_selection_change(self, *_args) -> None:
+        signature = self._structure_table_selection_signature()
+        if signature is not None and signature == self._last_table_selection_signature:
+            return
+        self._last_table_selection_signature = signature
+        self.update_action_states()
+
 
     def _connect_signals(self) -> None:
         self.ui.btn_add.clicked.connect(self.add_structure)
@@ -121,12 +200,14 @@ class StructureBuilderForm(ChildScanMixin, ida_kernwin.PluginForm):
             self.structure_table_interaction
         )
         self.ui.tbl_structure.itemChanged.connect(self.structure_table_item_changed)
-        self.ui.tbl_structure.itemSelectionChanged.connect(self.update_action_states)
+        self.ui.tbl_structure.itemSelectionChanged.connect(
+            self._handle_structure_table_selection_change
+        )
         self.ui.tbl_structure.currentCellChanged.connect(
-            lambda *_args: self.update_action_states()
+            self._handle_structure_table_selection_change
         )
         self.ui.tbl_structure.cellClicked.connect(
-            lambda *_args: self.update_action_states()
+            self._handle_structure_table_selection_change
         )
         self.ui.tbl_structure.setContextMenuPolicy(Qt.CustomContextMenu)
         self.ui.tbl_structure.customContextMenuRequested.connect(
@@ -313,22 +394,27 @@ class StructureBuilderForm(ChildScanMixin, ida_kernwin.PluginForm):
     @staticmethod
     def _make_table_item(text: str, editable: bool = False) -> QTableWidgetItem:
         item = QTableWidgetItem(text)
-        flags = Qt.ItemIsSelectable | Qt.ItemIsEnabled
+        flags = qt_item_flags(Qt.ItemIsSelectable, Qt.ItemIsEnabled)
         if editable:
-            flags |= Qt.ItemIsEditable
+            flags = qt_item_flags(flags, Qt.ItemIsEditable)
         item.setFlags(flags)
         return item
 
     def get_selected_rows(self) -> list[int]:
-        if self.ui is None:
+        table = self._get_table_widget()
+        if table is None:
             return []
 
-        rows = sorted({index.row() for index in self.ui.tbl_structure.selectedIndexes()})
-        if rows:
-            return rows
+        try:
+            rows = sorted({index.row() for index in table.selectedIndexes()})
+            if rows:
+                return rows
 
-        current_row = self.ui.tbl_structure.currentRow()
-        return [current_row] if current_row >= 0 else []
+            current_row = table.currentRow()
+            return [current_row] if current_row >= 0 else []
+        except RuntimeError:
+            self._reset_ui_state()
+            return []
 
     def normalize_rows(self, rows) -> list[int]:
         if rows is None:
@@ -352,10 +438,10 @@ class StructureBuilderForm(ChildScanMixin, ida_kernwin.PluginForm):
         return members[0] if members else None
 
     def _restore_selected_rows(self, selected_rows: set[int]) -> None:
-        if self.ui is None:
+        table = self._get_table_widget()
+        if table is None:
             return
 
-        table = self.ui.tbl_structure
         table.clearSelection()
         for row in sorted(selected_rows):
             if 0 <= row < table.rowCount():
@@ -542,15 +628,16 @@ class StructureBuilderForm(ChildScanMixin, ida_kernwin.PluginForm):
         return True
 
     def _current_tree_structure(self) -> Structure | None:
-        if self.ui is None:
+        tree = self._get_tree_widget()
+        if tree is None:
             return None
-        return self._tree_item_structure(self.ui.tree_structures.currentItem())
+        return self._tree_item_structure(tree.currentItem())
 
     def reload_structure_list(self):
-        if self.ui is None:
+        tree = self._get_tree_widget()
+        if tree is None:
             return
 
-        tree = self.ui.tree_structures
         current_name = self.current_structure.name if self.current_structure else None
 
         blocker = QSignalBlocker(tree)
@@ -837,72 +924,75 @@ class StructureBuilderForm(ChildScanMixin, ida_kernwin.PluginForm):
         self.update_structure_fields()
 
     def update_structure_fields(self):
-        if self.ui is None:
+        table = self._get_table_widget()
+        if table is None or self.ui is None:
             return
 
         selected_rows = set(self.get_selected_rows())
-        scroll_value = self.ui.tbl_structure.verticalScrollBar().value()
+        if self.ui is None:
+            return
+        scroll_value = table.verticalScrollBar().value()
 
-        blocker = QSignalBlocker(self.ui.tbl_structure)
+        blocker = QSignalBlocker(table)
         try:
             if self.current_structure is None:
-                self.ui.tbl_structure.setRowCount(0)
-                self.ui.tbl_structure.setDisabled(True)
+                table.setRowCount(0)
+                table.setDisabled(True)
                 self.ui.input_name.setText("")
             else:
                 self.current_structure.refresh_collisions()
-                self.ui.tbl_structure.setEnabled(True)
+                table.setEnabled(True)
                 self.ui.input_name.setText(self.current_structure.name)
-                self.ui.tbl_structure.setRowCount(len(self.current_structure.members))
+                table.setRowCount(len(self.current_structure.members))
 
                 for row, member in enumerate(self.current_structure.members):
-                    self.ui.tbl_structure.setItem(
+                    table.setItem(
                         row,
                         Column.offset,
                         self._make_table_item(
                             f"0x{member.offset:04X} [{hex(member.size)}]"
                         ),
                     )
-                    self.ui.tbl_structure.setItem(
+                    table.setItem(
                         row,
                         Column.type,
                         self._make_table_item(self._format_type_name(member)),
                     )
-                    self.ui.tbl_structure.setItem(
+                    table.setItem(
                         row,
                         Column.name,
                         self._make_table_item(member.name, editable=True),
                     )
-                    self.ui.tbl_structure.setItem(
+                    table.setItem(
                         row,
                         Column.score,
                         self._make_table_item(str(member.score)),
                     )
-                    self.ui.tbl_structure.setItem(
+                    table.setItem(
                         row,
                         Column.comment,
                         self._make_table_item(member.comment, editable=True),
                     )
 
                     if self.current_structure.main_offset == member.offset:
-                        self.ui.tbl_structure.item(row, Column.offset).setBackground(
+                        table.item(row, Column.offset).setBackground(
                             QColor(config["form"]["origin_color"])
                         )
 
                     if not member.enabled:
                         set_row_background_color(
-                            self.ui.tbl_structure,
+                            table,
                             row,
                             QColor(config["form"]["disabled_color"]),
                         )
                     elif self.current_structure.has_collision(row):
                         set_row_background_color(
-                            self.ui.tbl_structure,
+                            table,
                             row,
                             QColor(config["form"]["collision_background_color"]),
                         )
                         set_row_foreground_color(
-                            self.ui.tbl_structure,
+                            table,
                             row,
                             QColor(config["form"]["collision_foreground_color"]),
                         )
@@ -910,28 +1000,42 @@ class StructureBuilderForm(ChildScanMixin, ida_kernwin.PluginForm):
             del blocker
 
         self._restore_selected_rows(selected_rows)
-        self.ui.tbl_structure.verticalScrollBar().setValue(scroll_value)
+        table = self._get_table_widget()
+        if table is None:
+            return
+        table.verticalScrollBar().setValue(scroll_value)
         self.update_action_states()
 
     def update_action_states(self):
-        if self.ui is None:
+        if not self._qt_widget_alive(self.ui):
+            self._reset_ui_state()
             return
 
         has_structure = self.current_structure is not None
         has_members = has_structure and bool(self.current_structure.members)
-        has_selection = bool(self.get_selected_rows())
+        selection_rows = self.get_selected_rows()
+        has_selection = bool(selection_rows)
         selected_member = self.get_selected_member()
+        if self.ui is None:
+            return
+
         linked_child_name = (
             getattr(selected_member, "linked_child_structure_name", None)
             if selected_member is not None
             else None
-)
+        )
         can_open_linked_child = bool(
             linked_child_name and linked_child_name in self.structures
         )
         has_child_relationships = has_structure and bool(
             self.current_structure.child_relationships
         )
+        child_scan_plan = (
+            self._build_child_scan_plan(selected_member)
+            if selected_member is not None
+            else None
+        )
+        can_scan_child = child_scan_plan is not None
 
         self.ui.btn_remove.setEnabled(has_structure)
         self.ui.btn_duplicate_structure.setEnabled(has_structure)
@@ -954,8 +1058,6 @@ class StructureBuilderForm(ChildScanMixin, ida_kernwin.PluginForm):
         self.ui.btn_duplicate_row.setEnabled(has_selection)
         self.ui.btn_edit_row.setEnabled(has_selection)
 
-        can_scan_child = self._build_child_scan_plan(selected_member) is not None
-
         self.ui.btn_scan_child.setEnabled(can_scan_child)
         self.ui.btn_open_child.setEnabled(can_open_linked_child)
         self.ui.btn_create_child_types.setEnabled(has_child_relationships)
@@ -972,7 +1074,7 @@ class StructureBuilderForm(ChildScanMixin, ida_kernwin.PluginForm):
         self.ui.action_create_child_types.setEnabled(has_child_relationships)
         self.ui.action_create_subtree_types.setEnabled(has_child_relationships)
 
-        selection_count = len(self.get_selected_rows())
+        selection_count = len(selection_rows)
         self.ui.btn_edit_row.setText(
             "Edit Rows" if selection_count > 1 else "Edit Row"
         )
@@ -981,7 +1083,8 @@ class StructureBuilderForm(ChildScanMixin, ida_kernwin.PluginForm):
         )
 
         self._update_summary_label()
-        self._update_inspector_panel()
+        self._update_inspector_panel(selected_member, child_scan_plan)
+        self._last_table_selection_signature = self._structure_table_selection_signature()
 
     def _update_summary_label(self) -> None:
         if self.current_structure is None:
@@ -997,7 +1100,11 @@ class StructureBuilderForm(ChildScanMixin, ida_kernwin.PluginForm):
             f"Origin: 0x{stats.origin_offset:X} | Selected: {selection_count}"
         )
 
-    def _update_inspector_panel(self) -> None:
+    def _update_inspector_panel(
+        self,
+        selected_member: AbstractMember | None = None,
+        child_scan_plan=None,
+    ) -> None:
         if self.current_structure is None:
             self.ui.lbl_provenance.setText("Provenance: -")
             self.ui.lbl_root_info.setText("Root: -")
@@ -1007,7 +1114,11 @@ class StructureBuilderForm(ChildScanMixin, ida_kernwin.PluginForm):
             self.ui.lbl_type_status.setText("Type Status: -")
             return
 
-        selected_member = self.get_selected_member()
+        if selected_member is None:
+            selected_member = self.get_selected_member()
+        if child_scan_plan is None and selected_member is not None:
+            child_scan_plan = self._build_child_scan_plan(selected_member)
+
         self.ui.lbl_provenance.setText(
             f"Provenance: {self._format_structure_provenance(self.current_structure)}"
         )
@@ -1023,7 +1134,7 @@ class StructureBuilderForm(ChildScanMixin, ida_kernwin.PluginForm):
             f"{self._format_relationships(self.current_structure.child_relationships, direction='child')}"
         )
         self.ui.lbl_selected_member_info.setText(
-            f"Selected Row: {self._format_selected_member_info(selected_member)}"
+            f"Selected Row: {self._format_selected_member_info(selected_member, child_scan_ready=child_scan_plan is not None)}"
         )
         self.ui.lbl_type_status.setText(
             f"Type Status: {self._format_type_status(self.current_structure)}"
@@ -1069,7 +1180,12 @@ class StructureBuilderForm(ChildScanMixin, ida_kernwin.PluginForm):
             )
         return "; ".join(sorted(labels))
 
-    def _format_selected_member_info(self, member: AbstractMember | None) -> str:
+    def _format_selected_member_info(
+        self,
+        member: AbstractMember | None,
+        *,
+        child_scan_ready: bool = False,
+    ) -> str:
         if member is None:
             return "-"
 
@@ -1091,11 +1207,13 @@ class StructureBuilderForm(ChildScanMixin, ida_kernwin.PluginForm):
                 child_label += " [missing]"
             parts.append(child_label)
 
-        scanned_variables = getattr(member, "scanned_variables", None)
+        scanned_variables = Structure.dedupe_scanned_variables(
+            getattr(member, "scanned_variables", ())
+        )
         if scanned_variables:
             parts.append(f"uses {len(scanned_variables)}")
 
-        if self._build_child_scan_plan(member) is not None:
+        if child_scan_ready:
             parts.append("child scan ready")
 
         return " | ".join(parts)
@@ -1696,7 +1814,9 @@ class StructureBuilderForm(ChildScanMixin, ida_kernwin.PluginForm):
 
         for row, member in enumerate(members):
             scanned_variables = sorted(
-                getattr(member, "scanned_variables", set()),
+                Structure.dedupe_scanned_variables(
+                    getattr(member, "scanned_variables", set())
+                ),
                 key=lambda scan_object: (
                     getattr(scan_object, "func_ea", idaapi.BADADDR),
                     getattr(scan_object, "ea", idaapi.BADADDR),
@@ -1772,6 +1892,14 @@ class StructureBuilderForm(ChildScanMixin, ida_kernwin.PluginForm):
 
         self.current_structure.auto_resolve()
         self.update_structure_fields()
+
+        # Auto-resolve is a whole-table action; leaving stale row selection behind
+        # can repaint rows with the inactive selection brush (white on some themes).
+        if self.ui is not None:
+            self.ui.tbl_structure.clearSelection()
+            if hasattr(self.ui.tbl_structure, "setCurrentCell"):
+                self.ui.tbl_structure.setCurrentCell(-1, -1)
+            self.update_action_states()
 
     def structure_table_finalize(self):
         if self.current_structure is None:

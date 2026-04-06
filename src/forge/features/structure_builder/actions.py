@@ -76,6 +76,7 @@ class StructureBuilderAction(HexRaysPopupAction):
     @staticmethod
     def _ensure_structure_selected() -> bool:
         if structure_form.current_structure is not None:
+            structure_form.ensure_ui()
             return True
 
         structure_form.show()

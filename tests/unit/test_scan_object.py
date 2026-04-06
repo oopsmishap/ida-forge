@@ -13,7 +13,8 @@ from forge.api.scan_object import (
     StructurePointerObject,
     StructureReferenceObject,
     VariableObject,
- )
+    _extract_offset_expression,
+)
 
 
 class FakeType:
@@ -261,6 +262,70 @@ def test_call_argument_object_create_scan_object_preserves_numeric_offset(monkey
     assert isinstance(derived, StructureReferenceObject)
     assert derived.struct_name == "FixtureScene"
 
+
+def test_extract_offset_expression_handles_cast_ref_add_and_subtraction():
+    add_expr = FakeExpr(
+        ctype.cast,
+        x=FakeExpr(ctype.ref, x=FakeExpr(ctype.add, x=FakeExpr(ctype.var), y=FakeNumberExpr(8))),
+    )
+    sub_expr = FakeExpr(ctype.sub, x=FakeExpr(ctype.var), y=FakeNumberExpr(8))
+
+    add_base, add_offset = _extract_offset_expression(add_expr)
+    sub_base, sub_offset = _extract_offset_expression(sub_expr)
+
+    assert add_base.op == ctype.var
+    assert add_offset == 8
+    assert sub_base.op == ctype.var
+    assert sub_offset == -8
+
+
+def test_extract_offset_expression_handles_scaled_index_and_direct_members():
+    idx_expr = FakeExpr(
+        ctype.idx,
+        x=FakeExpr(ctype.var),
+        y=FakeNumberExpr(2),
+        type=SimpleNamespace(get_ptrarr_objsize=lambda: 8),
+    )
+    memptr_expr = FakeExpr(ctype.memptr, m=4, x=FakeExpr(ctype.var))
+    memref_expr = FakeExpr(ctype.memref, m=12, x=FakeExpr(ctype.var))
+
+    idx_base, idx_offset = _extract_offset_expression(idx_expr)
+    ptr_base, ptr_offset = _extract_offset_expression(memptr_expr)
+    ref_base, ref_offset = _extract_offset_expression(memref_expr)
+
+    assert idx_base.op == ctype.var
+    assert idx_offset == 16
+    assert ptr_base.op == ctype.var
+    assert ptr_offset == 4
+    assert ref_base.op == ctype.var
+    assert ref_offset == 12
+
+
+def test_call_argument_object_create_scan_object_handles_pointer_wrapped_offset(monkeypatch):
+    base = SimpleNamespace(
+        tinfo=FakeType("FixtureScene *", pointed=FakeType("FixtureScene")),
+        name="this",
+        ea=0x10,
+    )
+    monkeypatch.setattr(ScanObject, "create", staticmethod(lambda _cfunc, expr: base if expr is not None else None))
+
+    inner = FakeExpr(
+        ctype.cast,
+        x=FakeExpr(
+            ctype.ptr,
+            x=FakeExpr(ctype.add, x=FakeExpr(ctype.var), y=FakeNumberExpr(8)),
+            type=SimpleNamespace(get_ptrarr_objsize=lambda: 8),
+        ),
+    )
+    call = FakeExpr(ctype.call, a=[inner])
+    obj = CallArgumentObject(0x1000, 0)
+
+    derived = obj.create_scan_object(FakeCfunc([]), call)
+
+    assert isinstance(derived, StructureReferenceObject)
+    assert derived.struct_name == "FixtureScene"
+    assert derived.offset == 8
+
 def test_scan_object_create_sets_scan_root_provenance(monkeypatch):
     cfunc = FakeCfunc([FakeLvar("arg0")], entry_ea=0x401000)
     monkeypatch.setattr(ScanObject, "get_expression_address", staticmethod(lambda _cfunc, expr: expr.ea))
@@ -304,6 +369,29 @@ def test_make_offset_scan_object_inherits_scan_root_provenance(monkeypatch):
 
 
 
+def test_variable_object_hash_uses_function_context_from_create(monkeypatch):
+    cfunc = FakeCfunc([FakeLvar("arg0")], entry_ea=0x1234)
+    monkeypatch.setattr(
+        ScanObject,
+        "get_expression_address",
+        staticmethod(lambda _cfunc, expr: expr.ea),
+    )
+
+    expr = FakeExpr(ctype.var, v=SimpleNamespace(idx=0), ea=0x401234)
+    obj = ScanObject.create(cfunc, expr)
+
+    assert obj.func_ea == 0x1234
+    assert hash(obj) == hash((obj.id, obj.name, 0x1234, 0x401234))
+
+
+def test_variable_object_hash_is_safe_without_function_context():
+    obj = VariableObject(FakeLvar("arg0"), 0)
+    obj.ea = 0x401234
+
+    assert obj.func_ea == -1
+    assert hash(obj) == hash((obj.id, obj.name, -1, 0x401234))
+
+
 def test_call_argument_object_create_populates_name_and_tinfo():
     cfunc = FakeCfunc([FakeLvar("arg0")], entry_ea=0x1234)
     obj = CallArgumentObject.create(cfunc, 0)
@@ -337,6 +425,75 @@ def test_memory_allocation_object_create_handles_direct_and_casted_calls(monkeyp
     assert via_cast.scan_root_function_name == "sub_1000"
 
 
+
+
+def test_memory_allocation_object_create_multiplies_calloc_size(monkeypatch):
+    import ida_name
+
+    monkeypatch.setattr(ida_name, "get_short_name", lambda _ea: "calloc")
+    monkeypatch.setattr(
+        ScanObject,
+        "get_expression_address",
+        staticmethod(lambda _cfunc, expr: expr.ea),
+    )
+    call = FakeExpr(
+        ctype.call,
+        x=SimpleNamespace(obj_ea=0x5000),
+        a=[FakeNumberExpr(1), FakeNumberExpr(0x2C)],
+        ea=0x77,
+    )
+
+    obj = MemoryAllocationObject.create(FakeCfunc([]), call)
+
+    assert obj is not None
+    assert obj.name == "calloc"
+    assert obj.size == 0x2C
+
+
+def test_memory_allocation_object_create_uses_windows_heapalloc_size_argument(monkeypatch):
+    import ida_name
+
+    monkeypatch.setattr(ida_name, "get_short_name", lambda _ea: "HeapAlloc")
+    monkeypatch.setattr(
+        ScanObject,
+        "get_expression_address",
+        staticmethod(lambda _cfunc, expr: expr.ea),
+    )
+    call = FakeExpr(
+        ctype.call,
+        x=SimpleNamespace(obj_ea=0x5000),
+        a=[FakeNumberExpr(0), FakeNumberExpr(0), FakeNumberExpr(0x38)],
+        ea=0x66,
+    )
+
+    obj = MemoryAllocationObject.create(FakeCfunc([]), call)
+
+    assert obj is not None
+    assert obj.name == "HeapAlloc"
+    assert obj.size == 0x38
+
+
+def test_memory_allocation_object_create_supports_prefixed_linux_kernel_allocators(monkeypatch):
+    import ida_name
+
+    monkeypatch.setattr(ida_name, "get_short_name", lambda _ea: "j___imp_kmalloc_array@12")
+    monkeypatch.setattr(
+        ScanObject,
+        "get_expression_address",
+        staticmethod(lambda _cfunc, expr: expr.ea),
+    )
+    call = FakeExpr(
+        ctype.call,
+        x=SimpleNamespace(obj_ea=0x5000),
+        a=[FakeNumberExpr(2), FakeNumberExpr(0x20), FakeNumberExpr(0)],
+        ea=0x55,
+    )
+
+    obj = MemoryAllocationObject.create(FakeCfunc([]), call)
+
+    assert obj is not None
+    assert obj.name == "j___imp_kmalloc_array@12"
+    assert obj.size == 0x40
 
 
 def test_memory_allocation_object_create_returns_zero_for_non_numeric_size(monkeypatch):

@@ -50,6 +50,53 @@ def _stub_guess_allocation_dependencies(monkeypatch):
     yield
 
 
+def test_guess_allocation_matches_object_without_base_helper(monkeypatch):
+    cfunc = SimpleNamespace(
+        entry_ea=0x401000,
+        body=SimpleNamespace(find_parent_of=lambda expr: None),
+    )
+    obj = SimpleNamespace(id=ObjectType.local_variable, ea=0x5000, name="arg0")
+
+    visitor = guess_allocation_module.GuessAllocationVisitor(cfunc, obj)
+    monkeypatch.setattr(
+        guess_allocation_module,
+        "find_expr_address",
+        lambda _cexpr, _parents: 0x5000,
+    )
+
+    assert visitor._matches_object(obj, SimpleNamespace(ea=0x5000)) is True
+
+
+def test_guess_allocation_records_heap_assignment(monkeypatch):
+    cfunc = SimpleNamespace(
+        entry_ea=0x401000,
+        body=SimpleNamespace(find_parent_of=lambda expr: None),
+    )
+    obj = SimpleNamespace(id=ObjectType.local_variable, ea=0x5000, name="v1")
+
+    visitor = guess_allocation_module.GuessAllocationVisitor(cfunc, obj)
+    monkeypatch.setattr(
+        guess_allocation_module,
+        "ctype",
+        SimpleNamespace(asg=1, ref=2),
+    )
+    monkeypatch.setattr(
+        visitor,
+        "parent_expr",
+        lambda: SimpleNamespace(op=guess_allocation_module.ctype.asg, y=SimpleNamespace()),
+    )
+    monkeypatch.setattr(
+        guess_allocation_module.MemoryAllocationObject,
+        "create",
+        lambda _cfunc, _expr: SimpleNamespace(ea=0x401010),
+    )
+    monkeypatch.setattr(visitor, "get_line", lambda: "v1 = calloc(...)")
+
+    visitor._manipulate(SimpleNamespace(), obj)
+
+    assert visitor._data == [[0x401010, "v1", "v1 = calloc(...)", "HEAP"]]
+
+
 def test_guess_allocation_skips_when_parent_expression_is_missing(monkeypatch):
     cfunc = SimpleNamespace(
         entry_ea=0x401000,

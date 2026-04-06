@@ -600,6 +600,9 @@ class RecursiveUpwardsObjectVisitor(RecursiveObjectVisitor, UpwardsObjectVisitor
     def _check_call(self, cexpr: ida_hexrays.cexpr_t):
         if cexpr.op != ctype.var:
             return
+        if not any(self._matches_object(obj, cexpr) for obj in self._objects):
+            return
+
         lvars = self._cfunc.get_lvars()
         if cexpr.v.idx < 0 or cexpr.v.idx >= len(lvars):
             return

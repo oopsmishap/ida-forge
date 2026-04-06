@@ -1,4 +1,5 @@
 from enum import Enum
+import re
 import traceback
 
 import ida_hexrays
@@ -9,6 +10,67 @@ import ida_name
 from forge.api.hexrays import get_member_name, ctype
 from forge.util.logging import log_debug
 TYPE_IGNORED_TOKENS = {"const", "volatile", "struct", "class", "union", "&"}
+
+_ALLOCATOR_NAME_PREFIXES = ("j_", "imp_", "thunk_")
+_SINGLE_SIZE_ALLOCATORS = {
+    # ISO / POSIX / CRT
+    "malloc": 0,
+    "malloc_base": 0,
+    "realloc": 1,
+    "realloc_base": 1,
+    "aligned_alloc": 1,
+    "memalign": 1,
+    "valloc": 0,
+    "pvalloc": 0,
+    "aligned_malloc": 0,
+    "aligned_offset_malloc": 0,
+    "aligned_realloc": 1,
+    "aligned_offset_realloc": 1,
+    # C++
+    "new": 0,
+    "new[]": 0,
+    "operatornew": 0,
+    "operatornew[]": 0,
+    "operator_new": 0,
+    "operator_new[]": 0,
+    # GLib
+    "g_malloc": 0,
+    "g_malloc0": 0,
+    "g_try_malloc": 0,
+    "g_try_malloc0": 0,
+    "g_realloc": 1,
+    # Linux kernel
+    "kmalloc": 0,
+    "kzalloc": 0,
+    "krealloc": 1,
+    # Win32 / NT heap APIs
+    "heapalloc": 2,
+    "heaprealloc": 3,
+    "localalloc": 1,
+    "globalalloc": 1,
+    "cotaskmemalloc": 0,
+    "rtlallocateheap": 2,
+    "rtlreallocateheap": 3,
+    "exallocatepool": 1,
+    "exallocatepoolwithtag": 1,
+    "exallocatepool2": 1,
+}
+_PRODUCT_SIZE_ALLOCATORS = {
+    # ISO / CRT
+    "calloc": (0, 1),
+    "calloc_base": (0, 1),
+    "recalloc": (1, 2),
+    "recalloc_base": (1, 2),
+    "reallocarray": (1, 2),
+    # GLib
+    "g_malloc_n": (0, 1),
+    "g_malloc0_n": (0, 1),
+    "g_realloc_n": (1, 2),
+    # Linux kernel
+    "kcalloc": (0, 1),
+    "kmalloc_array": (0, 1),
+}
+
 
 
 def _type_identity_key(name: str) -> str:
@@ -47,40 +109,77 @@ def _strip_casts_and_refs(expr):
 
 
 
-def _extract_offset_expression(expr):
-    offset = 0
+def _extract_offset_expression(expr, offset: int = 0, scale: int = 1, ctype_ops=None):
+    if ctype_ops is None:
+        ctype_ops = ctype
+
+    cast_op = getattr(ctype_ops, "cast", None)
+    ref_op = getattr(ctype_ops, "ref", None)
+    memref_op = getattr(ctype_ops, "memref", None)
+    memptr_op = getattr(ctype_ops, "memptr", None)
+    ptr_op = getattr(ctype_ops, "ptr", None)
+    idx_op = getattr(ctype_ops, "idx", None)
+    add_op = getattr(ctype_ops, "add", None)
+    sub_op = getattr(ctype_ops, "sub", None)
+    num_op = getattr(ctype_ops, "num", None)
+
+    def strip_wrappers(value):
+        while value is not None and hasattr(value, "op") and value.op in (cast_op, ref_op):
+            value = value.x
+        return value
+
     current = expr
-    while current is not None and hasattr(current, "op") and current.op in (ctype.cast, ctype.ref):
+    while current is not None and hasattr(current, "op") and current.op in (cast_op, ref_op):
         current = current.x
-    while current is not None and hasattr(current, "op") and current.op in (ctype.add, ctype.sub, ctype.idx):
 
-        if current.op == ctype.idx:
-            if not hasattr(current, "y") or current.y is None:
-                current = _strip_casts_and_refs(getattr(current, "x", None))
-                continue
-            if current.y.op != ctype.num:
+    while current is not None and hasattr(current, "op"):
+        if current.op in (memref_op, memptr_op):
+            base = getattr(current, "x", None)
+            if base is None:
                 return None, None
-            offset += current.y.numval()
-            current = _strip_casts_and_refs(current.x)
+            return base, offset + getattr(current, "m", 0)
+
+        if current.op in (ptr_op, idx_op):
+            next_scale = scale
+            current_type = getattr(current, "type", None)
+            get_ptrarr_objsize = getattr(current_type, "get_ptrarr_objsize", None)
+            if callable(get_ptrarr_objsize):
+                try:
+                    next_scale = get_ptrarr_objsize() or scale
+                except Exception:
+                    next_scale = scale
+
+            index_expr = getattr(current, "y", None)
+            if current.op == idx_op and index_expr is not None and getattr(index_expr, "op", None) == num_op:
+                offset += index_expr.numval() * next_scale
+
+            current = strip_wrappers(getattr(current, "x", None))
+            scale = next_scale
             continue
 
-        if not hasattr(current, "x") or not hasattr(current, "y"):
-            current = _strip_casts_and_refs(getattr(current, "x", None))
+        if current.op in (add_op, sub_op):
+            # Hex-Rays add/sub nodes already encode byte deltas; only idx carries
+            # element-size scaling.
+            left = strip_wrappers(getattr(current, "x", None))
+            right = strip_wrappers(getattr(current, "y", None))
+            if left is not None and getattr(left, "op", None) == num_op and right is not None:
+                delta = left.numval()
+                if current.op == sub_op:
+                    delta = -delta
+                offset += delta
+                current = right
+                continue
+            if right is not None and getattr(right, "op", None) == num_op and left is not None:
+                delta = right.numval()
+                if current.op == sub_op:
+                    delta = -delta
+                offset += delta
+                current = left
+                continue
+            current = left if right is None else right
             continue
 
-        left = _strip_casts_and_refs(current.x)
-        right = _strip_casts_and_refs(current.y)
-        if left is not None and hasattr(left, "op") and left.op == ctype.num and right is not None:
-            offset += left.numval() if current.op == ctype.add else -left.numval()
-            current = right
-            continue
-        if right is not None and hasattr(right, "op") and right.op == ctype.num and left is not None:
-            offset += right.numval() if current.op == ctype.add else -right.numval()
-            current = left
-            continue
-        current = left if right is None else right
-        continue
-
+        break
 
     return current, offset
 
@@ -137,6 +236,7 @@ class ScanObject:
 
     def __init__(self):
         self.ea = idaapi.BADADDR
+        self.func_ea = idaapi.BADADDR
         self.name = None
         self.tinfo = None
         self.id = ObjectType.unknown
@@ -213,6 +313,7 @@ class ScanObject:
 
         result.tinfo = cexpr.type
         result.ea = ScanObject.get_expression_address(cfunc, cexpr)
+        result.func_ea = getattr(cfunc, "entry_ea", idaapi.BADADDR)
         result.set_scan_root(
             cfunc.entry_ea,
             expression_ea=result.ea,
@@ -238,18 +339,20 @@ class ScanObject:
         assert expr is not None
         return expr.ea
 
+    def identity_key(self):
+        return (
+            self.id,
+            self.name,
+            getattr(self, "func_ea", idaapi.BADADDR),
+            self.ea,
+        )
+
     def __hash__(self):
         # Preserve distinct scan evidence for the same variable at different locations.
-        return hash((self.id, self.name, self.func_ea, self.ea))
+        return hash(self.identity_key())
 
     def __eq__(self, rhs):
-        return (
-            isinstance(rhs, ScanObject)
-            and self.id == rhs.id
-            and self.name == rhs.name
-            and self.func_ea == rhs.func_ea
-            and self.ea == rhs.ea
-        )
+        return isinstance(rhs, ScanObject) and self.identity_key() == rhs.identity_key()
 
     def __repr__(self):
         return self.name
@@ -474,45 +577,97 @@ class MemoryAllocationObject(ScanObject):
         log_debug(f"Creating MemoryAllocationObject {self.name}, {self.size}")
 
     @staticmethod
+    def _unwrap_call_expression(cexpr: ida_hexrays.cexpr_t):
+        expr = cexpr
+        while expr is not None and getattr(expr, "op", None) == ctype.cast:
+            expr = getattr(expr, "x", None)
+        if expr is not None and getattr(expr, "op", None) == ctype.call:
+            return expr
+        return None
+
+    @staticmethod
+    def _normalize_allocator_name(func_name: str) -> str:
+        normalized = (func_name or "").strip().lower()
+        if not normalized:
+            return ""
+
+        normalized = normalized.split("::")[-1].split(".")[-1]
+        normalized = re.sub(r"@@.*$", "", normalized)
+        normalized = re.sub(r"@\d+$", "", normalized)
+        normalized = normalized.replace(" ", "")
+
+        while normalized:
+            stripped = normalized.lstrip("_")
+            updated = stripped
+            for prefix in _ALLOCATOR_NAME_PREFIXES:
+                if updated.startswith(prefix):
+                    updated = updated[len(prefix):]
+                    break
+            if updated == normalized:
+                normalized = updated
+                break
+            normalized = updated
+
+        return normalized
+
+    @staticmethod
+    def _extract_numeric_argument(args, index: int) -> int:
+        if index < 0 or index >= len(args):
+            return 0
+
+        expr = args[index]
+        while expr is not None and getattr(expr, "op", None) == ctype.cast:
+            expr = getattr(expr, "x", None)
+
+        if expr is not None and getattr(expr, "op", None) == ctype.num:
+            return expr.numval()
+        return 0
+
+    @classmethod
+    def _resolve_size(cls, allocator_name: str, args) -> int | None:
+        if allocator_name in _SINGLE_SIZE_ALLOCATORS:
+            return cls._extract_numeric_argument(
+                args, _SINGLE_SIZE_ALLOCATORS[allocator_name]
+            )
+
+        if allocator_name in _PRODUCT_SIZE_ALLOCATORS:
+            left_index, right_index = _PRODUCT_SIZE_ALLOCATORS[allocator_name]
+            return cls._extract_numeric_argument(
+                args, left_index
+            ) * cls._extract_numeric_argument(args, right_index)
+
+        return None
+
+    @staticmethod
     def create(cfunc: ida_hexrays.cfunc_t, cexpr: ida_hexrays.cexpr_t):
         """
-        Creates a new `MemoryAllocationObject` if `malloc` or `operator new` is found at expression
+        Creates a new `MemoryAllocationObject` when the expression matches a known allocator call.
+
 
         :param cfunc: cfunc_t object representing the current decompiled function
         :param cexpr: cexpr_t object representing the current expression
-        :return: a MemoryAllocationObject instance if the expression is a memory allocation, otherwise None
+        :return: a MemoryAllocationObject instance if the expression is a supported allocation, otherwise None
         """
-        if cexpr.op == ctype.call:
-            call_expr = cexpr
-        elif (
-            cexpr.op == ctype.cast
-            and hasattr(cexpr, "x")
-            and cexpr.x is not None
-            and cexpr.x.op == ctype.call
-        ):
-            call_expr = cexpr.x
-        else:
+        call_expr = MemoryAllocationObject._unwrap_call_expression(cexpr)
+        if call_expr is None:
             return None
 
-        func_name = ida_name.get_short_name(getattr(call_expr.x, "obj_ea", idaapi.BADADDR))
+        raw_func_name = ida_name.get_short_name(
+            getattr(call_expr.x, "obj_ea", idaapi.BADADDR)
+        )
+        allocator_name = MemoryAllocationObject._normalize_allocator_name(raw_func_name)
+        size = MemoryAllocationObject._resolve_size(allocator_name, getattr(call_expr, "a", ()))
+        if size is None:
+            return None
 
-        if "malloc" in func_name or "operator new" in func_name or "operator_new" in func_name:
-            # if we find `malloc` or `new` we get the size of the allocation
-            size_expr = call_expr.a[0] if len(call_expr.a) else None
-            # Missing size arguments should not crash the scan; treat them as unknown.
-            if size_expr is not None and size_expr.op == ctype.num:
-                size = size_expr.numval()
-            else:
-                size = 0
-            result = MemoryAllocationObject(func_name, size)
-            result.ea = ScanObject.get_expression_address(cfunc, call_expr)
-            result.set_scan_root(
-                cfunc.entry_ea,
-                expression_ea=result.ea,
-                function_name=getattr(ida_funcs, "get_func_name", lambda ea: f"sub_{ea:x}")(cfunc.entry_ea),
-            )
-            return result
-
+        result = MemoryAllocationObject(raw_func_name or allocator_name, size)
+        result.ea = ScanObject.get_expression_address(cfunc, call_expr)
+        result.set_scan_root(
+            cfunc.entry_ea,
+            expression_ea=result.ea,
+            function_name=getattr(ida_funcs, "get_func_name", lambda ea: f"sub_{ea:x}")(cfunc.entry_ea),
+        )
+        return result
 
     def is_target(self, cexpr: ida_hexrays.cexpr_t) -> bool:
         return True

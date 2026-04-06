@@ -16,6 +16,7 @@ from forge.util.logging import log_debug, log_error
 # issues where the types coming out of the cache are invalid, something like that is probably happening
 
 
+
 class TypesConfig(ForgeConfig):
     name = "Types"
     default_config = {
@@ -184,53 +185,94 @@ class Types:
         )
         # TODO: add any more types that are needed
 
+    @staticmethod
+    def _is_meaningful_type_shape(tinfo: ida_typeinf.tinfo_t) -> bool:
+        return any(
+            predicate()
+            for predicate in (
+                tinfo.is_udt,
+                tinfo.is_func,
+                tinfo.is_funcptr,
+                tinfo.is_array,
+            )
+        )
+
+    def _is_canonical_scalar_type(self, tinfo: ida_typeinf.tinfo_t) -> bool:
+        scalar_names = (
+            "bool",
+            "char",
+            "u8",
+            "u16",
+            "u32",
+            "u64",
+            "u128",
+            "i8",
+            "i16",
+            "i32",
+            "i64",
+            "i128",
+            "f32",
+            "f64",
+            "size_t",
+        )
+        return any(
+            tinfo.equals_to(self._type_cache[name].type)
+            for name in scalar_names
+            if name in self._type_cache
+        )
+
     def convert_to_simple_type(
         self,
         in_type: Optional[ida_typeinf.tinfo_t],
-        was_pointer: bool = False,
     ) -> Optional[ida_typeinf.tinfo_t]:
         """
-        Convert a type to a simple type (i.e. remove any pointers, arrays, etc.).
+        Canonicalize scalar aliases while preserving meaningful type structure.
 
-        :param in_type: The type to convert.
-        :param was_pointer: Flag to indicate if the type was a pointer.
-        :return: The converted type.
+
+        :param in_type: The type to canonicalize.
+
+        :return: The canonicalized type.
         """
         if in_type is None:
             return None
 
         work_type = ida_typeinf.tinfo_t(in_type)
-        out_type = ida_typeinf.tinfo_t()
+
+        if self._is_meaningful_type_shape(work_type):
+            return work_type
 
         if work_type.is_ptr():
-            if work_type.remove_ptr_or_array():
-                return self.convert_to_simple_type(work_type, True)
-            raise Exception(f"Failed to remove pointer from type {work_type.dstr()}")
+            pointed = work_type.get_pointed_object()
+            if pointed is None:
+                return work_type
 
-        # gets the width of the type in bytes
+            if (
+                pointed.is_ptr()
+                or self._is_meaningful_type_shape(pointed)
+                or self._is_canonical_scalar_type(pointed)
+            ):
+                return work_type
+
+            simplified_pointed = self.convert_to_simple_type(pointed)
+            pointer_tinfo = ida_typeinf.tinfo_t()
+            pointer_tinfo.create_ptr(simplified_pointed)
+            return pointer_tinfo
+
+        if self._is_canonical_scalar_type(work_type):
+            return work_type
+
         size = work_type.get_size()
-
         if size in [1, 2, 4, 8, 16]:
             if work_type.is_integral():
-                # if signed gets iXX, if unsigned gets uXX (e.g. i8, u16)
-                out_type = ida_typeinf.tinfo_t(
+                return ida_typeinf.tinfo_t(
                     self._type_cache[
                         f"{'i' if work_type.is_signed() else 'u'}{size * 8}"
                     ].type
                 )
-            elif work_type.is_float():
-                out_type = ida_typeinf.tinfo_t(self._type_cache[f"f{size * 8}"].type)
-            else:
-                return work_type
-        else:
-            return work_type
+            if work_type.is_float():
+                return ida_typeinf.tinfo_t(self._type_cache[f"f{size * 8}"].type)
 
-        if was_pointer:
-            pointer_tinfo = ida_typeinf.tinfo_t()
-            pointer_tinfo.create_ptr(out_type)
-            return pointer_tinfo
-
-        return out_type
+        return work_type
 
     def get_ptr(self):
         return ida_typeinf.tinfo_t(self.get_ptr_type().ptr)

@@ -318,61 +318,7 @@ class ChildScanMixin:
 
     @staticmethod
     def _parse_member_assignment_target(expr, offset: int = 0, scale: int = 1):
-        if expr is None:
-            return None
-
-        cast_op = getattr(ctype, "cast", None)
-        ref_op = getattr(ctype, "ref", None)
-        memref_op = getattr(ctype, "memref", None)
-        memptr_op = getattr(ctype, "memptr", None)
-        ptr_op = getattr(ctype, "ptr", None)
-        idx_op = getattr(ctype, "idx", None)
-        add_op = getattr(ctype, "add", None)
-        sub_op = getattr(ctype, "sub", None)
-        num_op = getattr(ctype, "num", None)
-
-        if expr.op in tuple(op for op in (cast_op, ref_op) if op is not None) and getattr(expr, "x", None) is not None:
-            return ChildScanMixin._parse_member_assignment_target(expr.x, offset, scale)
-
-        if expr.op in tuple(op for op in (memref_op, memptr_op) if op is not None) and getattr(expr, "x", None) is not None:
-            return expr.x, offset + getattr(expr, "m", 0)
-
-        if expr.op in tuple(op for op in (ptr_op, idx_op) if op is not None) and getattr(expr, "x", None) is not None:
-            next_scale = scale
-            expr_type = getattr(expr, "type", None)
-            get_ptrarr_objsize = getattr(expr_type, "get_ptrarr_objsize", None)
-            if callable(get_ptrarr_objsize):
-                try:
-                    next_scale = get_ptrarr_objsize() or scale
-                except Exception:
-                    next_scale = scale
-
-            index_expr = getattr(expr, "y", None)
-            if expr.op == idx_op and index_expr is not None and getattr(index_expr, "op", None) == num_op:
-                return ChildScanMixin._parse_member_assignment_target(
-                    expr.x, offset + index_expr.numval() * next_scale, next_scale
-                )
-            return ChildScanMixin._parse_member_assignment_target(expr.x, offset, next_scale)
-
-        if expr.op in tuple(op for op in (add_op, sub_op) if op is not None):
-            left = getattr(expr, "x", None)
-            right = getattr(expr, "y", None)
-            if left is not None and getattr(left, "op", None) == num_op and right is not None:
-                delta = left.numval()
-                if expr.op == sub_op:
-                    delta = -delta
-                return ChildScanMixin._parse_member_assignment_target(
-                    right, offset + delta * scale, scale
-                )
-            if right is not None and getattr(right, "op", None) == num_op and left is not None:
-                delta = right.numval()
-                if expr.op == sub_op:
-                    delta = -delta
-                return ChildScanMixin._parse_member_assignment_target(
-                    left, offset + delta * scale, scale
-                )
-
-        return expr, offset
+        return _extract_offset_expression(expr, offset, scale, ctype)
 
     @classmethod
     def _member_expression_matches(cls, scan_object: ScanObject, expr) -> bool:
@@ -799,7 +745,9 @@ class ChildScanMixin:
                 log_warning(message, True)
 
         scanned_variables = sorted(
-            getattr(member, "scanned_variables", set()),
+            Structure.dedupe_scanned_variables(
+                getattr(member, "scanned_variables", set())
+            ),
             key=lambda scan_variable: (
                 getattr(scan_variable, "func_ea", idaapi.BADADDR),
                 getattr(scan_variable, "ea", idaapi.BADADDR),
@@ -1108,16 +1056,14 @@ class ChildScanMixin:
 
         selected_members = self.get_selected_members()
         if selected_members:
-            scanned_variables = {
+            scanned_variables = Structure.dedupe_scanned_variables(
                 scan_object
                 for member in selected_members
                 for scan_object in member.scanned_variables
-            }
+            )
         else:
-            scanned_variables = set(
-                self.current_structure.get_unique_scanned_variables(
-                    self.current_structure.main_offset
-                )
+            scanned_variables = self.current_structure.get_unique_scanned_variables(
+                self.current_structure.main_offset
             )
 
         if not scanned_variables:

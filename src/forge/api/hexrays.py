@@ -13,6 +13,7 @@ import ida_nalt
 import idc
 
 from forge.api import cache
+from forge.api.tinfo import is_incomplete_tinfo
 from forge.api.types import types
 from forge.util.logging import *
 from forge.util.util import DocIntEnum
@@ -119,28 +120,94 @@ def get_argument_index(cfunc: ida_hexrays.cfunc_t, lvar_idx: int) -> int | None:
     return None
 
 
+def _strip_call_argument_wrappers(expr: ida_hexrays.cexpr_t | None):
+    while expr is not None and getattr(expr, "op", None) in (ctype.cast, ctype.ref):
+        expr = getattr(expr, "x", None)
+    return expr
+
+
+def _get_callable_tinfo(call_cexpr: ida_hexrays.cexpr_t):
+    callee = getattr(call_cexpr, "x", None)
+    func_tinfo = getattr(callee, "type", None)
+    if func_tinfo is None:
+        return None
+
+    if getattr(func_tinfo, "is_func", lambda: False)():
+        return func_tinfo
+
+    if getattr(func_tinfo, "is_ptr", lambda: False)():
+        pointed = getattr(func_tinfo, "get_pointed_object", lambda: None)()
+        if pointed is not None and getattr(pointed, "is_func", lambda: False)():
+            return pointed
+
+    return None
+
+
+def _call_argument_match_key(expr: ida_hexrays.cexpr_t | None):
+    if expr is None:
+        return None
+
+    dstr = getattr(expr, "dstr", None)
+    return (
+        getattr(expr, "op", None),
+        getattr(expr, "ea", idaapi.BADADDR),
+        dstr() if callable(dstr) else str(expr),
+    )
+
+
+def _get_argument_index(
+    function: ida_hexrays.cexpr_t, expression: ida_hexrays.cexpr_t
+ ) -> int | None:
+    normalized_expression = _strip_call_argument_wrappers(expression)
+    normalized_key = _call_argument_match_key(normalized_expression)
+    normalized_matches: list[int] = []
+    structural_matches: list[int] = []
+
+    for idx, arg in enumerate(getattr(function, "a", ())):
+        arg_expr = getattr(arg, "cexpr", arg)
+        if expression is arg_expr or expression == arg_expr:
+            return idx
+
+        normalized_arg = _strip_call_argument_wrappers(arg_expr)
+        if normalized_expression is normalized_arg or normalized_expression == normalized_arg:
+            normalized_matches.append(idx)
+            continue
+
+        if normalized_key is not None and normalized_key == _call_argument_match_key(normalized_arg):
+            structural_matches.append(idx)
+
+    if len(normalized_matches) == 1:
+        return normalized_matches[0]
+    if len(normalized_matches) > 1:
+        return None
+    if len(structural_matches) == 1:
+        return structural_matches[0]
+    return None
+
 
 def get_func_argument_info(
     function: ida_hexrays.cexpr_t, expression: ida_hexrays.cexpr_t
-):
+ ):
     """
     Returns information about the argument of the specified expression in the specified function.
+
 
     :param function: The function expression.
     :param expression: The expression to get argument information for.
     :return: A tuple containing the argument index and t if available, else None.
     """
     log_debug(f"match: {expression.dstr()}, type: {expression.type.dstr()}")
-    for idx, arg in enumerate(function.a):
-        log_debug(
-            f"arg: {idx}, name: {arg.dstr()}, type: {function.x.type.get_nth_arg(idx).dstr()}"
-        )
-        if expression == arg.cexpr:
-            func_tinfo = function.x.type
-            if idx < func_tinfo.get_nargs():
-                return idx, func_tinfo.get_nth_arg(idx)
-            return idx, None
-    return None, None
+    idx = _get_argument_index(function, expression)
+    if idx is None:
+        return None, None
+
+    func_tinfo = _get_callable_tinfo(function)
+    if func_tinfo is None:
+        return idx, None
+
+    if idx < func_tinfo.get_nargs():
+        return idx, func_tinfo.get_nth_arg(idx)
+    return idx, None
 
 
 def get_funcs_calling_address(ea):
@@ -199,11 +266,17 @@ def get_member_name(tinfo: ida_typeinf.tinfo_t, offset: int) -> str:
 
 
 def is_legal_type(tinfo: ida_typeinf.tinfo_t) -> bool:
-    tinfo.clr_const()
-    if tinfo.is_ptr() and tinfo.get_pointed_object().is_forward_decl():
-        return tinfo.get_pointed_object().get_size() == ida_typeinf.BADSIZE
-    # TODO: look into restricting scan types to only those that are legal
-    return True
+    if tinfo is None:
+        return False
+
+    work_tinfo = tinfo
+
+    clr_const = getattr(work_tinfo, "clr_const", None)
+    if callable(clr_const):
+        clr_const()
+
+    # Forward declarations and other incomplete wrappers are not usable root types.
+    return not is_incomplete_tinfo(work_tinfo)
 
 
 def find_expr_address(cexpr: ida_hexrays.cexpr_t, parents):

@@ -415,22 +415,33 @@ class Structure:
             )
         return self.name
 
+    @staticmethod
+    def dedupe_scanned_variables(scan_objects) -> list:
+        unique_scan_objects = {}
+        for scan_object in scan_objects:
+            if scan_object is None:
+                continue
+
+            identity_key = getattr(scan_object, "identity_key", None)
+            if callable(identity_key):
+                key = identity_key()
+            else:
+                key = (
+                    getattr(scan_object, "func_ea", None),
+                    getattr(scan_object, "ea", None),
+                    getattr(scan_object, "id", None),
+                    getattr(scan_object, "name", None),
+                )
+            unique_scan_objects[key] = scan_object
+        return list(unique_scan_objects.values())
+
     def get_unique_scanned_variables(self, origin: int = 0) -> list:
         scan_objects = itertools.chain.from_iterable(
             member.scanned_variables
             for member in self.members
             if member.origin == origin
         )
-        unique_scan_objects = {}
-        for scan_object in scan_objects:
-            key = (
-                getattr(scan_object, "func_ea", None),
-                getattr(scan_object, "ea", None),
-                getattr(scan_object, "id", None),
-                scan_object.name,
-            )
-            unique_scan_objects[key] = scan_object
-        return list(unique_scan_objects.values())
+        return self.dedupe_scanned_variables(scan_objects)
 
     def get_stats(self) -> StructureStats:
         self.refresh_collisions()

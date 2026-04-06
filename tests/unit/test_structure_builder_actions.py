@@ -38,6 +38,28 @@ def reset_structure_form(monkeypatch):
     _FakeVisitor.calls = []
 
 
+def test_ensure_structure_selected_rehydrates_existing_form_ui(monkeypatch):
+    structure = Structure("Selected")
+    actions_module.structure_form.current_structure = structure
+    ensure_calls = []
+    show_calls = []
+
+    monkeypatch.setattr(
+        actions_module.structure_form,
+        "ensure_ui",
+        lambda: ensure_calls.append("ensure") or True,
+    )
+    monkeypatch.setattr(
+        actions_module.structure_form,
+        "show",
+        lambda: show_calls.append("show") or True,
+    )
+
+    assert actions_module.StructureBuilderAction._ensure_structure_selected() is True
+    assert ensure_calls == ["ensure"]
+    assert show_calls == []
+
+
 def test_shallow_scan_sets_confirmed_root_provenance(monkeypatch):
     structure = Structure("Selected")
     actions_module.structure_form.current_structure = structure

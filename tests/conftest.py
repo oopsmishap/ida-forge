@@ -204,12 +204,25 @@ class _DummyQtNamespace:
             return types.SimpleNamespace(
                 AlignCenter=0,
                 CustomContextMenu=0,
+                ItemIsSelectable=1,
+                ItemIsEnabled=2,
+                ItemIsEditable=4,
+                ItemFlags=lambda value=0: value,
                 Key_Return=0,
                 Key_Enter=0,
                 UserRole=0,
                 TextFormat=types.SimpleNamespace(RichText=0),
             )
         return _DummyQtClass
+
+
+def _qt_item_flags(*flags):
+    combined = 0
+    for flag in flags:
+        if flag is None:
+            continue
+        combined |= flag
+    return combined
 
 
 _stub_module(
@@ -221,6 +234,7 @@ _stub_module(
     qt_exec=lambda widget, *args, **kwargs: widget.exec(*args, **kwargs)
     if hasattr(widget, "exec")
     else widget.exec_(*args, **kwargs),
+    qt_item_flags=_qt_item_flags,
 )
 _stub_module(
     "forge.api.hexrays",
@@ -234,8 +248,9 @@ _stub_module(
         ref=7,
         add=8,
         sub=9,
-        idx=10,
-        num=11,
+        ptr=10,
+        idx=11,
+        num=12,
     ),
     get_member_name=lambda *_args, **_kwargs: "member_name",
     get_ptr=lambda *args, **kwargs: 0,

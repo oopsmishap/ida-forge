@@ -44,6 +44,14 @@ class _Recorder:
     def setText(self, value):
         self.text = value
 
+    def selectedIndexes(self):
+        return []
+
+    def currentRow(self):
+        return -1
+
+    def currentColumn(self):
+        return -1
 
 
 class _FakeMember:
@@ -187,6 +195,90 @@ def _make_form(monkeypatch) -> form_module.StructureBuilderForm:
     )
     return structure_form
 
+def test_on_close_resets_cached_ui_state(monkeypatch):
+    structure_form = _make_form(monkeypatch)
+    structure_form.parent = object()
+    structure_form.ui = SimpleNamespace(tbl_structure=object(), tree_structures=object())
+    structure_form.layout = object()
+    structure_form._shortcut_actions = [object(), object()]
+
+    structure_form.OnClose(None)
+
+    assert structure_form.parent is None
+    assert structure_form.ui is None
+    assert structure_form.layout is None
+    assert structure_form._shortcut_actions == []
+
+
+def test_get_selected_rows_handles_stale_table_after_reload(monkeypatch):
+    structure_form = _make_form(monkeypatch)
+    structure_form.parent = object()
+    structure_form.layout = object()
+
+    class _StaleTable:
+        def selectedIndexes(self):
+            raise RuntimeError("wrapped C/C++ object of type QTableWidget has been deleted")
+
+    structure_form.ui = SimpleNamespace(tbl_structure=_StaleTable())
+
+    assert structure_form.get_selected_rows() == []
+    assert structure_form.ui is None
+    assert structure_form.parent is None
+    assert structure_form.layout is None
+
+
+def test_update_structure_fields_returns_when_table_selection_is_stale(monkeypatch):
+    structure_form = _make_form(monkeypatch)
+    monkeypatch.setattr(
+        structure_form,
+        "update_structure_fields",
+        form_module.StructureBuilderForm.update_structure_fields.__get__(structure_form),
+    )
+    structure_form.parent = object()
+    structure_form.layout = object()
+
+    class _StaleTable:
+        def selectedIndexes(self):
+            raise RuntimeError("wrapped C/C++ object of type QTableWidget has been deleted")
+
+    structure_form.ui = SimpleNamespace(tbl_structure=_StaleTable())
+    structure_form.current_structure = Structure("Selected")
+
+    structure_form.update_structure_fields()
+
+    assert structure_form.ui is None
+    assert structure_form.parent is None
+    assert structure_form.layout is None
+
+
+
+
+def test_make_table_item_uses_shared_qt_flag_helper(monkeypatch):
+    calls = []
+
+    class _FakeItem:
+        def __init__(self, text):
+            self.text = text
+            self.flags = None
+
+        def setFlags(self, flags):
+            self.flags = flags
+
+    monkeypatch.setattr(form_module, "QTableWidgetItem", _FakeItem)
+    monkeypatch.setattr(
+        form_module,
+        "qt_item_flags",
+        lambda *flags: calls.append(flags) or 0xD,
+    )
+
+    item = form_module.StructureBuilderForm._make_table_item("field", editable=True)
+
+    assert item.text == "field"
+    assert item.flags == 0xD
+    assert calls == [
+        (form_module.Qt.ItemIsSelectable, form_module.Qt.ItemIsEnabled),
+        (0xD, form_module.Qt.ItemIsEditable),
+    ]
 
 def test_create_structure_treats_none_as_cancel(monkeypatch):
     structure_form = _make_form(monkeypatch)
@@ -447,6 +539,40 @@ def test_structure_table_finalize_blocks_unresolved_children(monkeypatch):
     ]
 
 
+def test_structure_table_resolve_clears_stale_selection_after_refresh(monkeypatch):
+    structure_form = _make_form(monkeypatch)
+
+    class _TableSelectionRecorder:
+        def __init__(self):
+            self.clear_selection_calls = 0
+            self.current_cells = []
+
+        def clearSelection(self):
+            self.clear_selection_calls += 1
+
+        def setCurrentCell(self, row, column):
+            self.current_cells.append((row, column))
+
+    calls: list[str] = []
+    table = _TableSelectionRecorder()
+    structure_form.ui = SimpleNamespace(tbl_structure=table)
+    structure_form.current_structure = SimpleNamespace(
+        auto_resolve=lambda: calls.append("resolve")
+    )
+    monkeypatch.setattr(
+        structure_form, "update_structure_fields", lambda: calls.append("fields")
+    )
+    monkeypatch.setattr(
+        structure_form, "update_action_states", lambda: calls.append("actions")
+    )
+
+    structure_form.structure_table_resolve()
+
+    assert calls == ["resolve", "fields", "actions"]
+    assert table.clear_selection_calls == 1
+    assert table.current_cells == [(-1, -1)]
+
+
 def test_create_child_types_creates_direct_children_in_offset_order(monkeypatch):
     structure_form = _make_form(monkeypatch)
     parent = structure_form.create_structure("Parent")
@@ -598,7 +724,11 @@ def test_update_action_states_enables_child_type_actions_for_child_relationships
     monkeypatch.setattr(structure_form, "get_selected_member", lambda: None)
     monkeypatch.setattr(structure_form, "_build_child_scan_plan", lambda _member: None)
     monkeypatch.setattr(structure_form, "_update_summary_label", lambda: None)
-    monkeypatch.setattr(structure_form, "_update_inspector_panel", lambda: None)
+    monkeypatch.setattr(
+        structure_form,
+        "_update_inspector_panel",
+        lambda *_args, **_kwargs: None,
+    )
     monkeypatch.setattr(
         structure_form,
         "update_action_states",
@@ -713,6 +843,47 @@ def test_scan_child_structure_reuses_existing_linked_child(monkeypatch):
     assert member.linked_child_structure_name == "Child"
     assert parent.child_relationships[0].child_structure_name == "Child"
     assert child.parent_relationships[0].parent_structure_name == "Parent"
+
+def test_show_scanned_variables_dedupes_duplicate_selected_member_evidence(monkeypatch):
+    structure_form = _make_form(monkeypatch)
+    parent = structure_form.create_structure("Parent")
+    assert parent is not None
+
+    class _DuplicateScanObject:
+        def __init__(self, *, func_ea: int, ea: int, name: str, origin: int = 0x20):
+            self.func_ea = func_ea
+            self.ea = ea
+            self.name = name
+            self.origin = origin
+
+        def to_list(self):
+            return [f"0x{self.origin:04X}", "child_func", self.name, hex(self.ea)]
+
+    member = _FakeMember(0x30, 8, type_name="Child *", name="child_ptr")
+    scan_a = _DuplicateScanObject(func_ea=0x401000, ea=0x401234, name="child_ptr_scan")
+    scan_b = _DuplicateScanObject(func_ea=0x401000, ea=0x401234, name="child_ptr_scan")
+    member.scanned_variables = {scan_a, scan_b}
+    parent.add_member(member)
+    structure_form.current_structure = parent
+    monkeypatch.setattr(structure_form, "get_selected_members", lambda rows=None: [member])
+
+    captured = {}
+
+    class _ChooserRecorder:
+        def __init__(self, scanned_variables):
+            captured["scanned_variables"] = list(scanned_variables)
+
+        def Show(self):
+            captured["shown"] = True
+
+    monkeypatch.setattr(child_scan_module, "ScannedVariableChooser", _ChooserRecorder)
+
+    structure_form.show_scanned_variables()
+
+    assert captured["shown"] is True
+    assert len(captured["scanned_variables"]) == 1
+    assert captured["scanned_variables"][0].name == "child_ptr_scan"
+
 
 def test_build_structure_table_debug_csv_includes_scan_metadata(monkeypatch):
     structure_form = _make_form(monkeypatch)
@@ -1143,6 +1314,143 @@ def test_build_child_scan_plan_prefers_scan_root_evidence(monkeypatch):
 
 
 
+def test_handle_structure_table_selection_change_coalesces_duplicate_signals(monkeypatch):
+    structure_form = _make_form(monkeypatch)
+    structure_form.current_structure = Structure("Parent")
+
+    class _FakeIndex:
+        def __init__(self, row):
+            self._row = row
+
+        def row(self):
+            return self._row
+
+    class _FakeTable:
+        def __init__(self):
+            self._row = 1
+            self._column = 0
+
+        def selectedIndexes(self):
+            return [_FakeIndex(self._row)]
+
+        def currentRow(self):
+            return self._row
+
+        def currentColumn(self):
+            return self._column
+
+    calls = []
+    structure_form.ui = SimpleNamespace(tbl_structure=_FakeTable())
+    monkeypatch.setattr(
+        structure_form,
+        "update_action_states",
+        lambda: calls.append(structure_form._structure_table_selection_signature()),
+    )
+
+    structure_form._handle_structure_table_selection_change()
+    structure_form._handle_structure_table_selection_change()
+    structure_form._handle_structure_table_selection_change()
+
+    assert len(calls) == 1
+    assert calls[0] == ("Parent", (1,), 1, 0)
+
+    structure_form.ui.tbl_structure._row = 2
+    structure_form._handle_structure_table_selection_change()
+
+    assert len(calls) == 2
+    assert calls[1] == ("Parent", (2,), 2, 0)
+
+
+def test_update_action_states_builds_child_scan_plan_once_per_refresh(monkeypatch):
+    structure_form = _make_form(monkeypatch)
+    parent = structure_form.create_structure("Parent")
+    assert parent is not None
+
+    member = _FakeMember(0x30, 8, type_name="u64", name="child_ptr")
+    member.tinfo = SimpleNamespace(is_ptr=lambda: False, is_udt=lambda: False)
+    member.scanned_variables = [SimpleNamespace(func_ea=0x401000, ea=0x402000, name="root")]
+    parent.add_member(member)
+    structure_form.current_structure = parent
+
+    plan = SimpleNamespace(function_eas=(0x401000,), relation_kind="embedded")
+    plan_calls = []
+
+    structure_form.ui = SimpleNamespace(
+        btn_remove=_Recorder(),
+        btn_duplicate_structure=_Recorder(),
+        btn_apply_name=_Recorder(),
+        input_name=_Recorder(),
+        input_filter=_Recorder(),
+        tbl_structure=_Recorder(),
+        btn_auto_resolve=_Recorder(),
+        btn_create_type=_Recorder(),
+        btn_enable_rows=_Recorder(),
+        btn_disable_rows=_Recorder(),
+        btn_toggle_array=_Recorder(),
+        btn_set_origin=_Recorder(),
+        btn_remove_rows=_Recorder(),
+        btn_clear_rows=_Recorder(),
+        btn_view_scanned_uses=_Recorder(),
+        btn_recognize_vtable=_Recorder(),
+        btn_add_row=_Recorder(),
+        btn_duplicate_row=_Recorder(),
+        btn_edit_row=_Recorder(),
+        btn_scan_child=_Recorder(),
+        btn_open_child=_Recorder(),
+        btn_create_child_types=_Recorder(),
+        btn_create_subtree_types=_Recorder(),
+        action_enable=_Recorder(),
+        action_disable=_Recorder(),
+        action_resolve=_Recorder(),
+        action_finalize=_Recorder(),
+        action_edit=_Recorder(),
+        action_add_row=_Recorder(),
+        action_duplicate_row=_Recorder(),
+        action_scan_child=_Recorder(),
+        action_create_child_types=_Recorder(),
+        action_create_subtree_types=_Recorder(),
+        lbl_summary=_Recorder(),
+        lbl_provenance=_Recorder(),
+        lbl_root_info=_Recorder(),
+        lbl_parent_links=_Recorder(),
+        lbl_child_links=_Recorder(),
+        lbl_selected_member_info=_Recorder(),
+        lbl_type_status=_Recorder(),
+    )
+    monkeypatch.setattr(structure_form, "get_selected_rows", lambda: [0])
+    monkeypatch.setattr(structure_form, "get_selected_member", lambda: member)
+    monkeypatch.setattr(
+        structure_form,
+        "_build_child_scan_plan",
+        lambda _member, show_warnings=False: plan_calls.append((_member, show_warnings)) or plan,
+    )
+    monkeypatch.setattr(structure_form, "_update_summary_label", lambda: None)
+    monkeypatch.setattr(structure_form, "_format_structure_provenance", lambda _structure: "manual")
+    monkeypatch.setattr(structure_form, "_format_root_info", lambda _structure: "root")
+    monkeypatch.setattr(
+        structure_form,
+        "_format_relationships",
+        lambda _relationships, direction: direction,
+    )
+    monkeypatch.setattr(
+        structure_form,
+        "_format_selected_member_info",
+        lambda _member, *, child_scan_ready=False: "child scan ready" if child_scan_ready else "selected",
+    )
+    monkeypatch.setattr(structure_form, "_format_type_status", lambda _structure: "status")
+    monkeypatch.setattr(
+        structure_form,
+        "update_action_states",
+        form_module.StructureBuilderForm.update_action_states.__get__(structure_form),
+    )
+
+    structure_form.update_action_states()
+
+    assert plan_calls == [(member, False)]
+    assert structure_form.ui.btn_scan_child.enabled is True
+    assert structure_form.ui.lbl_selected_member_info.text == "Selected Row: child scan ready"
+
+
 def test_update_action_states_enables_child_scan_actions_for_scannable_member(monkeypatch):
     structure_form = _make_form(monkeypatch)
     parent = structure_form.create_structure("Parent")
@@ -1196,7 +1504,11 @@ def test_update_action_states_enables_child_scan_actions_for_scannable_member(mo
     monkeypatch.setattr(structure_form, "get_selected_member", lambda: member)
     monkeypatch.setattr(structure_form, "_build_child_scan_plan", lambda _member, show_warnings=False: plan)
     monkeypatch.setattr(structure_form, "_update_summary_label", lambda: None)
-    monkeypatch.setattr(structure_form, "_update_inspector_panel", lambda: None)
+    monkeypatch.setattr(
+        structure_form,
+        "_update_inspector_panel",
+        lambda *_args, **_kwargs: None,
+    )
     monkeypatch.setattr(
         structure_form,
         "update_action_states",
@@ -1207,7 +1519,10 @@ def test_update_action_states_enables_child_scan_actions_for_scannable_member(mo
 
     assert structure_form.ui.btn_scan_child.enabled is True
     assert structure_form.ui.action_scan_child.enabled is True
-    assert "child scan ready" in structure_form._format_selected_member_info(member)
+    assert (
+        "child scan ready"
+        in structure_form._format_selected_member_info(member, child_scan_ready=True)
+    )
 
 
 
@@ -1594,14 +1909,15 @@ def test_infer_direct_child_roots_matches_pointer_arithmetic_assignment(monkeypa
     parent_expr = SimpleNamespace(op=ctype.var, ea=0x401050)
     rhs_expr = SimpleNamespace(op=ctype.var, ea=0x401060)
     index_expr = SimpleNamespace(op=ctype.num, numval=lambda: 3)
-    add_expr = SimpleNamespace(
-        op=ctype.add,
+    idx_expr = SimpleNamespace(
+        op=ctype.idx,
         x=SimpleNamespace(op=ctype.cast, x=parent_expr),
         y=index_expr,
+        type=SimpleNamespace(get_ptrarr_objsize=lambda: 8),
     )
     lhs_expr = SimpleNamespace(
         op=ctype.ptr,
-        x=add_expr,
+        x=idx_expr,
         type=SimpleNamespace(get_ptrarr_objsize=lambda: 8),
     )
     assignment = SimpleNamespace(op=ctype.asg, x=lhs_expr, y=rhs_expr, ea=0x401070)
