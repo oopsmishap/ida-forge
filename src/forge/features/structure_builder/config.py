@@ -9,6 +9,7 @@ class StructureBuilderConfig(ForgeConfig):
         "show_structure_form_hotkey": "Alt+Shift+F9",
         "shallow_scan_hotkey": "Alt+S",
         "deep_scan_hotkey": "Shift+Alt+S",
+        "default_deep_scan_depth": 3,
         "form": {
             "origin_color": "#006699",
             "disabled_color": "#999999",

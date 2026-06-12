@@ -57,6 +57,8 @@ def test_recursive_downwards_object_visitor_skips_invalid_callee_ordinal(monkeyp
         visitor_module.RecursiveDownwardsObjectVisitor
     )
     visitor._cfunc = SimpleNamespace(entry_ea=0x401000)
+    visitor._max_depth = None
+    visitor._current_depth = 0
     visitor._new_for_visit = {(0x402000, 0)}
     monkeypatch.setattr(visitor_module.RecursiveObjectVisitor, "_recursive_process", lambda self: None)
     monkeypatch.setattr(
@@ -122,6 +124,55 @@ def test_recursive_downwards_check_call_only_tracks_matched_argument(monkeypatch
     assert argument_queries == [(call_expr, matched_expr)]
     assert recorded_visits == [(0x402000, 0)]
     assert recorded_tree_edges == [(0x402000, 0)]
+
+def test_recursive_downwards_check_call_follows_offset_expression(monkeypatch):
+    visitor_module = _load_visitor_module()
+    visitor = visitor_module.RecursiveDownwardsObjectVisitor.__new__(
+        visitor_module.RecursiveDownwardsObjectVisitor
+    )
+    visitor._cfunc = SimpleNamespace(entry_ea=0x401000)
+    visitor._objects = [SimpleNamespace(name="a1")]
+    visitor.parents = SimpleNamespace(size=lambda: 1)
+    call_expr = SimpleNamespace(
+        op=visitor_module.ctype.call,
+        x=SimpleNamespace(obj_ea=0x402000),
+    )
+    a1_var = SimpleNamespace(op=visitor_module.ctype.var, name="a1")
+    offset_num = SimpleNamespace(op=visitor_module.ctype.num, name="12")
+    add_expr = SimpleNamespace(op=visitor_module.ctype.add, x=a1_var, y=offset_num)
+    unrelated_expr = SimpleNamespace(op=visitor_module.ctype.var, name="other")
+    recorded_visits = []
+
+    monkeypatch.setattr(visitor, "parent_expr", lambda: call_expr, raising=False)
+    monkeypatch.setattr(
+        visitor,
+        "_matches_object",
+        lambda _obj, cexpr: cexpr is a1_var,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        visitor_module,
+        "get_func_argument_info",
+        lambda call, arg: (0, None),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        visitor,
+        "_add_visit",
+        lambda func_ea, arg_idx: recorded_visits.append((func_ea, arg_idx)) or True,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        visitor,
+        "_add_scan_tree_info",
+        lambda func_ea, arg_idx: None,
+        raising=False,
+    )
+
+    visitor._check_call(unrelated_expr)
+    visitor._check_call(add_expr)
+
+    assert recorded_visits == [(0x402000, 0)]
 
 
 def test_recursive_downwards_object_visitor_leave_expr_checks_calls(monkeypatch):
@@ -270,6 +321,8 @@ def test_recursive_downwards_object_visitor_retries_deferred_child_arguments(mon
         visitor_module.RecursiveDownwardsObjectVisitor
     )
     visitor._cfunc = SimpleNamespace(entry_ea=0x401000)
+    visitor._max_depth = None
+    visitor._current_depth = 0
     visitor._new_for_visit = {(0x402000, 0), (0x403000, 0)}
 
     prepared_calls = []
@@ -340,6 +393,8 @@ def test_recursive_downwards_object_visitor_refreshes_tree_before_scanning(monke
         visitor_module.RecursiveDownwardsObjectVisitor
     )
     visitor._cfunc = SimpleNamespace(entry_ea=0x401000)
+    visitor._max_depth = None
+    visitor._current_depth = 0
     visitor._new_for_visit = {(0x402000, 0)}
 
     prepared_calls = []

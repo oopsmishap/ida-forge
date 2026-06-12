@@ -35,7 +35,6 @@ class CreateNewField(HexRaysPopupAction):
 
         cexpr = item.it.to_specific_type
         if cexpr.op not in (idaapi.cot_memptr, idaapi.cot_memref):
-            log_warning(f"{cexpr.dstr()} is not a member pointer!")
             return False
 
         return True

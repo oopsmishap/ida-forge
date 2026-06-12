@@ -1874,6 +1874,50 @@ class StructureBuilderForm(ChildScanMixin, ida_kernwin.PluginForm):
 
 
 
+
+    def convert_to_vtable(self):
+        if self.current_structure is None:
+            return
+
+        member = self.get_selected_member()
+        if member is None or isinstance(member, VirtualTable):
+            return
+
+        address_str = ida_kernwin.ask_str(
+            "", ida_kernwin.HIST_IDENT, "Enter vtable address (hex):"
+        )
+        if not address_str:
+            return
+
+        address_str = address_str.strip()
+        try:
+            address = int(address_str, 16)
+        except ValueError:
+            ida_kernwin.warning(f"Invalid hex address: {address_str}")
+            return
+
+        func_count = VirtualTable.is_virtual_table(address)
+        if func_count == 0:
+            reply = ida_kernwin.ask_yn(
+                ida_kernwin.ASKBTN_NO,
+                "HIDECANCEL\n"
+                f"No virtual functions found at {hex(address)}.\n"
+                "The address may contain undefined functions.\n"
+                "Convert anyway?",
+            )
+            if reply != ida_kernwin.ASKBTN_YES:
+                return
+
+        self.current_structure.members.remove(member)
+
+        vtable = VirtualTable(member.offset, address, None, member.origin)
+        vtable.scanned_variables = member.scanned_variables
+        vtable.comment = member.comment
+
+        self.current_structure.add_member(vtable)
+        self.update_structure_fields()
+        self._select_member(vtable)
+
     def structure_table_recognize(self):
         member = self.get_selected_member()
         if not isinstance(member, VirtualTable):
@@ -2009,6 +2053,13 @@ class StructureBuilderForm(ChildScanMixin, ida_kernwin.PluginForm):
         recognize_action = menu.addAction("Recognize VTable")
         recognize_action.setEnabled(isinstance(selected_member, VirtualTable))
         recognize_action.triggered.connect(self.structure_table_recognize)
+
+        convert_vtable_action = menu.addAction("Convert to VTable")
+        convert_vtable_action.setEnabled(
+            selected_member is not None
+            and not isinstance(selected_member, VirtualTable)
+        )
+        convert_vtable_action.triggered.connect(self.convert_to_vtable)
 
         qt_exec(menu, self.ui.tbl_structure.viewport().mapToGlobal(point))
 

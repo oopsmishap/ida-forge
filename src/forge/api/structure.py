@@ -591,7 +591,7 @@ class Structure:
 
     @staticmethod
     def _extract_type_name(cdecl: str) -> str | None:
-        match = re.search(r"\b(struct|union|enum)\s+([A-Za-z_]\w*)", cdecl)
+        match = re.search(r"\b(struct|union|enum)\s+([A-Za-z_]\w*(?:::[A-Za-z_]\w*)*)", cdecl)
         if match:
             return match.group(2)
         return None
@@ -613,7 +613,16 @@ class Structure:
 
         ptr_tinfo = ida_typeinf.tinfo_t()
         ptr_tinfo.create_ptr(tinfo)
+
+        seen_targets: set[tuple] = set()
         for scan_object in self.get_unique_scanned_variables(origin):
+            target_key = (
+                getattr(scan_object, "func_ea", None),
+                getattr(scan_object, "name", None),
+            )
+            if target_key in seen_targets:
+                continue
+            seen_targets.add(target_key)
             scan_object.apply_type(ptr_tinfo)
         return tinfo
 
@@ -641,7 +650,7 @@ class Structure:
             )
             return None
 
-        ida_typeinf.del_named_type(ida_typeinf.get_idati(), structure_name)
+        ida_typeinf.del_named_type(ida_typeinf.get_idati(), structure_name, 0)
         if not forge_types.create_type(structure_name, cdecl):
             log_error(f"Failed to recreate type {structure_name}", True)
             return None

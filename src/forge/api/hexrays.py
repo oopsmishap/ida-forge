@@ -269,14 +269,19 @@ def is_legal_type(tinfo: ida_typeinf.tinfo_t) -> bool:
     if tinfo is None:
         return False
 
-    work_tinfo = tinfo
+    try:
+        empty = getattr(tinfo, "empty", None)
+        if callable(empty) and empty():
+            return False
 
-    clr_const = getattr(work_tinfo, "clr_const", None)
-    if callable(clr_const):
-        clr_const()
+        clr_const = getattr(tinfo, "clr_const", None)
+        if callable(clr_const):
+            clr_const()
+    except Exception:
+        return False
 
     # Forward declarations and other incomplete wrappers are not usable root types.
-    return not is_incomplete_tinfo(work_tinfo)
+    return not is_incomplete_tinfo(tinfo)
 
 
 def find_expr_address(cexpr: ida_hexrays.cexpr_t, parents):

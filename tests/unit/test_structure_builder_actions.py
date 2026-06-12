@@ -20,7 +20,7 @@ actions_module = import_module("forge.features.structure_builder.actions")
 class _FakeVisitor:
     calls = []
 
-    def __init__(self, *args):
+    def __init__(self, *args, **kwargs):
         self.args = args
         type(self).calls.append(args)
 
@@ -101,6 +101,7 @@ def test_deep_scan_sets_upward_resolved_root_provenance(monkeypatch):
         "_prepare_function",
         staticmethod(lambda current: current),
     )
+    monkeypatch.setattr(actions_module.DeepScanAction, "_prompt_scan_depth", staticmethod(lambda: -1))
 
     action = actions_module.DeepScanAction()
     action.create_scan_object = lambda *_args: SimpleNamespace(
@@ -134,6 +135,7 @@ def test_deep_scan_global_path_sets_global_root_provenance(monkeypatch):
         "_prepare_function",
         staticmethod(lambda current: current),
     )
+    monkeypatch.setattr(actions_module.DeepScanAction, "_prompt_scan_depth", staticmethod(lambda: -1))
     monkeypatch.setattr(actions_module, "get_funcs_referencing_address", lambda _ea: {0x402000, 0x401000})
     monkeypatch.setattr(actions_module, "decompile", lambda ea: SimpleNamespace(entry_ea=ea))
 

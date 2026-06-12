@@ -158,3 +158,58 @@ def test_parse_vtable_name_sanitizes_demangled_vtable_symbols(monkeypatch):
 
     assert nice is True
     assert name == "fixture_Interface_std_vector_int_vtbl"
+
+
+def _make_vfunc(address=0x1000, offset=16, table_name="TestVtbl"):
+    vf = members.VirtualFunction.__new__(members.VirtualFunction)
+    vf.address = address
+    vf.offset = offset
+    vf.vtable_name = table_name
+    vf.visited = False
+    return vf
+
+
+def test_virtual_function_name_returns_generated_when_get_func_name_is_none(monkeypatch):
+    vf = _make_vfunc()
+    monkeypatch.setattr(members.ida_funcs, "get_func_name", lambda _ea: None, raising=False)
+
+    assert vf.name == "TestVtbl_function_2"
+
+
+def test_virtual_function_name_returns_generated_when_demangle_fails(monkeypatch):
+    vf = _make_vfunc()
+    monkeypatch.setattr(
+        members.ida_funcs, "get_func_name", lambda _ea: "?mangled@@invalid", raising=False
+    )
+    monkeypatch.setattr(members.ida_name, "is_valid_typename", lambda _name: False, raising=False)
+    monkeypatch.setattr(members.idc, "demangle_name", lambda _name, _flags: None, raising=False)
+    monkeypatch.setattr(members.idc, "get_inf_attr", lambda _attr: 0, raising=False)
+    monkeypatch.setattr(members.idc, "INF_SHORT_DN", 0, raising=False)
+
+    assert vf.name == "TestVtbl_function_2"
+
+
+def test_virtual_function_repr_does_not_crash_with_none_func_name(monkeypatch):
+    vf = _make_vfunc(address=0x140043300, offset=0, table_name="SomeClass")
+    monkeypatch.setattr(members.ida_funcs, "get_func_name", lambda _ea: None, raising=False)
+
+    result = repr(vf)
+
+    assert "SomeClass_function_0" in result
+    assert "0x140043300" in result
+
+
+def test_virtual_function_name_returns_valid_typename_directly(monkeypatch):
+    vf = _make_vfunc()
+    monkeypatch.setattr(members.ida_funcs, "get_func_name", lambda _ea: "MyMethod", raising=False)
+    monkeypatch.setattr(members.ida_name, "is_valid_typename", lambda _name: True, raising=False)
+
+    assert vf.name == "MyMethod"
+
+
+def test_virtual_function_name_returns_generated_for_sub_prefix(monkeypatch):
+    vf = _make_vfunc()
+    monkeypatch.setattr(members.ida_funcs, "get_func_name", lambda _ea: "sub_1400A0", raising=False)
+    monkeypatch.setattr(members.ida_name, "is_valid_typename", lambda _name: True, raising=False)
+
+    assert vf.name == "TestVtbl_function_2"

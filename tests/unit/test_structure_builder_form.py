@@ -2195,3 +2195,68 @@ def test_refresh_all_linked_member_types_materializes_deferred_child_links(
 
     assert seen == [("child_ptr", "ChildType", "pointer")]
     assert member.tinfo is sentinel
+
+
+def test_convert_to_vtable_replaces_member_with_virtual_table(monkeypatch):
+    structure_form = _make_form(monkeypatch)
+    structure_form.create_structure("TestStruct")
+
+    member = _FakeMember(0, 8, type_name="_QWORD", comment="from deep scan")
+    member.scanned_variables = {"sv1", "sv2"}
+    structure_form.current_structure.members.append(member)
+
+    monkeypatch.setattr(structure_form, "get_selected_member", lambda: member)
+
+    monkeypatch.setattr(form_module.ida_kernwin, "HIST_IDENT", 0, raising=False)
+    monkeypatch.setattr(
+        form_module.ida_kernwin,
+        "ask_str",
+        lambda *_args, **_kwargs: "0x140018338",
+    )
+
+    captured = {}
+
+    class _FakeVirtualTable:
+        def __init__(self, offset, address, scanned_variable=None, origin=None):
+            captured["offset"] = offset
+            captured["address"] = address
+            captured["origin"] = origin
+            self.offset = offset
+            self.address = address
+            self.scanned_variables = set()
+            self.comment = ""
+            self.type_name = "VTable"
+            self.name = "vftable"
+            self.enabled = True
+            self.is_array = False
+            self.size = 8
+            self.origin = origin
+
+        @staticmethod
+        def is_virtual_table(address):
+            return 5
+
+        def __lt__(self, other):
+            return (self.offset, self.type_name) < (
+                getattr(other, "offset", 0),
+                getattr(other, "type_name", ""),
+            )
+
+        def __eq__(self, other):
+            return (self.offset, self.type_name) == (
+                getattr(other, "offset", 0),
+                getattr(other, "type_name", ""),
+            )
+
+    monkeypatch.setattr(form_module, "VirtualTable", _FakeVirtualTable)
+
+    structure_form.convert_to_vtable()
+
+    assert len(structure_form.current_structure.members) == 1
+    vtable = structure_form.current_structure.members[0]
+    assert isinstance(vtable, _FakeVirtualTable)
+    assert captured["offset"] == 0
+    assert captured["address"] == 0x140018338
+    assert captured["origin"] == 0
+    assert vtable.scanned_variables == {"sv1", "sv2"}
+    assert vtable.comment == "from deep scan"

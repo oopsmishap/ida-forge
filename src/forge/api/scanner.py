@@ -375,9 +375,13 @@ class ScanVisitor(ObjectVisitor):
 
         obj_tinfo = getattr(obj, "tinfo", None)
         if obj_tinfo and not is_legal_type(obj_tinfo):
-            # TODO: if this is triggered look into why and how to solve it
+            # The tinfo is corrupt or incomplete — even dstr() can throw on bad tinfo_t objects.
             expr_ea = find_expr_address(cexpr, self.parents)
-            log_warning(f"Type {obj_tinfo.dstr()} @ {to_hex(expr_ea)} is not supported")
+            try:
+                type_str = obj_tinfo.dstr()
+            except Exception:
+                type_str = "?"
+            log_warning(f"Type {type_str} @ {to_hex(expr_ea)} is not supported")
             return
 
 
@@ -730,8 +734,10 @@ class NewDeepScanVisitor(ScanVisitor, RecursiveDownwardsObjectVisitor):
         obj: ScanObject,
         structure,
         recurse_calls: bool = False,
+        max_depth: int | None = None,
     ):
         super().__init__(cfunc, origin, obj, structure, recurse_calls=recurse_calls)
+        self._max_depth = max_depth
 
 
 class DeepScanReturnVisitor(NewDeepScanVisitor):

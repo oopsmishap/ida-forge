@@ -1,4 +1,5 @@
 import ida_hexrays
+import ida_kernwin
 import idaapi
 
 from forge.api.hexrays import decompile, get_funcs_referencing_address, is_legal_type
@@ -128,7 +129,7 @@ class DeepScanAction(StructureBuilderAction):
         cloned.tinfo = obj.tinfo
         return cloned
 
-    def _scan_global_references(self, obj, origin):
+    def _scan_global_references(self, obj, origin, max_depth):
         xref_functions = sorted(get_funcs_referencing_address(obj.object_ea))
         if not xref_functions:
             log_warning(
@@ -154,12 +155,36 @@ class DeepScanAction(StructureBuilderAction):
                 origin,
                 self._clone_global_object(obj),
                 structure_form.current_structure,
+                recurse_calls=True,
+                max_depth=max_depth,
             )
             visitor.process()
+
+    @staticmethod
+    def _prompt_scan_depth() -> int | None:
+        default = config.get_class_config(type(config)).get("default_deep_scan_depth", 0)
+        result = ida_kernwin.ask_str(
+            str(default), ida_kernwin.HIST_TYPE,
+            "Scan depth (0 = unlimited):",
+        )
+        if result is None:
+            return None
+        result = result.strip()
+        if not result:
+            return 0
+        try:
+            return int(result)
+        except ValueError:
+            return default
 
     def activate(self, ctx):
         if not self._ensure_structure_selected():
             return
+
+        depth = self._prompt_scan_depth()
+        if depth is None:
+            return
+        max_depth = None if depth <= 0 else depth
 
         hx_view = ida_hexrays.get_widget_vdui(ctx.widget)
         cfunc = hx_view.cfunc
@@ -168,7 +193,7 @@ class DeepScanAction(StructureBuilderAction):
         obj = self.create_scan_object(cfunc, hx_view.item)
         if obj:
             if obj.id == ObjectType.global_object:
-                self._scan_global_references(obj, origin)
+                self._scan_global_references(obj, origin, max_depth)
             else:
                 prepared_cfunc = self._prepare_function(cfunc)
                 self._set_root_scan_provenance(
@@ -178,7 +203,9 @@ class DeepScanAction(StructureBuilderAction):
                 if prepared_cfunc.entry_ea == cfunc.entry_ea:
                     hx_view.refresh_view(True)
                 visitor = NewDeepScanVisitor(
-                    prepared_cfunc, origin, obj, structure_form.current_structure
+                    prepared_cfunc, origin, obj, structure_form.current_structure,
+                    recurse_calls=True,
+                    max_depth=max_depth,
                 )
                 visitor.process()
             structure_form.update_structure_fields()

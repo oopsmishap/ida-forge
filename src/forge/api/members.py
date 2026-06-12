@@ -479,6 +479,8 @@ class VirtualFunction:
         :return: Function name or default virtual function name
         """
         name = ida_funcs.get_func_name(self.address)
+        if not name:
+            return self._def_generate_vfunc_name()
         if ida_name.is_valid_typename(name):
             if name.startswith("sub_"):
                 return self._def_generate_vfunc_name()
@@ -486,7 +488,8 @@ class VirtualFunction:
         # TODO: add support for C++ name mangling with itanium mangler or create MSVC mangler
         demangled_name = idc.demangle_name(name, idc.get_inf_attr(idc.INF_SHORT_DN))
         if not demangled_name:
-            raise ValueError(f"Could not demangle name {name} at {hex(self.address)}")
+            log_warning(f"Could not demangle name {name!r} at {hex(self.address)}, using generated name")
+            return self._def_generate_vfunc_name()
         return demangled_name_to_c_str(demangled_name)
 
     def _def_generate_vfunc_name(self) -> str:
