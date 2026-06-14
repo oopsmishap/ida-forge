@@ -1,0 +1,34 @@
+{
+  "$schema": "https://hcli.docs.hex-rays.com/schemas/ida-plugin.json",
+  "IDAMetadataDescriptorVersion": 1,
+  "plugin": {
+    "name": "ida-forge",
+    "version": "0.0.1",
+    "entryPoint": "forge.py",
+    "idaVersions": ["9.0", "9.0sp1", "9.1", "9.2", "9.3"],
+    "description": "Structure builder, type-rewriting, and decompiler quality-of-life tools for IDA Pro.",
+    "pythonDependencies": [
+      "toml>=0.10"
+    ],
+    "authors": [
+      {
+        "name": "@oopsmishap",
+        "email": "oopsmishap@users.noreply.github.com"
+      }
+    ],
+    "license": "MIT",
+    "categories": [
+      "ui-ux-and-visualization",
+      "decompilation"
+    ],
+    "logoPath": "img/forge_256px.png",
+    "keywords": [
+      "structures",
+      "decompiler",
+      "pseudocode"
+    ],
+    "urls": {
+      "repository": "https://github.com/oopsmishap/ida-forge"
+    }
+  }
+}
