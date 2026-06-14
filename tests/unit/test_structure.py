@@ -6,6 +6,7 @@ from forge.api import structure as structure_module
 from forge.api.structure import Structure
 
 
+
 class FakeMember:
     def __init__(
         self,

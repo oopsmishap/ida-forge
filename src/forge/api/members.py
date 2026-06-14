@@ -422,12 +422,14 @@ class VirtualFunction:
         return name.startswith(("sub_", "nullsub_", "j_sub_", "unknown_libname_"))
 
     def try_rename(self) -> None:
-        desired_name = self._def_generate_vfunc_name()
+        self.try_rename_to(self._def_generate_vfunc_name())
+
+    def try_rename_to(self, desired_name: str) -> bool:
         current_name = ida_funcs.get_func_name(self.address)
         if current_name == desired_name:
-            return
+            return True
         if not current_name or not self._is_generated_name(current_name):
-            return
+            return False
 
         existing_ea = ida_name.get_name_ea(idaapi.BADADDR, desired_name)
         if existing_ea not in (idaapi.BADADDR, self.address):
@@ -435,9 +437,9 @@ class VirtualFunction:
                 "Skipping vtable function rename "
                 f"{hex(self.address)} -> {desired_name}: name already used at {hex(existing_ea)}"
             )
-            return
+            return False
 
-        ida_name.set_name(self.address, desired_name)
+        return bool(ida_name.set_name(self.address, desired_name))
 
     def get_ptr_tinfo(self):
         ptr_tinfo = ida_typeinf.tinfo_t()
@@ -524,7 +526,7 @@ class ImportedVirtualFunction(VirtualFunction):
 
 class VirtualTable(AbstractMember):
     def __init__(self, offset, address, scanned_variable=None, origin=None):
-        super().__init__(offset, address, scanned_variable, origin)
+        super().__init__(offset, scanned_variable, origin)
         self.address = address
         self.virtual_functions = []
         self.name = "_vftable" + f"_{hex(self.offset)}" if self.address else ""

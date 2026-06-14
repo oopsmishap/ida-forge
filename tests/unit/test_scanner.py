@@ -341,6 +341,7 @@ def test_get_member_creates_virtual_table_from_assignment_source(monkeypatch):
     visitor._origin = 0x10
     visitor.parents = []
     visitor.crippled = False
+    visitor._callee_base_offset = 0
     obj = SimpleNamespace(id=scanner_module.ObjectType.local_variable, name="this")
 
     member = visitor._get_member(0, SimpleNamespace(ea=0x401234), obj, None, 0x5000)
@@ -351,59 +352,55 @@ def test_get_member_creates_virtual_table_from_assignment_source(monkeypatch):
     assert member.origin == 0x10
 
 
-def test_get_member_preserves_negative_offset(monkeypatch):
+def test_get_member_applies_callee_base_offset(monkeypatch):
     scanner_module = _load_scanner_module()
     visitor = scanner_module.ScanVisitor.__new__(scanner_module.ScanVisitor)
 
-    class FakeMember:
-        def __init__(self, offset, tinfo, scan_obj, origin):
+    class FakeVirtualTable:
+        def __init__(self, offset, address, scanned_variable=None, origin=None):
             self.offset = offset
-            self.tinfo = tinfo
-            self.scan_obj = scan_obj
-            self.origin = origin
+            self.address = address
+            self.scanned_variable = scanned_variable
 
-    class FakeTinfo:
-        def __init__(self, name):
-            self._name = name
-
-        def dstr(self):
-            return self._name
-
-        def clr_const(self):
-            return None
-
-        def equals_to(self, other):
-            return False
+        @staticmethod
+        def is_virtual_table(address):
+            return 3 if address == 0x5000 else 0
 
     import forge.api.members as members_module
-    monkeypatch.setattr(members_module, "Member", FakeMember, raising=False)
-    monkeypatch.setattr(members_module, "VoidMember", type("VoidMember", (), {}), raising=False)
+    monkeypatch.setattr(members_module, "VirtualTable", FakeVirtualTable, raising=False)
     monkeypatch.setattr(
         scanner_module.ScannedObject,
         "create",
-        lambda obj, ea, origin, applicable: SimpleNamespace(obj=obj, ea=ea, origin=origin, applicable=applicable),
+        lambda obj, ea, origin, applicable: SimpleNamespace(
+            obj=obj, ea=ea, origin=origin, applicable=applicable,
+        ),
     )
-    monkeypatch.setattr(scanner_module.ida_typeinf, "tinfo_t", lambda value=None: value if value is not None else FakeTinfo("u32"))
 
-    class FakeTypes:
-        def convert_to_simple_type(self, t):
-            return t
+    visitor._origin = 0x10
+    visitor.parents = []
+    visitor.crippled = False
+    visitor._callee_base_offset = 8
+    obj = SimpleNamespace(id=scanner_module.ObjectType.local_variable, name="this")
 
-        def __getitem__(self, key):
-            return SimpleNamespace(type=FakeTinfo(key))
+    member = visitor._get_member(0, SimpleNamespace(ea=0x401234), obj, None, 0x5000)
 
-    monkeypatch.setattr(scanner_module, "types", FakeTypes())
-    monkeypatch.setattr(scanner_module, "is_code", lambda *_args, **_kwargs: False)
+    assert isinstance(member, FakeVirtualTable)
+    assert member.offset == 8
+    assert member.scanned_variable.applicable is False
+
+
+def test_get_member_discards_negative_offset():
+    scanner_module = _load_scanner_module()
+    visitor = scanner_module.ScanVisitor.__new__(scanner_module.ScanVisitor)
 
     visitor.parents = []
     visitor._origin = 0x10
-    visitor._structure = SimpleNamespace(add_member=lambda *_args, **_kwargs: None)
     visitor.crippled = False
+    visitor._callee_base_offset = 0
 
-    member = visitor._get_member(-32, SimpleNamespace(ea=0x1000), SimpleNamespace(id=scanner_module.ObjectType.local_variable, name="a1"), FakeTinfo("u32"))
+    result = visitor._get_member(-32, SimpleNamespace(ea=0x1000), SimpleNamespace(id=scanner_module.ObjectType.local_variable, name="a1"), None)
 
-    assert isinstance(member, FakeMember)
-    assert member.offset == -32
+    assert result is None
 
 
 def test_manipulate_prefers_pointer_context_even_without_pointer_tinfo(monkeypatch):
@@ -616,6 +613,41 @@ def test_extract_member_uses_argument_expression_type_without_warning(monkeypatc
     assert captured["offset"] == 0
     assert captured["tinfo"] is first_expr.type
     assert "warning" not in captured
+
+def test_extract_member_does_not_double_count_pointer_assignment_offset(monkeypatch):
+    scanner_module = _load_scanner_module()
+    visitor = scanner_module.ScanVisitor.__new__(scanner_module.ScanVisitor)
+    monkeypatch.setattr(
+        scanner_module,
+        "ctype",
+        SimpleNamespace(cast=1, ptr=2, idx=3, add=4, num=5, asg=6, var=7, obj=8, ref=9),
+    )
+
+    captured = {}
+
+    def fake_get_member(offset, cexpr, obj, tinfo, obj_ea=None):
+        captured["offset"] = offset
+        captured["obj_ea"] = obj_ea
+        return "member"
+
+    visitor._get_member = fake_get_member
+    visitor._describe_tinfo = lambda tinfo: getattr(tinfo, "dstr", lambda: str(tinfo))()
+
+    a1_var = SimpleNamespace(op=scanner_module.ctype.var, name="a1")
+    offset_num = SimpleNamespace(op=scanner_module.ctype.num, numval=lambda: 0x38)
+    add_node = SimpleNamespace(op=scanner_module.ctype.add, x=a1_var, y=offset_num)
+    lhs = SimpleNamespace(op=scanner_module.ctype.ptr, x=add_node, type=SimpleNamespace(dstr=lambda: "void *"))
+    rhs = SimpleNamespace(op=scanner_module.ctype.obj, obj_ea=0x5000)
+    asg_node = SimpleNamespace(op=scanner_module.ctype.asg, x=lhs, y=rhs)
+    ptr_parent = SimpleNamespace(op=scanner_module.ctype.ptr, x=add_node)
+    context = scanner_module.ParentExpressionContext([ptr_parent, asg_node])
+
+    result = visitor._extract_member(a1_var, SimpleNamespace(name="a1"), 0x38, context)
+
+    assert result == "member"
+    assert captured["offset"] == 0x38
+    assert captured["obj_ea"] == 0x5000
+
 
 
 

@@ -69,6 +69,9 @@ class _DummyTInfo:
     def create_array(self, *args, **kwargs):
         return True
 
+    def create_udt(self, *args, **kwargs):
+        return True
+
     def get_named_type(self, *args, **kwargs):
         return False
 
@@ -88,6 +91,10 @@ class _DummyUDTMember:
         self.offset = 0
         self.name = ""
 
+
+class _DummyUDTTypeData(list):
+    def push_back(self, value):
+        self.append(value)
 
 _user_ida_dir = Path(tempfile.gettempdir()) / "ida-forge-tests"
 _user_ida_dir.mkdir(parents=True, exist_ok=True)
@@ -125,6 +132,8 @@ _stub_module(
     tinfo_t=_DummyTInfo,
     array_type_data_t=_DummyArrayTypeData,
     udt_member_t=_DummyUDTMember,
+    udt_type_data_t=_DummyUDTTypeData,
+    BTF_STRUCT=0,
     get_idati=lambda: object(),
     parse_decl=lambda *args, **kwargs: False,
     import_type=lambda *args, **kwargs: 0,
@@ -158,9 +167,21 @@ _stub_module(
     PT_TYP=0,
     PLUGIN_KEEP=2,
     PLUGIN_SKIP=1,
+    PRTYPE_MULTI=0,
+    PRTYPE_TYPE=0,
+    PRTYPE_SEMI=0,
     idc_parse_decl=lambda *args, **kwargs: None,
     register_timer=lambda *_args, **_kwargs: object(),
     unregister_timer=lambda *_args, **_kwargs: None,
+    get_import_module_qty=lambda: 0,
+    get_import_module_name=lambda _i: "",
+    enum_import_names=lambda _i, _cb: True,
+    print_tinfo=lambda *_args, **_kwargs: "typedef;",
+    get_type_ordinal=lambda *_args, **_kwargs: 0,
+    idc_set_local_type=lambda *_args, **_kwargs: 1,
+    del_numbered_type=lambda *_args, **_kwargs: True,
+    create_typedef=lambda name: name,
+    cvar=types.SimpleNamespace(idati=object()),
 )
 _stub_module("ida_idp", IDP_INTERFACE_VERSION=0)
 _stub_module(
@@ -194,18 +215,19 @@ _stub_module(
     get_name=lambda ea: f"sub_{ea:x}",
 )
 
-for name in [
-    "ida_auto",
+_stub_module("ida_auto")
+_stub_module(
     "ida_bytes",
-    "ida_xref",
-    "ida_ida",
-    "ida_lines",
-]:
-    _stub_module(name)
-
+    get_64bit=lambda *_args, **_kwargs: 0,
+    get_32bit=lambda *_args, **_kwargs: 0,
+    get_wide_dword=lambda *_args, **_kwargs: 0,
+    get_byte=lambda *_args, **_kwargs: 0,
+    get_wide_byte=lambda *_args, **_kwargs: 0,
+)
 _stub_module(
     "ida_funcs",
     get_func=lambda *_args, **_kwargs: None,
+    get_func_name=lambda ea: f"sub_{ea:x}",
     FUNCATTR_START=0,
 )
 _stub_module("ida_segment", get_segm_name=lambda *_args, **_kwargs: "", getseg=lambda *_args, **_kwargs: None, SEGPERM_EXEC=1)
@@ -216,7 +238,19 @@ _stub_module(
     get_import_module_name=lambda _i: "",
     enum_import_names=lambda _i, _cb: True,
 )
-_stub_module("ida_name", get_short_name=lambda ea: f"name_{ea:x}")
+_stub_module("ida_xref", get_first_dref_to=lambda *_args, **_kwargs: -1)
+_stub_module("ida_ida", idainfo=types.SimpleNamespace(procname="metapc"))
+_stub_module("ida_lines")
+
+_stub_module(
+    "ida_name",
+    get_short_name=lambda ea: f"name_{ea:x}",
+    get_name=lambda _ea: "",
+    get_name_ea=lambda *_args, **_kwargs: -1,
+    set_name=lambda *_args, **_kwargs: True,
+    is_valid_typename=lambda name: bool(name) and name.replace("_", "").isalnum(),
+    demangle_name=lambda *_args, **_kwargs: None,
+)
 _stub_module("ida_netnode", BADNODE=-1, netnode=lambda *args, **kwargs: None)
 
 class _DummyQtClass:

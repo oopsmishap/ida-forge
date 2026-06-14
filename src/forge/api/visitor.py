@@ -434,23 +434,31 @@ class RecursiveDownwardsObjectVisitor(RecursiveObjectVisitor, DownwardsObjectVis
         self._rescan_current_function = False
         self._recurse_calls = recurse_calls
         self._max_depth = max_depth
-
+        self._visit_base_offsets: dict[tuple[int, int], int] = {}
 
 
     def _expression_references_object(self, cexpr) -> bool:
-        work = [cexpr]
+        work: list[tuple[object, bool]] = [(cexpr, False)]
         while work:
-            expr = work.pop()
+            expr, addr_ctx = work.pop()
             if expr is None:
                 continue
-            if any(self._matches_object(obj, expr) for obj in self._objects):
+            if not addr_ctx and any(self._matches_object(obj, expr) for obj in self._objects):
                 return True
             op = getattr(expr, "op", None)
             if op == ctype.cast:
-                work.append(getattr(expr, "x", None))
+                work.append((getattr(expr, "x", None), addr_ctx))
             elif op in (ctype.add, ctype.sub):
-                work.append(getattr(expr, "x", None))
-                work.append(getattr(expr, "y", None))
+                work.append((getattr(expr, "x", None), addr_ctx))
+                work.append((getattr(expr, "y", None), addr_ctx))
+            elif op == ctype.ref:
+                work.append((getattr(expr, "x", None), True))
+            elif op == ctype.memptr:
+                if addr_ctx:
+                    work.append((getattr(expr, "x", None), False))
+            elif op == ctype.memref:
+                if addr_ctx:
+                    work.append((getattr(expr, "x", None), True))
         return False
 
     def _check_call(self, cexpr: ida_hexrays.cexpr_t):
@@ -471,6 +479,9 @@ class RecursiveDownwardsObjectVisitor(RecursiveObjectVisitor, DownwardsObjectVis
 
         if not self._expression_references_object(cexpr):
             return
+        _, arg_offset = _extract_offset_expression(cexpr)
+        if arg_offset is None:
+            arg_offset = 0
         idx, _ = get_func_argument_info(call_cexpr, arg_cexpr)
         if idx is None:
             return
@@ -478,6 +489,7 @@ class RecursiveDownwardsObjectVisitor(RecursiveObjectVisitor, DownwardsObjectVis
         if func_ea == ida_idaapi.BADADDR:
             return
         if self._add_visit(func_ea, idx):
+            self._visit_base_offsets[(func_ea, idx)] = arg_offset
             self._add_scan_tree_info(func_ea, idx)
 
     def leave_expr(self, cexpr):
@@ -504,13 +516,15 @@ class RecursiveDownwardsObjectVisitor(RecursiveObjectVisitor, DownwardsObjectVis
     def _recursive_process(self):
         self._scan_single_function()
 
-        pending_visits = list(self._new_for_visit)
+        pending_visits: list[tuple[int, int, int]] = [
+            (fe, ai, self._visit_base_offsets.get((fe, ai), 0))
+            for (fe, ai) in self._new_for_visit
+        ]
         self._new_for_visit.clear()
-        deferred_visits: list[tuple[int, int]] = []
-
+        deferred_visits: list[tuple[int, int, int]] = []
 
         while pending_visits:
-            func_ea, arg_idx = pending_visits.pop()
+            func_ea, arg_idx, acc_offset = pending_visits.pop()
 
             cfunc = decompile(func_ea)
             if cfunc is None:
@@ -521,7 +535,7 @@ class RecursiveDownwardsObjectVisitor(RecursiveObjectVisitor, DownwardsObjectVis
 
             argidx = getattr(cfunc, "argidx", ())
             if arg_idx is None or arg_idx < 0 or arg_idx >= len(argidx):
-                deferred_visits.append((func_ea, arg_idx))
+                deferred_visits.append((func_ea, arg_idx, acc_offset))
                 continue
 
             arg, lvar_idx = get_argument(cfunc, arg_idx)
@@ -533,11 +547,18 @@ class RecursiveDownwardsObjectVisitor(RecursiveObjectVisitor, DownwardsObjectVis
             saved_skip = getattr(self, "_skip", False)
             saved_init_obj = getattr(self, "_init_obj", None)
 
+            saved_base_offset = self._callee_base_offset
+            self._callee_base_offset = acc_offset
             self.prepare_new_scan(cfunc, lvar_idx, obj)
             self._scan_single_function()
+            self._callee_base_offset = saved_base_offset
 
             if self._new_for_visit:
-                pending_visits.extend(self._new_for_visit)
+                for child_ea, child_idx in self._new_for_visit:
+                    child_offset = acc_offset + self._visit_base_offsets.get(
+                        (child_ea, child_idx), 0
+                    )
+                    pending_visits.append((child_ea, child_idx, child_offset))
                 self._new_for_visit.clear()
 
             self._cfunc = saved_cfunc
@@ -551,9 +572,9 @@ class RecursiveDownwardsObjectVisitor(RecursiveObjectVisitor, DownwardsObjectVis
                 deferred_visits = []
 
         while deferred_visits:
-            next_round: list[tuple[int, int]] = []
+            next_round: list[tuple[int, int, int]] = []
             progressed = False
-            for func_ea, arg_idx in deferred_visits:
+            for func_ea, arg_idx, acc_offset in deferred_visits:
                 cfunc = decompile(func_ea)
                 if cfunc is None:
                     continue
@@ -563,7 +584,7 @@ class RecursiveDownwardsObjectVisitor(RecursiveObjectVisitor, DownwardsObjectVis
 
                 argidx = getattr(cfunc, "argidx", ())
                 if arg_idx is None or arg_idx < 0 or arg_idx >= len(argidx):
-                    next_round.append((func_ea, arg_idx))
+                    next_round.append((func_ea, arg_idx, acc_offset))
                     continue
 
                 arg, lvar_idx = get_argument(cfunc, arg_idx)
@@ -575,11 +596,18 @@ class RecursiveDownwardsObjectVisitor(RecursiveObjectVisitor, DownwardsObjectVis
                 saved_skip = getattr(self, "_skip", False)
                 saved_init_obj = getattr(self, "_init_obj", None)
 
+                saved_base_offset = self._callee_base_offset
+                self._callee_base_offset = acc_offset
                 self.prepare_new_scan(cfunc, lvar_idx, obj)
                 self._scan_single_function()
+                self._callee_base_offset = saved_base_offset
 
                 if self._new_for_visit:
-                    pending_visits.extend(self._new_for_visit)
+                    for child_ea, child_idx in self._new_for_visit:
+                        child_offset = acc_offset + self._visit_base_offsets.get(
+                            (child_ea, child_idx), 0
+                        )
+                        pending_visits.append((child_ea, child_idx, child_offset))
                     self._new_for_visit.clear()
 
                 self._cfunc = saved_cfunc
@@ -589,6 +617,13 @@ class RecursiveDownwardsObjectVisitor(RecursiveObjectVisitor, DownwardsObjectVis
                 self._init_obj = saved_init_obj
 
                 progressed = True
+
+            if pending_visits:
+                while pending_visits:
+                    func_ea, arg_idx, acc_offset = pending_visits.pop()
+                    if arg_idx is None:
+                        continue
+                    next_round.append((func_ea, arg_idx, acc_offset))
 
             if not progressed or not next_round:
                 break

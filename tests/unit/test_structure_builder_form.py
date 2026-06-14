@@ -7,6 +7,7 @@ from types import SimpleNamespace
 
 from forge.api.structure import Structure
 
+
 hexrays_api = import_module("forge.api.hexrays")
 scanner_api = import_module("forge.api.scanner")
 setattr(hexrays_api, "get_funcs_referencing_address", lambda *_args, **_kwargs: [])

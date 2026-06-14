@@ -158,19 +158,29 @@ def _extract_offset_expression(expr, offset: int = 0, scale: int = 1, ctype_ops=
             continue
 
         if current.op in (add_op, sub_op):
-            # Hex-Rays add/sub nodes already encode byte deltas; only idx carries
-            # element-size scaling.
+            # Hex-Rays add/sub on a pointer use C element-count semantics: the
+            # numeric operand counts elements of the pointee type, so it must be
+            # scaled by the pointer's element size to recover a byte delta.
+            # `(_QWORD *)a1 + 1` is +8 bytes, not +1.
+            elem_scale = 1
+            add_type = getattr(current, "type", None)
+            get_objsize = getattr(add_type, "get_ptrarr_objsize", None)
+            if callable(get_objsize):
+                try:
+                    elem_scale = get_objsize() or 1
+                except Exception:
+                    elem_scale = 1
             left = strip_wrappers(getattr(current, "x", None))
             right = strip_wrappers(getattr(current, "y", None))
             if left is not None and getattr(left, "op", None) == num_op and right is not None:
-                delta = left.numval()
+                delta = left.numval() * elem_scale
                 if current.op == sub_op:
                     delta = -delta
                 offset += delta
                 current = right
                 continue
             if right is not None and getattr(right, "op", None) == num_op and left is not None:
-                delta = right.numval()
+                delta = right.numval() * elem_scale
                 if current.op == sub_op:
                     delta = -delta
                 offset += delta
