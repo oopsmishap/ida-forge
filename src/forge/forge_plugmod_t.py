@@ -43,11 +43,18 @@ class ForgePlugin(ida_idaapi.plugin_t):
     All heavy lifting (core load, menu attach, IDC registration) happens
     in :meth:`init` because Forge is a multi-feature plugin whose setup
     must run exactly once per IDB load. The returned :class:`forge_plugmod_t`
-    is a thin handle whose only job is to forward :meth:`run` to the menu
-    and expose hot-reload / state-log helpers.
+    is a thin handle that owns the active runtime: it forwards
+    :meth:`run` to the menu, exposes hot-reload and IDC state-log
+    helpers, and runs cleanup in :meth:`__del__` when IDA unloads the
+    plugin or the database closes.
+
+    With ``PLUGIN_MULTI`` the ``plugin_t`` exists only to satisfy IDA's
+    "give me a descriptor" contract; ``plugin_t.run`` and ``plugin_t.term``
+    are not invoked. Activation and teardown go through the
+    ``plugmod_t`` instance returned by :meth:`init`.
     """
 
-    flags = ida_idaapi.PLUGIN_KEEP
+    flags = ida_idaapi.PLUGIN_MULTI
     version = ida_idp.IDP_INTERFACE_VERSION
     comment = PLUGIN_COMMENT
     help = PLUGIN_HELP
@@ -106,12 +113,14 @@ class ForgePlugin(ida_idaapi.plugin_t):
             traceback.print_exc()
             return ida_idaapi.PLUGIN_SKIP
 
-    def run(self, arg: int) -> None:
-        if self._core is None:
-            return
-        self._core.show_menu()
+    def _teardown(self) -> None:
+        """Release every resource ``_do_init`` acquired.
 
-    def term(self) -> None:
+        Idempotent and safe to call multiple times. Invoked from
+        :meth:`forge_plugmod_t.__del__`; the ``PLUGIN_MULTI`` lifecycle
+        destroys the plugmod (not this ``plugin_t``) on unload, so this
+        method must not be called from ``plugin_t.term``.
+        """
         unregister_idc_func()
 
         if self._ready_hook is not None:
@@ -180,23 +189,34 @@ class ForgePlugin(ida_idaapi.plugin_t):
         return len(self._state_log) - 1
 
 
-# Backwards-compatibility shim. The old name is still exported so anything
-# that imports it (e.g. the test suite) keeps working.
 class forge_plugmod_t(ida_idaapi.plugmod_t):
-    """Thin ``plugmod_t`` shim returned by :meth:`ForgePlugin.init`.
+    """Active lifecycle for Forge, returned by :meth:`ForgePlugin.init`.
 
-    Holds a back-reference to its :class:`ForgePlugin` and forwards
-    :meth:`run` to the plugin's menu. All real lifecycle work lives on
-    ``ForgePlugin``; the plugmod exists only to satisfy IDA's
-    "return a ``plugmod_t``" contract for the new plugin framework.
+    Cleanup runs in :meth:`__del__` because IDA's ``PLUGIN_MULTI``
+    lifecycle destroys the plugmod (not the ``plugin_t``) when the
+    plugin is unloaded or the database closes. Activation runs in
+    :meth:`run`; the rest of the methods forward to the back-referenced
+    :class:`ForgePlugin`.
     """
 
     def __init__(self, plugin: "ForgePlugin") -> None:
         super().__init__()
         self._plugin = plugin
 
+    def __del__(self) -> None:
+        # Best-effort cleanup. IDA may unload the plugmod at any time
+        # (database close, plugin unload, IDA exit). Swallow any error
+        # so we never raise from a destructor.
+        try:
+            self._plugin._teardown()
+        except Exception:  # noqa: BLE001
+            pass
+
     def run(self, arg: int) -> None:
-        self._plugin.run(arg)
+        # Called by IDA when the user activates the plugin from
+        # Edit > Plugins > Forge. Just show the menu.
+        if self._plugin._core is not None:
+            self._plugin._core.show_menu()
 
     @property
     def core(self):

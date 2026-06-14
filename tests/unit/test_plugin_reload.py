@@ -79,3 +79,36 @@ def test_plugin_reload_rebuilds_core_and_shows_menu(monkeypatch):
     assert plugin.core is _NewCore.instances[0]
     assert plugin.core.loaded is True
     assert "hook" in menu_calls
+
+
+def test_plugmod_teardown_unloads_core_and_unhooks(monkeypatch):
+    import gc
+
+    unload_calls = []
+    menu_calls = []
+
+    plugin = plugmod_module.ForgePlugin.__new__(plugmod_module.ForgePlugin)
+    plugin._core = _OldCore(unload_calls)
+
+    real_ready_hook = plugmod_module._ReadyHook
+
+    def _fake_hook_init(self, owner):
+        self._owner = owner
+
+    monkeypatch.setattr(real_ready_hook, "__init__", _fake_hook_init)
+    monkeypatch.setattr(real_ready_hook, "unhook", lambda self: menu_calls.append("unhook"))
+
+    plugin._ready_hook = real_ready_hook(plugin)
+
+    # Build the plugmod and drop it; __del__ must call _teardown().
+    plugmod = plugmod_module.forge_plugmod_t(plugin)
+    plugmod_ref = plugmod
+    plugmod = None
+    del plugmod_ref
+    gc.collect()
+
+    assert menu_calls == ["unhook"]
+    # _OldCore.unload is called with the default keep_menu=False.
+    assert unload_calls == [False]
+    assert plugin._core is None
+    assert plugin._ready_hook is None

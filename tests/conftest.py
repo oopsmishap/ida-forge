@@ -1,11 +1,12 @@
 from __future__ import annotations
 
+import shutil
 import sys
 import tempfile
 import types
 from pathlib import Path
 
-
+import pytest
 ROOT = Path(__file__).resolve().parents[1]
 SRC = ROOT / "src"
 UTIL = ROOT / "util"
@@ -137,9 +138,10 @@ _stub_module(
     "ida_idaapi",
     plugmod_t=type("plugmod_t", (), {}),
     plugin_t=type("plugin_t", (), {}),
-    PLUGIN_KEEP=0,
+    PLUGIN_OK=0,
     PLUGIN_SKIP=1,
-    PLUGIN_MULTI=2,
+    PLUGIN_KEEP=2,
+    PLUGIN_MULTI=0x100,
     BADADDR=-1,
     BADORD=0,
 )
@@ -150,12 +152,11 @@ _stub_module(
     VT_LONG=0,
     VT_STR=1,
 )
-
 _stub_module(
     "idaapi",
     BADADDR=-1,
     PT_TYP=0,
-    PLUGIN_KEEP=0,
+    PLUGIN_KEEP=2,
     PLUGIN_SKIP=1,
     idc_parse_decl=lambda *args, **kwargs: None,
     register_timer=lambda *_args, **_kwargs: object(),
@@ -207,7 +208,7 @@ _stub_module(
     get_func=lambda *_args, **_kwargs: None,
     FUNCATTR_START=0,
 )
-_stub_module("ida_segment", get_segm_name=lambda *_args, **_kwargs: "")
+_stub_module("ida_segment", get_segm_name=lambda *_args, **_kwargs: "", getseg=lambda *_args, **_kwargs: None, SEGPERM_EXEC=1)
 _stub_module(
     "ida_nalt",
     get_imagebase=lambda: 0,
@@ -294,3 +295,21 @@ _stub_module(
 _stub_module("forge.api.types", types=types.SimpleNamespace(width=8), import_type=lambda *args, **kwargs: 0)
 _stub_module("forge.api.scanner", NewDeepScanVisitor=type("NewDeepScanVisitor", (), {}))
 _stub_module("forge.api.visitor", FunctionTouchVisitor=type("FunctionTouchVisitor", (), {}))
+
+
+@pytest.fixture(autouse=True)
+def _purge_user_config_dir():
+    """Start every test with a clean ``ida_diskio.get_user_idadir`` directory.
+
+    The ``ForgeConfig`` loader reads and writes a TOML file under
+    ``get_user_idadir() / cfg / forge.toml``. If a previous test (or a
+    prior local run) saved a file with an old schema, the singleton
+    ``StructureBuilderConfig()`` instance created at import time would
+    read those stale values and short-circuit the deep-merge that
+    normally fills in missing keys. Purging the directory per test
+    guarantees the latest ``default_config`` is used.
+    """
+    if _user_ida_dir.exists():
+        shutil.rmtree(_user_ida_dir)
+    _user_ida_dir.mkdir(parents=True, exist_ok=True)
+    yield
