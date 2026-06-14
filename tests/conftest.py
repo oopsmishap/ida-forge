@@ -126,6 +126,7 @@ _stub_module(
     udt_member_t=_DummyUDTMember,
     get_idati=lambda: object(),
     parse_decl=lambda *args, **kwargs: False,
+    import_type=lambda *args, **kwargs: 0,
     PT_TYP=0,
     PT_SIL=0,
     BADSIZE=-1,
@@ -206,20 +207,6 @@ _stub_module(
     FUNCATTR_START=0,
 )
 _stub_module("ida_segment", get_segm_name=lambda *_args, **_kwargs: "")
-_stub_module(
-    "ida_typeinf",
-    tinfo_t=_DummyTInfo,
-    array_type_data_t=_DummyArrayTypeData,
-    udt_member_t=_DummyUDTMember,
-    get_idati=lambda: object(),
-    parse_decl=lambda *args, **kwargs: False,
-    import_type=lambda *args, **kwargs: 0,
-    PT_TYP=0,
-    PT_SIL=0,
-    BADSIZE=-1,
-    STRMEM_OFFSET=0,
-    cvar=types.SimpleNamespace(idati=object()),
-)
 _stub_module(
     "ida_nalt",
     get_imagebase=lambda: 0,
