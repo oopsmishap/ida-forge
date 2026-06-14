@@ -38,12 +38,13 @@ class _NewCore:
         self.loaded = True
 
 
-def _make_plugmod(monkeypatch, *, core: _OldCore):
-    plugmod = plugmod_module.forge_plugmod_t.__new__(plugmod_module.forge_plugmod_t)
-    plugmod._core = core
-    plugmod._ready_hook = None
-    plugmod._state_log = []
-    return plugmod
+def _make_plugin(monkeypatch, *, core: _OldCore):
+    plugin = plugmod_module.ForgePlugin.__new__(plugmod_module.ForgePlugin)
+    plugin._core = core
+    plugin._ready_hook = None
+    plugin._state_log = []
+    plugin._plugmod = None
+    return plugin
 
 
 def test_plugin_reload_rebuilds_core_and_shows_menu(monkeypatch):
@@ -52,7 +53,7 @@ def test_plugin_reload_rebuilds_core_and_shows_menu(monkeypatch):
     menu_calls = []
     queued = []
 
-    plugmod = _make_plugmod(monkeypatch, core=_OldCore(unload_calls))
+    plugin = _make_plugin(monkeypatch, core=_OldCore(unload_calls))
 
     monkeypatch.setattr(plugmod_module, "recursive_reload", lambda module, exclude_prefixes=(): reload_calls.append((module, exclude_prefixes)))
     monkeypatch.setattr(forge_core_module, "ForgeCore", _NewCore)
@@ -67,7 +68,7 @@ def test_plugin_reload_rebuilds_core_and_shows_menu(monkeypatch):
     monkeypatch.setattr(real_ready_hook, "hook", lambda self: menu_calls.append("hook"))
     monkeypatch.setattr(real_ready_hook, "unhook", lambda self: menu_calls.append("unhook"))
 
-    plugmod.reload()
+    plugin.reload()
 
     assert len(queued) == 1
     queued[0][0]()
@@ -75,6 +76,6 @@ def test_plugin_reload_rebuilds_core_and_shows_menu(monkeypatch):
     assert unload_calls == [True]
     assert reload_calls == [(forge_module, ("forge.api.ui_actions",))]
     assert len(_NewCore.instances) == 1
-    assert plugmod.core is _NewCore.instances[0]
-    assert plugmod.core.loaded is True
+    assert plugin.core is _NewCore.instances[0]
+    assert plugin.core.loaded is True
     assert "hook" in menu_calls

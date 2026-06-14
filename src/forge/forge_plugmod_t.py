@@ -5,11 +5,14 @@ import traceback
 from typing import TYPE_CHECKING
 
 import ida_hexrays
+import ida_idp
 import ida_idaapi
 import ida_kernwin
 
 from forge.core import ForgeCore
 from forge.plugin import (
+    PLUGIN_COMMENT,
+    PLUGIN_HELP,
     PLUGIN_NAME,
     register_idc_func,
     unregister_idc_func,
@@ -22,43 +25,43 @@ from forge.util.versions import (
 )
 
 
-if TYPE_CHECKING:
-    pass
-
-
 class _ReadyHook(ida_kernwin.UI_Hooks):
     """UI hook that attaches the plugin menu when the UI is ready."""
 
-    def __init__(self, plugmod: "forge_plugmod_t") -> None:
+    def __init__(self, plugin: "ForgePlugin") -> None:
         super().__init__()
-        self._plugmod = plugmod
+        self._plugin = plugin
 
     def ready_to_run(self) -> None:
-        if self._plugmod._core is not None:
-            self._plugmod._core.show_menu()
+        if self._plugin._core is not None:
+            self._plugin._core.show_menu()
 
 
-class forge_plugmod_t(ida_idaapi.plugmod_t):
-    """Active lifecycle for the Forge plugin.
+class ForgePlugin(ida_idaapi.plugin_t):
+    """IDA plugin entry point for Forge.
 
-    Owns the live :class:`ForgeCore` instance, registers cross-plugin IDC
-    accessors, and attaches the top-level menu once IDA's UI is ready.
+    All heavy lifting (core load, menu attach, IDC registration) happens
+    in :meth:`init` because Forge is a multi-feature plugin whose setup
+    must run exactly once per IDB load. The returned :class:`forge_plugmod_t`
+    is a thin handle whose only job is to forward :meth:`run` to the menu
+    and expose hot-reload / state-log helpers.
     """
+
+    flags = ida_idaapi.PLUGIN_KEEP
+    version = ida_idp.IDP_INTERFACE_VERSION
+    comment = PLUGIN_COMMENT
+    help = PLUGIN_HELP
+    wanted_name = PLUGIN_NAME
+    wanted_hotkey = ""
 
     def __init__(self) -> None:
         super().__init__()
         self._core: ForgeCore | None = None
         self._ready_hook: _ReadyHook | None = None
         self._state_log: list[str] = []
+        self._plugmod: "forge_plugmod_t | None" = None
 
-    def __del__(self) -> None:
-        # Best-effort cleanup; IDA may unload the plugmod at any time.
-        try:
-            self.term()
-        except Exception:  # noqa: BLE001
-            pass
-
-    def init(self) -> int:
+    def init(self) -> ida_idaapi.plugmod_t:
         try:
             return self._do_init()
         except Exception as exc:  # noqa: BLE001
@@ -66,7 +69,8 @@ class forge_plugmod_t(ida_idaapi.plugmod_t):
             traceback.print_exc()
             return ida_idaapi.PLUGIN_SKIP
 
-    def _do_init(self) -> int:
+    def _do_init(self) -> ida_idaapi.plugmod_t:
+        log_debug(f"Checking environment for {PLUGIN_NAME}")
         if not is_python_version_supported():
             log_warning("Unsupported Python version")
             return ida_idaapi.PLUGIN_SKIP
@@ -79,24 +83,31 @@ class forge_plugmod_t(ida_idaapi.plugmod_t):
             log_warning("Failed to initialize Hex-Rays SDK")
             return ida_idaapi.PLUGIN_SKIP
 
-        self._core = ForgeCore()
-        self._core.load()
+        try:
+            self._core = ForgeCore()
+            self._core.load()
 
-        self._ready_hook = _ReadyHook(self)
-        self._ready_hook.hook()
+            self._ready_hook = _ReadyHook(self)
+            self._ready_hook.hook()
 
-        register_idc_func(self)
+            plugmod = forge_plugmod_t(self)
+            self._plugmod = plugmod
 
-        main_module = sys.modules.get("__main__")
-        if main_module is not None:
-            main_module.forge = self
+            register_idc_func(plugmod)
 
-        log_debug(f"{PLUGIN_NAME} loaded successfully!")
-        return ida_idaapi.PLUGIN_KEEP
+            main_module = sys.modules.get("__main__")
+            if main_module is not None:
+                main_module.forge = plugmod
+
+            log_debug(f"{PLUGIN_NAME} loaded successfully!")
+            return plugmod
+        except Exception as exc:  # noqa: BLE001
+            log_warning(f"Failed to initialize {PLUGIN_NAME}: {exc}")
+            traceback.print_exc()
+            return ida_idaapi.PLUGIN_SKIP
 
     def run(self, arg: int) -> None:
         if self._core is None:
-            log_warning("Plugin not initialized yet")
             return
         self._core.show_menu()
 
@@ -112,8 +123,15 @@ class forge_plugmod_t(ida_idaapi.plugmod_t):
             self._core = None
 
         main_module = sys.modules.get("__main__")
-        if main_module is not None and getattr(main_module, "forge", None) is self:
+        if main_module is not None and getattr(main_module, "forge", None) is self._plugmod:
             del main_module.forge
+
+        self._plugmod = None
+
+    @property
+    def core(self) -> ForgeCore | None:
+        """Return the active plugin core."""
+        return self._core
 
     def reload(self) -> None:
         """Hot-reload the plugin modules and recreate the core on the UI thread."""
@@ -130,8 +148,6 @@ class forge_plugmod_t(ida_idaapi.plugmod_t):
             self._ready_hook.unhook()
             self._ready_hook = None
 
-        # Acquire the `forge` package from sys.modules — `forge.py` imports
-        # this module, so we must not import it again at the top level.
         forge_pkg = sys.modules.get("forge")
         if forge_pkg is None:
             log_warning("Cannot reload: 'forge' package is not in sys.modules")
@@ -149,11 +165,6 @@ class forge_plugmod_t(ida_idaapi.plugmod_t):
 
         log_debug(f"{PLUGIN_NAME} reloaded successfully!")
 
-    @property
-    def core(self) -> ForgeCore | None:
-        """Return the active plugin core, or ``None`` if unloaded."""
-        return self._core
-
     def get_state(self, index: int) -> str:
         """Return the recorded state entry at ``index`` (IDC accessor)."""
         if not self._state_log:
@@ -167,3 +178,35 @@ class forge_plugmod_t(ida_idaapi.plugmod_t):
         """Append ``value`` to the state log and return its index (IDC accessor)."""
         self._state_log.append(value or "")
         return len(self._state_log) - 1
+
+
+# Backwards-compatibility shim. The old name is still exported so anything
+# that imports it (e.g. the test suite) keeps working.
+class forge_plugmod_t(ida_idaapi.plugmod_t):
+    """Thin ``plugmod_t`` shim returned by :meth:`ForgePlugin.init`.
+
+    Holds a back-reference to its :class:`ForgePlugin` and forwards
+    :meth:`run` to the plugin's menu. All real lifecycle work lives on
+    ``ForgePlugin``; the plugmod exists only to satisfy IDA's
+    "return a ``plugmod_t``" contract for the new plugin framework.
+    """
+
+    def __init__(self, plugin: "ForgePlugin") -> None:
+        super().__init__()
+        self._plugin = plugin
+
+    def run(self, arg: int) -> None:
+        self._plugin.run(arg)
+
+    @property
+    def core(self):
+        return self._plugin.core
+
+    def reload(self) -> None:
+        self._plugin.reload()
+
+    def get_state(self, index: int) -> str:
+        return self._plugin.get_state(index)
+
+    def add_state(self, value: str) -> int:
+        return self._plugin.add_state(value)
