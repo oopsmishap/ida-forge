@@ -11,9 +11,12 @@ class StructureBuilderConfig(ForgeConfig):
         "deep_scan_hotkey": "Shift+Alt+S",
         "default_deep_scan_depth": 3,
         "form": {
+            "cell_background_color": "#2A2A2A",
+            "cell_foreground_color": "#E0E0E0",
             "origin_color": "#006699",
-            "disabled_color": "#999999",
-            "collision_foreground_color": "#F0DB2B",
+            "origin_foreground_color": "#FFFFFF",
+            "disabled_color": "#3D3D3D",
+            "disabled_foreground_color": "#D0D0D0",
             "collision_background_color": "#CC4B4B",
         },
     }

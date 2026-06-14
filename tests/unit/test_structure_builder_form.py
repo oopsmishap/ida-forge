@@ -260,9 +260,17 @@ def test_make_table_item_uses_shared_qt_flag_helper(monkeypatch):
         def __init__(self, text):
             self.text = text
             self.flags = None
+            self.background = None
+            self.foreground = None
 
         def setFlags(self, flags):
             self.flags = flags
+
+        def setBackground(self, color):
+            self.background = color
+
+        def setForeground(self, color):
+            self.foreground = color
 
     monkeypatch.setattr(form_module, "QTableWidgetItem", _FakeItem)
     monkeypatch.setattr(
@@ -275,10 +283,251 @@ def test_make_table_item_uses_shared_qt_flag_helper(monkeypatch):
 
     assert item.text == "field"
     assert item.flags == 0xD
+    # _make_table_item now sets a default background and foreground
+    # so no cell is ever transparent (the QTableWidget viewport is
+    # white in IDA's theme and would otherwise bleed through).
+    assert item.background is not None
+    assert item.foreground is not None
     assert calls == [
         (form_module.Qt.ItemIsSelectable, form_module.Qt.ItemIsEnabled),
         (0xD, form_module.Qt.ItemIsEditable),
     ]
+
+
+def test_update_structure_fields_disabled_state_paints_all_columns(monkeypatch):
+    """Disabled rows must paint the disabled color on *every* column.
+
+    A previous version of the form relied on the per-item
+    ``setBackground`` to override the QTableWidget viewport's white
+    background. Some cells were left transparent on dark themes and
+    rendered white-on-white for the disabled foreground. The fix
+    guarantees a default per-cell background in ``_make_table_item``
+    so the disabled/collision colors reliably win for all columns.
+    """
+    structure_form = _make_form(monkeypatch)
+    captured = []
+
+    class _FakeItem:
+        def __init__(self, text):
+            self.text = text
+            self.flags = None
+            self.background = None
+            self.foreground = None
+
+        def setFlags(self, flags):
+            self.flags = flags
+
+        def setBackground(self, color):
+            self.background = color
+
+        def setForeground(self, color):
+            self.foreground = color
+
+    class _FakeTable:
+        def __init__(self):
+            self._items = {}
+            self.column_count = 5
+
+        def columnCount(self):
+            return self.column_count
+
+        def rowCount(self):
+            return 1
+
+        def setRowCount(self, _n):
+            self._items.clear()
+
+        def setItem(self, row, col, item):
+            captured.append((row, col, item))
+            self._items[(row, col)] = item
+
+        def item(self, row, col):
+            return self._items.get((row, col))
+
+        def setEnabled(self, _v):
+            pass
+
+        def setDisabled(self, _v):
+            pass
+
+        def clearSelection(self):
+            pass
+
+        def selectRow(self, _row):
+            pass
+
+        def setRangeSelected(self, *_args, **_kwargs):
+            pass
+
+        def setCurrentCell(self, *_args, **_kwargs):
+            pass
+
+        def verticalScrollBar(self):
+            return SimpleNamespace(value=lambda: 0, setValue=lambda _v: None)
+
+    table = _FakeTable()
+    structure_form.ui = SimpleNamespace(
+        tbl_structure=table,
+        input_name=SimpleNamespace(setText=lambda _t: None),
+    )
+
+    member = SimpleNamespace(
+        offset=0x10,
+        size=8,
+        name="field_disabled",
+        type_name="u64",
+        score=0,
+        comment="",
+        enabled=False,
+        is_array=False,
+    )
+    structure = Structure("disabled_check")
+    structure.add_member(member)
+    # Use a different main_offset so the origin highlight does not
+    # repaint the offset cell on top of the disabled state.
+    structure.main_offset = 0x20
+    structure_form.current_structure = structure
+
+    monkeypatch.setattr(form_module, "QTableWidgetItem", _FakeItem)
+    monkeypatch.setattr(form_module, "QColor", lambda hexstr: hexstr)
+    monkeypatch.setattr(structure_form, "get_selected_rows", lambda: [])
+    monkeypatch.setattr(structure_form, "_restore_selected_rows", lambda _r: None)
+    monkeypatch.setattr(structure_form, "update_action_states", lambda: None)
+
+    form_module.StructureBuilderForm.update_structure_fields.__get__(structure_form)()
+
+    # Sanity: verify the fake recorded the expected setItem calls
+    assert len(captured) == 5, (
+        f"expected 5 setItem calls (one per column), got {len(captured)}: {captured}"
+    )
+    for row, col, _ in captured:
+        assert row == 0
+        assert 0 <= col < 5
+
+    disabled_bg = form_module.config["form"]["disabled_color"]
+    disabled_fg = form_module.config["form"]["disabled_foreground_color"]
+
+    for col in range(5):
+        item = table.item(0, col)
+        assert item is not None, f"column {col} has no item"
+        assert item.background is not None, (
+            f"column {col} has no background — viewport white would"
+            " show through and disabled text becomes invisible"
+        )
+        assert item.background == disabled_bg, (
+            f"column {col} did not receive the disabled background"
+        )
+        assert item.foreground == disabled_fg, (
+            f"column {col} did not receive the disabled foreground"
+        )
+
+
+def test_update_structure_fields_origin_cell_uses_disabled_palette_when_row_disabled(
+    monkeypatch,
+):
+    """A row that is the structure's main offset but is disabled must
+    paint the offset cell with the disabled palette, not the origin
+    blue. The visual cue is the row state, not the offset cell.
+    """
+    structure_form = _make_form(monkeypatch)
+    captured = []
+
+    class _FakeItem:
+        def __init__(self, text):
+            self.text = text
+            self.background = None
+            self.foreground = None
+
+        def setFlags(self, _flags):
+            pass
+
+        def setBackground(self, color):
+            self.background = color
+
+        def setForeground(self, color):
+            self.foreground = color
+
+    class _FakeTable:
+        def __init__(self):
+            self._items = {}
+            self.column_count = 5
+
+        def columnCount(self):
+            return self.column_count
+
+        def rowCount(self):
+            return 1
+
+        def setRowCount(self, _n):
+            self._items.clear()
+
+        def setItem(self, row, col, item):
+            captured.append((row, col, item))
+            self._items[(row, col)] = item
+
+        def item(self, row, col):
+            return self._items.get((row, col))
+
+        def setEnabled(self, _v):
+            pass
+
+        def setDisabled(self, _v):
+            pass
+
+        def clearSelection(self):
+            pass
+
+        def selectRow(self, _row):
+            pass
+
+        def setRangeSelected(self, *_args, **_kwargs):
+            pass
+
+        def setCurrentCell(self, *_args, **_kwargs):
+            pass
+
+        def verticalScrollBar(self):
+            return SimpleNamespace(value=lambda: 0, setValue=lambda _v: None)
+
+    table = _FakeTable()
+    structure_form.ui = SimpleNamespace(
+        tbl_structure=table,
+        input_name=SimpleNamespace(setText=lambda _t: None),
+    )
+
+    member = SimpleNamespace(
+        offset=0x10,
+        size=8,
+        name="origin_field",
+        type_name="u64",
+        score=0,
+        comment="",
+        enabled=False,
+        is_array=False,
+    )
+    structure = Structure("disabled_origin")
+    structure.add_member(member)
+    # The member's offset IS the structure's main offset, so it is
+    # the origin row. With the row disabled, the origin cell must
+    # adopt the disabled palette.
+    structure.main_offset = 0x10
+    structure_form.current_structure = structure
+
+    monkeypatch.setattr(form_module, "QTableWidgetItem", _FakeItem)
+    monkeypatch.setattr(form_module, "QColor", lambda hexstr: hexstr)
+    monkeypatch.setattr(structure_form, "get_selected_rows", lambda: [])
+    monkeypatch.setattr(structure_form, "_restore_selected_rows", lambda _r: None)
+    monkeypatch.setattr(structure_form, "update_action_states", lambda: None)
+
+    form_module.StructureBuilderForm.update_structure_fields.__get__(structure_form)()
+
+    offset_item = table.item(0, 0)
+    assert offset_item is not None
+    # Origin cell should now be the disabled palette, not the origin blue.
+    assert offset_item.background == form_module.config["form"]["disabled_color"]
+    assert offset_item.foreground == form_module.config["form"]["disabled_foreground_color"]
+    assert offset_item.background != form_module.config["form"]["origin_color"]
+
 
 def test_create_structure_treats_none_as_cancel(monkeypatch):
     structure_form = _make_form(monkeypatch)

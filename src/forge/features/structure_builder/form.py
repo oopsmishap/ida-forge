@@ -255,7 +255,13 @@ class StructureBuilderForm(ChildScanMixin, ida_kernwin.PluginForm):
             QtWidgets.QAbstractItemView.DoubleClicked
             | QtWidgets.QAbstractItemView.EditKeyPressed
         )
-        self.ui.tbl_structure.setAlternatingRowColors(True)
+        # Per-state row colors (origin / disabled / collision) carry
+        # the visual structure. The Qt default alternating-row painter
+        # bleeds through per-cell backgrounds on dark themes and
+        # produces white-on-white text in disabled rows. We set a
+        # default per-cell color in :meth:`_make_table_item` so no
+        # cell is ever transparent.
+        self.ui.tbl_structure.setAlternatingRowColors(False)
         self.ui.tbl_structure.setSortingEnabled(False)
 
     def _register_shortcut(
@@ -398,6 +404,14 @@ class StructureBuilderForm(ChildScanMixin, ida_kernwin.PluginForm):
         if editable:
             flags = qt_item_flags(flags, Qt.ItemIsEditable)
         item.setFlags(flags)
+        # Default per-cell colors so no cell is ever transparent. The
+        # Qt viewport is white by default in IDA's theme; without an
+        # explicit background, cells paint as white-on-...-color and
+        # light-grey disabled text becomes invisible. Per-state row
+        # colors (origin / disabled / collision) overwrite these in
+        # :meth:`update_structure_fields`.
+        item.setBackground(QColor(config["form"]["cell_background_color"]))
+        item.setForeground(QColor(config["form"]["cell_foreground_color"]))
         return item
 
     def get_selected_rows(self) -> list[int]:
@@ -974,16 +988,16 @@ class StructureBuilderForm(ChildScanMixin, ida_kernwin.PluginForm):
                         self._make_table_item(member.comment, editable=True),
                     )
 
-                    if self.current_structure.main_offset == member.offset:
-                        table.item(row, Column.offset).setBackground(
-                            QColor(config["form"]["origin_color"])
-                        )
-
                     if not member.enabled:
                         set_row_background_color(
                             table,
                             row,
                             QColor(config["form"]["disabled_color"]),
+                        )
+                        set_row_foreground_color(
+                            table,
+                            row,
+                            QColor(config["form"]["disabled_foreground_color"]),
                         )
                     elif self.current_structure.has_collision(row):
                         set_row_background_color(
@@ -996,6 +1010,22 @@ class StructureBuilderForm(ChildScanMixin, ida_kernwin.PluginForm):
                             row,
                             QColor(config["form"]["collision_foreground_color"]),
                         )
+
+                    # Origin highlight applied last. When the row is
+                    # disabled the origin cell adopts the disabled
+                    # palette so the user can see at a glance that the
+                    # structure root is excluded from the layout. On
+                    # enabled/collision rows the cell stays blue.
+                    if self.current_structure.main_offset == member.offset:
+                        origin_item = table.item(row, Column.offset)
+                        if member.enabled:
+                            origin_bg = config["form"]["origin_color"]
+                            origin_fg = config["form"]["origin_foreground_color"]
+                        else:
+                            origin_bg = config["form"]["disabled_color"]
+                            origin_fg = config["form"]["disabled_foreground_color"]
+                        origin_item.setBackground(QColor(origin_bg))
+                        origin_item.setForeground(QColor(origin_fg))
         finally:
             del blocker
 
