@@ -87,7 +87,8 @@ def is_code(ea: int):
 
 
 def is_imported(ea: int):
-    if ida_segment.get_segm_name(ea) == ".plt":
+    seg = ida_segment.getseg(ea)
+    if seg is not None and ida_segment.get_segm_name(seg) == ".plt":
         return True
     return ea + ida_nalt.get_imagebase() in cache.imported_ea
 
