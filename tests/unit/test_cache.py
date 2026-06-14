@@ -12,15 +12,15 @@ def test_collect_imported_ea_clears_existing_and_subtracts_image_base(monkeypatc
     }
 
     monkeypatch.setattr(cache.ida_nalt, "get_imagebase", lambda: 0x1000)
-    monkeypatch.setattr(cache.idaapi, "get_import_module_qty", lambda: 3)
-    monkeypatch.setattr(cache.idaapi, "get_import_module_name", lambda i: "mod" if i != 1 else "")
+    monkeypatch.setattr(cache.ida_nalt, "get_import_module_qty", lambda: 3)
+    monkeypatch.setattr(cache.ida_nalt, "get_import_module_name", lambda i: "mod" if i != 1 else "")
 
     def fake_enum_import_names(index, callback):
         for entry in imports.get(index, []):
             callback(*entry)
         return True
 
-    monkeypatch.setattr(cache.idaapi, "enum_import_names", fake_enum_import_names)
+    monkeypatch.setattr(cache.ida_nalt, "enum_import_names", fake_enum_import_names)
 
     cache._collect_imported_ea()
 

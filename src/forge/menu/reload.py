@@ -2,8 +2,6 @@ from __future__ import annotations
 
 import sys
 
-import ida_kernwin
-
 from forge.api.ui_actions import UIMenuAction, register_action
 from forge.util.logging import log_warning
 
@@ -16,19 +14,11 @@ class ReloadAction(UIMenuAction):
 
     def activate(self, ctx):
         main_module = sys.modules.get("__main__")
-        plugin = getattr(main_module, "forge", None) if main_module is not None else None
+        plugmod = getattr(main_module, "forge", None) if main_module is not None else None
 
-        if plugin is None:
+        if plugmod is None:
             log_warning("Forge plugin instance is not available; cannot reload.")
             return 0
 
-        def _perform_reload():
-            plugin.reload()
-            return 0
-
-        if not ida_kernwin.execute_ui_requests([_perform_reload]):
-            log_warning("Could not schedule Forge reload.")
-
+        plugmod.reload()
         return 0
-
-

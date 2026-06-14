@@ -38,15 +38,10 @@ def test_reload_action_calls_active_plugin_reload(monkeypatch):
     action = registered_actions[0]
 
     reload_calls = []
-    queued = []
-    plugin = types.SimpleNamespace(reload=lambda: reload_calls.append("reloaded"))
-    monkeypatch.setattr(sys.modules["__main__"], "forge", plugin, raising=False)
-    monkeypatch.setattr(module.ida_kernwin, "execute_ui_requests", lambda callbacks: queued.append(callbacks) or True)
+    plugmod = types.SimpleNamespace(reload=lambda: reload_calls.append("reloaded"))
+    monkeypatch.setattr(sys.modules["__main__"], "forge", plugmod, raising=False)
 
     assert action.activate(None) == 0
-    assert reload_calls == []
-    assert len(queued) == 1
-    assert queued[0][0]() == 0
     assert reload_calls == ["reloaded"]
 
 
@@ -56,13 +51,8 @@ def test_reload_action_warns_when_plugin_instance_is_missing(monkeypatch):
     action = registered_actions[0]
 
     warnings = []
-    queued = []
-    monkeypatch.setattr(module, "log_warning", lambda message: warnings.append(message))
-    monkeypatch.setattr(module.ida_kernwin, "execute_ui_requests", lambda callbacks: queued.append(callbacks) or True)
+    monkeypatch.setattr(module, "log_warning", lambda message, *args, **kwargs: warnings.append(message))
     monkeypatch.delattr(sys.modules["__main__"], "forge", raising=False)
 
     assert action.activate(None) == 0
     assert warnings == ["Forge plugin instance is not available; cannot reload."]
-    assert queued == []
-
-

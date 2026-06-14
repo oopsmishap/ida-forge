@@ -107,8 +107,7 @@ _stub_module(
     execute_ui_requests=lambda *args, **kwargs: True,
     action_desc_t=lambda *args, **kwargs: (args, kwargs),
     action_handler_t=_DummyActionHandler,
-
-    HIST_TYPE=0,
+    UI_Hooks=_DummyHexraysHooks,
     AST_ENABLE_FOR_IDB=1,
     AST_ENABLE_FOR_WIDGET=2,
     AST_DISABLE_FOR_WIDGET=3,
@@ -117,6 +116,7 @@ _stub_module(
     Choose=_DummyChoose,
     PluginForm=_DummyPluginForm,
     is_idaq=lambda: True,
+    jumpto=lambda *_args, **_kwargs: True,
 )
 _stub_module("ida_diskio", get_user_idadir=lambda: str(_user_ida_dir))
 _stub_module(
@@ -133,6 +133,23 @@ _stub_module(
     cvar=types.SimpleNamespace(idati=object()),
 )
 _stub_module(
+    "ida_idaapi",
+    plugmod_t=type("plugmod_t", (), {}),
+    plugin_t=type("plugin_t", (), {}),
+    PLUGIN_KEEP=0,
+    PLUGIN_SKIP=1,
+    PLUGIN_MULTI=2,
+    BADADDR=-1,
+    BADORD=0,
+)
+_stub_module(
+    "ida_expr",
+    add_idc_func=lambda *args, **kwargs: True,
+    del_idc_func=lambda *args, **kwargs: True,
+    VT_LONG=0,
+    VT_STR=1,
+)
+_stub_module(
     "idaapi",
     BADADDR=-1,
     PT_TYP=0,
@@ -141,9 +158,6 @@ _stub_module(
     idc_parse_decl=lambda *args, **kwargs: None,
     register_timer=lambda *_args, **_kwargs: object(),
     unregister_timer=lambda *_args, **_kwargs: None,
-    get_import_module_qty=lambda: 0,
-    get_import_module_name=lambda _i: "",
-    enum_import_names=lambda _i, _cb: True,
 )
 _stub_module("ida_idp", IDP_INTERFACE_VERSION=0)
 _stub_module(
@@ -159,12 +173,17 @@ _stub_module(
     lvar_t=type("lvar_t", (), {}),
     vdui_t=object,
     VDI_EXPR=1,
+    cot_memptr=70,
+    cot_memref=71,
+    cot_idx=80,
+    cot_num=12,
     OPF_REUSE=0,
     DecompilationFailure=Exception,
 )
 _stub_module(
     "idc",
     BADADDR=-1,
+    BADORD=0,
     FUNCATTR_START=0,
     import_type=lambda *args, **kwargs: 0,
     get_segm_name=lambda *_args: "",
@@ -175,16 +194,40 @@ _stub_module(
 for name in [
     "ida_auto",
     "ida_bytes",
-    "ida_funcs",
-    "ida_segment",
     "ida_xref",
     "ida_ida",
     "ida_lines",
 ]:
     _stub_module(name)
 
+_stub_module(
+    "ida_funcs",
+    get_func=lambda *_args, **_kwargs: None,
+    FUNCATTR_START=0,
+)
+_stub_module("ida_segment", get_segm_name=lambda *_args, **_kwargs: "")
+_stub_module(
+    "ida_typeinf",
+    tinfo_t=_DummyTInfo,
+    array_type_data_t=_DummyArrayTypeData,
+    udt_member_t=_DummyUDTMember,
+    get_idati=lambda: object(),
+    parse_decl=lambda *args, **kwargs: False,
+    import_type=lambda *args, **kwargs: 0,
+    PT_TYP=0,
+    PT_SIL=0,
+    BADSIZE=-1,
+    STRMEM_OFFSET=0,
+    cvar=types.SimpleNamespace(idati=object()),
+)
+_stub_module(
+    "ida_nalt",
+    get_imagebase=lambda: 0,
+    get_import_module_qty=lambda: 0,
+    get_import_module_name=lambda _i: "",
+    enum_import_names=lambda _i, _cb: True,
+)
 _stub_module("ida_name", get_short_name=lambda ea: f"name_{ea:x}")
-_stub_module("ida_nalt", get_imagebase=lambda: 0)
 _stub_module("ida_netnode", BADNODE=-1, netnode=lambda *args, **kwargs: None)
 
 class _DummyQtClass:
