@@ -5,17 +5,18 @@ import ida_bytes
 import ida_funcs
 import ida_hexrays
 import ida_ida
-import idaapi
+import ida_idaapi
 import ida_lines
+import ida_name
+import ida_segment
 import ida_typeinf
 import ida_xref
 import ida_nalt
-import idc
 
 from forge.api import cache
 from forge.api.tinfo import is_incomplete_tinfo
 from forge.api.types import types
-from forge.util.logging import *
+from forge.util.logging import log_debug, log_error, log_warning
 from forge.util.util import DocIntEnum
 
 
@@ -86,7 +87,7 @@ def is_code(ea: int):
 
 
 def is_imported(ea: int):
-    if idc.get_segm_name(ea) == ".plt":
+    if ida_segment.get_segm_name(ea) == ".plt":
         return True
     return ea + ida_nalt.get_imagebase() in cache.imported_ea
 
@@ -150,7 +151,7 @@ def _call_argument_match_key(expr: ida_hexrays.cexpr_t | None):
     dstr = getattr(expr, "dstr", None)
     return (
         getattr(expr, "op", None),
-        getattr(expr, "ea", idaapi.BADADDR),
+            getattr(expr, "ea", ida_idaapi.BADADDR),
         dstr() if callable(dstr) else str(expr),
     )
 
@@ -219,7 +220,7 @@ def get_funcs_calling_address(ea):
     """
     xref_ea = ida_xref.get_first_cref_to(ea)
     xrefs = set()
-    while xref_ea != idaapi.BADADDR:
+    while xref_ea != ida_idaapi.BADADDR:
         xref_func = ida_funcs.get_func(xref_ea)
         if xref_func:
             xrefs.add(xref_func.start_ea)
@@ -293,11 +294,12 @@ def find_expr_address(cexpr: ida_hexrays.cexpr_t, parents):
     :return: Closest virtual address to given expression
     """
     ea = cexpr.ea
-    if ea != idaapi.BADADDR:
+    if ea != ida_idaapi.BADADDR:
         return ea
     for p in reversed(parents):
-        if p.ea != idaapi.BADADDR:
+        if p.ea != ida_idaapi.BADADDR:
             return p.ea
+
 
 
 def print_expr_address(cexpr: ida_hexrays.cexpr_t, parents) -> str:
@@ -348,11 +350,12 @@ def to_function_offset_str(ea: int) -> str:
         return "<no-function>"
 
     func_start_ea = func.start_ea
-    func_name = idc.get_name(func_start_ea) or to_hex(func_start_ea)
+    func_name = ida_name.get_name(func_start_ea) or to_hex(func_start_ea)
     offset = ea - func_start_ea
     if offset == 0:
         return func_name
     return f"{func_name}{offset:+#x}"
+
 
 
 # Enums

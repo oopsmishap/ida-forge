@@ -2,8 +2,8 @@ from dataclasses import dataclass
 from typing import Dict, Optional, Tuple
 
 import ida_ida
+import ida_idaapi
 import ida_typeinf
-import idc
 
 from forge.api.config import ForgeConfig
 from forge.util.util import DocIntEnum
@@ -334,6 +334,6 @@ def import_type(name):
     :return int: The ordinal number of the imported type.
     """
     last_ordinal = ida_typeinf.get_ordinal_count(ida_typeinf.get_idati())
-    type_id = idc.import_type(-1, name)  # tid_t
-    if type_id != ida_typeinf.BADORD:
+    type_id = ida_typeinf.import_type(ida_typeinf.get_idati(), -1, name)
+    if type_id != ida_idaapi.BADORD:
         return last_ordinal

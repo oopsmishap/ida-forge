@@ -22,7 +22,7 @@ from forge.api.scanner import NewDeepScanVisitor
 from forge.api.types import types
 from forge.api.visitor import FunctionTouchVisitor
 from forge.util.cxx_to_c_name import demangled_name_to_c_str
-from forge.util.logging import *
+from forge.util.logging import log_debug, log_error, log_info, log_warning
 
 import forge.api.types as forge_types
 

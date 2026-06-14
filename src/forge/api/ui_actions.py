@@ -197,7 +197,7 @@ class UIMenuAction(ida_kernwin.action_handler_t):
         self.menu_path = (
             f"{PLUGIN_NAME}/{self.menu_path}" if self.menu_path else f"{PLUGIN_NAME}"
         )
-        self.id = f"{PLUGIN_NAME}:{re.sub('[^A-Za-z0-9]+', '_', self.name)}"
+        self.id = f"{PLUGIN_NAME}:{re.sub(r'[^A-Za-z0-9]+', '_', self.name)}"
 
     def activate(self, ctx):
         raise NotImplementedError()

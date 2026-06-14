@@ -12,7 +12,7 @@ from forge.api.scan_object import (
     _extract_offset_expression,
     _make_offset_scan_object,
 )
-from forge.util.logging import *
+from forge.util.logging import log_debug, log_info, log_warning
 
 
 class ObjectVisitor(ida_hexrays.ctree_parentee_t):

@@ -847,7 +847,7 @@ def test_to_function_offset_str_uses_stable_fallback_for_non_function():
 
     monkeypatch_get_func = lambda _ea: SimpleNamespace(start_ea=0x401000)
     hexrays_module.ida_funcs.get_func = monkeypatch_get_func
-    hexrays_module.idc.get_name = lambda _ea: "sub_401000"
+    hexrays_module.ida_name.get_name = lambda _ea: "sub_401000"
 
     assert hexrays_module.to_function_offset_str(0x401234) == "sub_401000+0x234"
 
