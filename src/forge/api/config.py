@@ -69,7 +69,34 @@ class ConfigBase:
             default_config = self._default_config_for(cls)
             self.set_class_config(cls, default_config)
             return default_config
-        return self._config[cls.name]
+        existing = self._config[cls.name]
+        defaults = cls._default_config_for(cls)
+        if ConfigBase._merge_defaults(defaults, existing):
+            self._save_config()
+        return existing
+
+    @staticmethod
+    def _merge_defaults(
+        defaults: ConfigDict, target: ConfigDict
+    ) -> bool:
+        """Recursively fold ``defaults`` into ``target`` in place.
+
+        Returns ``True`` if any keys were added (i.e. ``target`` was
+        mutated). Existing keys in ``target`` are left untouched so
+        user-customized values survive. Used to keep persisted configs
+        forward-compatible: when a config class adds a new key to its
+        ``default_config``, existing on-disk files pick it up on the
+        next read instead of raising ``KeyError`` from ``get_option``.
+        """
+        changed = False
+        for key, default_value in defaults.items():
+            if key not in target:
+                target[key] = deepcopy(default_value)
+                changed = True
+            elif isinstance(default_value, dict) and isinstance(target.get(key), dict):
+                if ConfigBase._merge_defaults(default_value, target[key]):
+                    changed = True
+        return changed
 
     def set_class_config(self, cls: type["ConfigBase"], config: ConfigDict) -> None:
         """Set the configuration block for a specific config subclass."""

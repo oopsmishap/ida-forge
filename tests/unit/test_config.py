@@ -92,3 +92,49 @@ def test_save_failure_propagates(tmp_path, monkeypatch):
 
     with pytest.raises(OSError, match="disk full"):
         config["enabled"] = False
+
+
+
+def test_config_backfills_new_default_keys_from_legacy_file(tmp_path, monkeypatch):
+    """A class adding new keys to ``default_config`` must not break
+    users who already have a saved file with the old schema."""
+    monkeypatch.setattr("ida_diskio.get_user_idadir", lambda: str(tmp_path))
+
+    class _LegacyConfig(ForgeConfig):
+        name = "LegacyExample"
+        default_config = {
+            "existing": 1,
+            "nested": {"old": True},
+        }
+
+    # Persist a file as if from an older version of the schema.
+    config_path = Path(tmp_path) / "cfg" / "forge.toml"
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    config_path.write_text(
+        '[LegacyExample]\nexisting = 7\n'
+        + '[LegacyExample.nested]\nold = false\n',
+        encoding="utf-8",
+    )
+
+    # Simulate an upgrade: extend the class default with new keys.
+    _LegacyConfig.default_config = {
+        "existing": 1,
+        "added_top_level": "fresh",
+        "nested": {"old": True, "added_nested": ["x", "y"]},
+    }
+
+    config = _LegacyConfig()
+
+    # User-customized values are preserved.
+    assert config["existing"] == 7
+    assert config.get_class_config(_LegacyConfig)["nested"]["old"] is False
+    # New keys from the upgraded defaults are filled in.
+    assert config["added_top_level"] == "fresh"
+    assert config.get_class_config(_LegacyConfig)["nested"]["added_nested"] == [
+        "x",
+        "y"
+    ]
+
+    # The fill-in is persisted, so the next read sees the merged file.
+    reloaded = _LegacyConfig()
+    assert reloaded["added_top_level"] == "fresh"
