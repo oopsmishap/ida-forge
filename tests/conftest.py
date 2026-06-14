@@ -135,11 +135,9 @@ _stub_module(
 )
 _stub_module(
     "ida_idaapi",
-    plugmod_t=type("plugmod_t", (), {}),
     plugin_t=type("plugin_t", (), {}),
     PLUGIN_KEEP=0,
     PLUGIN_SKIP=1,
-    PLUGIN_MULTI=2,
     BADADDR=-1,
     BADORD=0,
 )

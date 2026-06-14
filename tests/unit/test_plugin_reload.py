@@ -12,10 +12,10 @@ import ida_idaapi
 _PLUG_ENTRY = Path(__file__).resolve().parents[2] / "src" / "forge.py"
 _SPEC = importlib.util.spec_from_file_location("forge_plugin_entry", _PLUG_ENTRY)
 assert _SPEC is not None and _SPEC.loader is not None
-forge_module = importlib.util.module_from_spec(_SPEC)
-_SPEC.loader.exec_module(forge_module)
-plugmod_module = importlib.import_module("forge.forge_plugmod_t")
+forge_entry = importlib.util.module_from_spec(_SPEC)
+_SPEC.loader.exec_module(forge_entry)
 forge_core_module = importlib.import_module("forge.core")
+forge_module = importlib.import_module("forge")
 
 
 class _OldCore:
@@ -37,13 +37,12 @@ class _NewCore:
         self.loaded = True
 
 
-def _make_plugmod(monkeypatch, *, core: _OldCore):
-    plugmod = plugmod_module.forge_plugmod_t.__new__(plugmod_module.forge_plugmod_t)
-    plugmod._core = core
-    plugmod._ready_hook = None
-    plugmod._state_log = []
-    plugmod._plugin = types.SimpleNamespace()
-    return plugmod
+def _make_plugin(monkeypatch, *, core: _OldCore):
+    plugin = forge_entry.ForgePlugin.__new__(forge_entry.ForgePlugin)
+    plugin._core = core
+    plugin._ready_hook = None
+    plugin._state_log = []
+    return plugin
 
 
 def test_plugin_reload_rebuilds_core_and_shows_menu(monkeypatch):
@@ -52,13 +51,13 @@ def test_plugin_reload_rebuilds_core_and_shows_menu(monkeypatch):
     menu_calls = []
     queued = []
 
-    plugmod = _make_plugmod(monkeypatch, core=_OldCore(unload_calls))
+    plugin = _make_plugin(monkeypatch, core=_OldCore(unload_calls))
 
-    monkeypatch.setattr(plugmod_module, "recursive_reload", lambda module, exclude_prefixes=(): reload_calls.append((module, exclude_prefixes)))
+    monkeypatch.setattr(forge_entry, "recursive_reload", lambda module, exclude_prefixes=(): reload_calls.append((module, exclude_prefixes)))
     monkeypatch.setattr(forge_core_module, "ForgeCore", _NewCore)
-    monkeypatch.setattr(plugmod_module.ida_kernwin, "execute_ui_requests", lambda callbacks: queued.append(callbacks) or True)
+    monkeypatch.setattr(forge_entry.ida_kernwin, "execute_ui_requests", lambda callbacks: queued.append(callbacks) or True)
 
-    real_ready_hook = plugmod_module._ReadyHook
+    real_ready_hook = forge_entry._ReadyHook
 
     def _fake_hook_init(self, owner):
         self._owner = owner
@@ -67,14 +66,14 @@ def test_plugin_reload_rebuilds_core_and_shows_menu(monkeypatch):
     monkeypatch.setattr(real_ready_hook, "hook", lambda self: menu_calls.append("hook"))
     monkeypatch.setattr(real_ready_hook, "unhook", lambda self: menu_calls.append("unhook"))
 
-    plugmod.reload()
+    plugin.reload()
 
     assert len(queued) == 1
     queued[0][0]()
 
     assert unload_calls == [True]
-    assert reload_calls == [(plugmod_module.forge, ("forge.api.ui_actions",))]
+    assert reload_calls == [(forge_module, ("forge.api.ui_actions",))]
     assert len(_NewCore.instances) == 1
-    assert plugmod.core is _NewCore.instances[0]
-    assert plugmod.core.loaded is True
+    assert plugin.core is _NewCore.instances[0]
+    assert plugin.core.loaded is True
     assert "hook" in menu_calls
