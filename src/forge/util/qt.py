@@ -17,15 +17,18 @@ except ImportError:
 
 
 def qt_item_flags(*flags):
-    """Combine Qt item flags into a QFlags bitmask."""
-    combined = None
+    """Combine Qt item flags into a value compatible with ``QTableWidgetItem.setFlags``.
+
+    Uses ``.value`` for PySide6 because flag enums there do not support
+    bitwise ``|``; for PyQt5 the shim allows ``|`` on enum members but
+    the integer form is accepted by ``setFlags`` either way.
+    """
+    combined = 0
     for flag in flags:
         if flag is None:
             continue
-        combined = flag if combined is None else combined | flag
-
-    if combined is None:
-        combined = 0
+        value = getattr(flag, "value", flag)
+        combined |= int(value)
 
     item_flags = getattr(QtCore.Qt, "ItemFlags", None)
     if callable(item_flags):
