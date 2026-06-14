@@ -1,33 +1,12 @@
 from __future__ import annotations
 
-import sys
 import traceback
-from typing import TYPE_CHECKING
 
-import ida_hexrays
 import ida_idp
 import ida_idaapi
 import ida_kernwin
 
-import forge
-from forge.core import ForgeCore
-from forge.plugin import (
-    PLUGIN_COMMENT,
-    PLUGIN_HELP,
-    PLUGIN_NAME,
-    register_idc_func,
-    unregister_idc_func,
-)
-from forge.util.logging import log_debug, log_warning
-from forge.util.reload import recursive_reload
-from forge.util.versions import (
-    is_ida_version_supported,
-    is_python_version_supported,
-)
-
-
-if TYPE_CHECKING:
-    pass
+from forge.plugin import PLUGIN_COMMENT, PLUGIN_HELP, PLUGIN_NAME
 
 
 def PLUGIN_ENTRY():
@@ -35,20 +14,8 @@ def PLUGIN_ENTRY():
     return ForgePlugin()
 
 
-class _ReadyHook(ida_kernwin.UI_Hooks):
-    """UI hook that attaches the plugin menu when the UI is ready."""
-
-    def __init__(self, plugin: "ForgePlugin") -> None:
-        super().__init__()
-        self._plugin = plugin
-
-    def ready_to_run(self) -> None:
-        if self._plugin._core is not None:
-            self._plugin._core.show_menu()
-
-
 class ForgePlugin(ida_idaapi.plugin_t):
-    """IDA plugin entry point for Forge."""
+    """Thin ``plugin_t`` shell — delegates all work to ``forge_plugmod_t``."""
 
     flags = ida_idaapi.PLUGIN_KEEP
     version = ida_idp.IDP_INTERFACE_VERSION
@@ -57,111 +24,14 @@ class ForgePlugin(ida_idaapi.plugin_t):
     wanted_name = PLUGIN_NAME
     wanted_hotkey = ""
 
-    def __init__(self) -> None:
-        super().__init__()
-        self._core: ForgeCore | None = None
-        self._ready_hook: _ReadyHook | None = None
-        self._state_log: list[str] = []
-
-    def init(self) -> int:
+    def init(self):
+        # Late import: `forge.forge_plugmod_t` must not be imported at
+        # module load time because the package's hot-reload path needs
+        # `sys.modules["forge"]` to be a fully initialised package.
         try:
-            return self._do_init()
+            from forge.forge_plugmod_t import forge_plugmod_t
         except Exception as exc:  # noqa: BLE001
-            ida_kernwin.warning(f"Forge: init failed: {exc}")
+            ida_kernwin.warning(f"Forge: failed to import plugmod: {exc}")
             traceback.print_exc()
             return ida_idaapi.PLUGIN_SKIP
-
-    def _do_init(self) -> int:
-        if not is_python_version_supported():
-            log_warning("Unsupported Python version")
-            return ida_idaapi.PLUGIN_SKIP
-
-        if not is_ida_version_supported():
-            log_warning("Unsupported IDA version")
-            return ida_idaapi.PLUGIN_SKIP
-
-        if not ida_hexrays.init_hexrays_plugin():
-            log_warning("Failed to initialize Hex-Rays SDK")
-            return ida_idaapi.PLUGIN_SKIP
-
-        self._core = ForgeCore()
-        self._core.load()
-
-        self._ready_hook = _ReadyHook(self)
-        self._ready_hook.hook()
-
-        register_idc_func(self)
-
-        main_module = sys.modules.get("__main__")
-        if main_module is not None:
-            main_module.forge = self
-
-        log_debug(f"{self.wanted_name} loaded successfully!")
-        return ida_idaapi.PLUGIN_KEEP
-
-    def run(self, arg: int) -> None:
-        if self._core is None:
-            log_warning("Plugin not initialized yet")
-            return
-        self._core.show_menu()
-
-    def term(self) -> None:
-        unregister_idc_func()
-
-        if self._ready_hook is not None:
-            self._ready_hook.unhook()
-            self._ready_hook = None
-
-        if self._core is not None:
-            self._core.unload()
-            self._core = None
-
-        main_module = sys.modules.get("__main__")
-        if main_module is not None and getattr(main_module, "forge", None) is self:
-            del main_module.forge
-
-    def reload(self) -> None:
-        """Hot-reload the plugin modules and recreate the core on the UI thread."""
-        log_debug(f"Reloading {self.wanted_name}")
-        if not ida_kernwin.execute_ui_requests([lambda: self._reload_inner()]):
-            log_warning("Could not schedule Forge reload.")
-
-    def _reload_inner(self) -> None:
-        if self._core is not None:
-            self._core.unload(keep_menu=True)
-            self._core = None
-
-        if self._ready_hook is not None:
-            self._ready_hook.unhook()
-            self._ready_hook = None
-
-        recursive_reload(forge, exclude_prefixes=("forge.api.ui_actions",))
-
-        from forge.core import ForgeCore as _Core
-
-        self._core = _Core()
-        self._core.load()
-
-        self._ready_hook = _ReadyHook(self)
-        self._ready_hook.hook()
-
-        log_debug(f"{self.wanted_name} reloaded successfully!")
-
-    @property
-    def core(self) -> ForgeCore | None:
-        """Return the active plugin core."""
-        return self._core
-
-    def get_state(self, index: int) -> str:
-        """Return the recorded state entry at ``index`` (IDC accessor)."""
-        if not self._state_log:
-            return ""
-        try:
-            return self._state_log[index]
-        except (IndexError, TypeError):
-            return ""
-
-    def add_state(self, value: str) -> int:
-        """Append ``value`` to the state log and return its index (IDC accessor)."""
-        self._state_log.append(value or "")
-        return len(self._state_log) - 1
+        return forge_plugmod_t()
