@@ -8,7 +8,7 @@ from forge.util.qt import QtGui, QtWidgets
 from .templated_types import TemplatedTypes
 from .ui_form import Ui_templated_types_form
 
-from forge.util.logging import *
+from forge.util.logging import log_info, log_warning
 
 QFontDatabase = QtGui.QFontDatabase
 

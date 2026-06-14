@@ -1,18 +1,16 @@
 # Based on Rolf Rolles TemplatedTypes script
 # https://www.msreverseengineering.com/blog/2021/9/21/automation-in-reverse-engineering-c-template-code
 
-
 import os
 import pathlib
 
 import toml
 
-
-import ida_typeinf
 import ida_hexrays
-import idc
+import ida_idaapi
+import ida_typeinf
 
-from forge.util.logging import *
+from forge.util.logging import log_debug, log_error, log_info
 from .config import config
 
 
@@ -74,12 +72,10 @@ class TemplatedTypes:
             log_error(f"Could not parse structure declarations, found {ret_val} errors")
             return
 
-        tid = idc.import_type(-1, name)
-        if tid is idc.BADADDR:
+        tid = ida_typeinf.import_type(ida_typeinf.get_idati(), -1, name)
+        if tid is ida_idaapi.BADORD:
             log_error(f'could not import type "{name}" into idb')
             return
-
-        log_info(f'New type "{name}" was added to Local Types')
         ida_hexrays.create_typedef(name)
 
     def get_types(self, key):

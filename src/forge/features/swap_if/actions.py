@@ -1,6 +1,6 @@
 import ida_hexrays
 import ida_kernwin
-import ida_idaapi
+import ida_nalt
 
 from forge.api.hooks import HexRaysHook, register_hook
 from forge.api.ui_actions import HexRaysPopupAction, register_action
@@ -60,7 +60,7 @@ class SilentIfSwapper(HexRaysHook):
         ):
             log_debug(f"Swapping then/else in {hex(cfunc.entry_ea)}")
             inverted = [
-                n + ida_idaapi.get_imagebase() for n in get_inverted(cfunc.entry_ea)
+                n + ida_nalt.get_imagebase() for n in get_inverted(cfunc.entry_ea)
             ]
             log_debug(f"Got inverted: {inverted}")
             visitor = SwapThenElseVisitor(inverted)

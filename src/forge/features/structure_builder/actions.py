@@ -1,6 +1,6 @@
 import ida_hexrays
+import ida_idaapi
 import ida_kernwin
-import idaapi
 
 from forge.api.hexrays import decompile, get_funcs_referencing_address, is_legal_type
 from forge.api.scan_object import GlobalVariableObject, ObjectType, ScanObject
@@ -62,8 +62,8 @@ class StructureBuilderAction(HexRaysPopupAction):
         if obj.id == ObjectType.global_object:
             root_object_ea = getattr(obj, "object_ea", None)
         else:
-            candidate_ea = getattr(obj, "ea", idaapi.BADADDR)
-            if candidate_ea != idaapi.BADADDR:
+            candidate_ea = getattr(obj, "ea", ida_idaapi.BADADDR)
+            if candidate_ea != ida_idaapi.BADADDR:
                 root_object_ea = candidate_ea
 
         structure.set_provenance(

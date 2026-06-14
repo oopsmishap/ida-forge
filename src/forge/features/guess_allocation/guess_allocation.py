@@ -1,6 +1,7 @@
-import idaapi
+import ida_hexrays
+import ida_idaapi
+import ida_kernwin
 
-from forge.util.logging import *
 from forge.api.hexrays import find_expr_address, to_function_offset_str, ctype
 from forge.api.scan_object import ScanObject, ObjectType, MemoryAllocationObject
 from forge.api.visitor import RecursiveUpwardsObjectVisitor
@@ -14,9 +15,9 @@ class StructureAllocationChoose(Choose):
 
     def __init__(self, items):
         super().__init__(items)
-
     def OnSelectLine(self, n):
-        idaapi.jumpto(self.items[n][0])
+        ida_kernwin.jumpto(self.items[n][0])
+
 
     def OnGetLine(self, n):
         func_ea, var, line, alloc_type = self.items[n]
@@ -37,8 +38,8 @@ class GuessAllocationVisitor(RecursiveUpwardsObjectVisitor):
         if callable(target_matches):
             return target_matches(cexpr)
 
-        obj_ea = getattr(obj, "ea", idaapi.BADADDR)
-        if obj_ea == idaapi.BADADDR:
+        obj_ea = getattr(obj, "ea", ida_idaapi.BADADDR)
+        if obj_ea == ida_idaapi.BADADDR:
             return False
 
         return obj_ea == find_expr_address(cexpr, getattr(self, "parents", []))
@@ -84,14 +85,13 @@ class GuessAllocation(HexRaysPopupAction):
 
     def __init__(self):
         super().__init__()
-
     def check(self, hx_view):
-        if hx_view.item.citype != idaapi.VDI_EXPR:
+        if hx_view.item.citype != ida_hexrays.VDI_EXPR:
             return False
         return ScanObject.create(hx_view.cfunc, hx_view.item) is not None
 
     def activate(self, ctx):
-        hx_view = idaapi.get_widget_vdui(ctx.widget)
+        hx_view = ida_hexrays.get_widget_vdui(ctx.widget)
         obj = ScanObject.create(hx_view.cfunc, hx_view.item)
         if obj:
             visitor = GuessAllocationVisitor(hx_view.cfunc, obj)

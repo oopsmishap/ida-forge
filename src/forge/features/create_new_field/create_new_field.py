@@ -1,12 +1,13 @@
-import idaapi
-import idc
+import ida_hexrays
+import ida_idaapi
+import ida_typeinf
 import re
 
 from forge.api.config import ForgeConfig
 from forge.api.hexrays import get_member_name, create_udt_padding_member
 from forge.api.types import types
 from forge.api.ui_actions import HexRaysPopupAction, register_action
-from forge.util.logging import *
+from forge.util.logging import log_error, log_warning
 
 
 class CreateNewFieldConfig(ForgeConfig):
@@ -30,11 +31,11 @@ class CreateNewField(HexRaysPopupAction):
     def check(self, hx_view):
         """Checks if the current item is a gap member within a structure."""
         item = hx_view.item
-        if item.citype != idaapi.VDI_EXPR:
+        if item.citype != ida_hexrays.VDI_EXPR:
             return False
 
         cexpr = item.it.to_specific_type
-        if cexpr.op not in (idaapi.cot_memptr, idaapi.cot_memref):
+        if cexpr.op not in (ida_hexrays.cot_memptr, ida_hexrays.cot_memref):
             return False
 
         return True
@@ -46,7 +47,7 @@ class CreateNewField(HexRaysPopupAction):
         # return "gap" in member_name
 
     def activate(self, ctx):
-        hx_view: idaapi.vdui_t = idaapi.get_widget_vdui(ctx.widget)
+        hx_view: ida_hexrays.vdui_t = ida_hexrays.get_widget_vdui(ctx.widget)
         if not self.check(hx_view):
             return
 
@@ -55,7 +56,7 @@ class CreateNewField(HexRaysPopupAction):
 
         idx = (
             parent.y.numval()
-            if parent.op == idaapi.cot_idx and parent.y.op == idaapi.cot_num
+            if parent.op == ida_hexrays.cot_idx and parent.y.op == ida_hexrays.cot_num
             else 0
         )
 
@@ -75,7 +76,7 @@ class CreateNewField(HexRaysPopupAction):
         else:
             default_field_type = types.get_ptr_type().name
 
-        declaration = idaapi.ask_text(
+        declaration = ida_idaapi.ask_text(
             0x10000,
             f"{default_field_type} field_{offset + idx:X}",
             "Enter new structure member:",
@@ -90,12 +91,12 @@ class CreateNewField(HexRaysPopupAction):
 
         field_tinfo, field_name = result
         field_size = field_tinfo.get_size()
-        udt_data = idaapi.udt_type_data_t()
-        udt_member = idaapi.udt_member_t()
+        udt_data = ida_typeinf.udt_type_data_t()
+        udt_member = ida_typeinf.udt_member_t()
 
         struct_tinfo.get_udt_details(udt_data)
         udt_member.offset = offset * 8
-        struct_tinfo.find_udt_member(udt_member, idaapi.STRMEM_OFFSET)
+        struct_tinfo.find_udt_member(udt_member, ida_typeinf.STRMEM_OFFSET)
         gap_size = udt_member.size // 8
 
         gap_leftover = gap_size - idx - field_size
@@ -115,7 +116,7 @@ class CreateNewField(HexRaysPopupAction):
                 create_udt_padding_member(offset + idx + field_size, gap_leftover),
             )
 
-        udt_member = idaapi.udt_member_t()
+        udt_member = ida_typeinf.udt_member_t()
         udt_member.offset = offset * 8 + idx
         udt_member.name = field_name
         udt_member.type = field_tinfo
@@ -126,9 +127,9 @@ class CreateNewField(HexRaysPopupAction):
         if idx > 0:
             udt_data.insert(iterator, create_udt_padding_member(offset, idx))
 
-        struct_tinfo.create_udt(udt_data, idaapi.BTF_STRUCT)
+        struct_tinfo.create_udt(udt_data, ida_typeinf.BTF_STRUCT)
         struct_tinfo.set_numbered_type(
-            idaapi.get_idati(), ordinal, idaapi.BTF_STRUCT, struct_name
+            ida_typeinf.get_idati(), ordinal, ida_typeinf.BTF_STRUCT, struct_name
         )
         hx_view.refresh_view(True)
 
@@ -149,14 +150,14 @@ class CreateNewField(HexRaysPopupAction):
             log_error("Bad field name", True)
             return None, None
 
-        result = idc.parse_decl(type_name, 0)
+        result = ida_idaapi.idc_parse_decl(type_name, 0)
         if result is None:
             log_error("Failed to parse member type.", True)
             return None, None
 
         _, tp, fld = result
-        tinfo = idaapi.tinfo_t()
-        tinfo.deserialize(idaapi.get_idati(), tp, fld, None)
+        tinfo = ida_typeinf.tinfo_t()
+        tinfo.deserialize(ida_typeinf.get_idati(), tp, fld, None)
         if arr_size:
             tinfo.create_array(tinfo, int(arr_size))
         return tinfo, field_name

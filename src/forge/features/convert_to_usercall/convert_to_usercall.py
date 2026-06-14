@@ -3,7 +3,7 @@ import ida_typeinf
 
 from forge.api.config import ForgeConfig
 from forge.api.ui_actions import HexRaysPopupAction, register_action
-from forge.util.logging import *
+from forge.util.logging import log_debug
 
 
 class ConvertToUsercallConfig(ForgeConfig):
