@@ -9,7 +9,7 @@ from pathlib import Path
 import ida_idaapi
 
 
-_PLUG_ENTRY = Path(__file__).resolve().parents[2] / "src" / "forge.py"
+_PLUG_ENTRY = Path(__file__).resolve().parents[2] / "src" / "ida_forge_plugin.py"
 _SPEC = importlib.util.spec_from_file_location("forge_plugin_entry", _PLUG_ENTRY)
 assert _SPEC is not None and _SPEC.loader is not None
 forge_entry = importlib.util.module_from_spec(_SPEC)

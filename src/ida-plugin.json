@@ -4,7 +4,7 @@
   "plugin": {
     "name": "ida-forge",
     "version": "0.0.1",
-    "entryPoint": "forge.py",
+    "entryPoint": "ida_forge_plugin.py",
     "idaVersions": ["9.0", "9.0sp1", "9.1", "9.2", "9.3"],
     "description": "Structure builder, type-rewriting, and decompiler quality-of-life tools for IDA Pro.",
     "pythonDependencies": [
