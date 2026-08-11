@@ -5,6 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "ida-forge"
 version = "0.0.1"
+description = "IDA Pro plugin for recovering C structure layouts from decompiler output"
 requires-python = ">=3.9"
 dependencies = ["toml>=0.10"]
 

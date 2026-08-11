@@ -468,8 +468,19 @@ scout reports, 246-test run, official IDAPython docs cross-check).
 
 ## Tier 4 — User-facing risks (IDA type corruption)
 
-### T4.1 Dry-run confirmation for `auto_resolve`
+### T4.1 Dry-run confirmation for `auto_resolve` — RESOLVED 2026-08-11
 
+- **Status**: `Structure.auto_resolve_preview()` is a read-only walk returning
+  exactly the members that would be disabled; `structure_table_resolve` shows
+  an `ask_yn` confirm with the count and declines without touching members.
+  `set_cdecl` writes now run inside an `ida_undo` snapshot
+  (`_type_write_undo` context manager, guarded for the unit-test env), so a
+  bad auto-resolve/overwrite result is one `undo` away. Tests:
+  `test_auto_resolve_preview_reports_without_mutating`,
+  `test_auto_resolve_preview_disables_lower_scored_earlier_member`,
+  `test_structure_table_resolve_confirms_before_disabling`,
+  `test_set_cdecl_wraps_type_write_in_undo_snapshot`,
+  `test_set_cdecl_undo_is_absent_without_ida_undo`.
 - **Issue**: `auto_resolve()` silently overwrites member `tinfo` values; a
   wrong heuristic clobbers a correct user-typed member.
 - **Evidence**: `form.py:1975` (survey-verified; re-confirm), `Structure.auto_resolve`
@@ -479,8 +490,12 @@ scout reports, 246-test run, official IDAPython docs cross-check).
 - **Acceptance**: dialog appears with accurate preview when overwrites would
   occur; form test asserts the confirm path.
 
-### T4.2 Block nudge-into-collision
+### T4.2 Block nudge-into-collision — RESOLVED 2026-08-11
 
+- **Status**: `nudge_selected_rows` snapshots offsets, and after
+  `refresh_collisions` rejects (with a warning) any nudge whose collision set
+  includes a member the user did not select — restoring every offset and the
+  main_offset. Test: `test_nudge_into_collision_with_unselected_member_is_rejected`.
 - **Issue**: bulk nudging offsets can create overlapping members that reach
   `pack_structure` → IDA `add_struc_member` with undefined behavior.
 - **Evidence**: `form.py:1465` `nudge_selected_rows` (survey-verified);
@@ -491,8 +506,15 @@ scout reports, 246-test run, official IDAPython docs cross-check).
 - **Acceptance**: unit test: nudge that would overlap an unselected member is
   refused and member offsets unchanged.
 
-### T4.3 Guard live-type rename and `BADADDR` UI calls
+### T4.3 Guard live-type rename and `BADADDR` UI calls — RESOLVED 2026-08-11
 
+- **Status**: `hexrays.decompile` now rejects `BADADDR` and any EA where
+  `ida_funcs.get_func` returns None ("not a function" warning) — the same
+  guard closes the scan-log observation about decompiling non-function EAs.
+  The dialogs chooser already guarded `open_pseudocode` on `BADADDR` and
+  `get_func_name` was already EA-guarded. Tests:
+  `test_decompile_rejects_badaddr`, `test_decompile_rejects_non_function_ea`,
+  `test_decompile_delegates_to_real_function`.
 - **Issue**: `rename_created_type` on a type referenced by lvars leaves
   dangling references (`structure.py:215-235`, `form.py:1553`); `open_pseudocode`
   with `BADADDR` (`dialogs.py:40`) and `get_func_name(BADADDR)`
@@ -501,8 +523,14 @@ scout reports, 246-test run, official IDAPython docs cross-check).
   real EAs only; add `func_ea != BADADDR` guards.
 - **Acceptance**: tests passing `BADADDR` assert warning + no IDA calls.
 
-### T4.4 Reset form/plugin singleton state on reload
+### T4.4 Reset form/plugin singleton state on reload — RESOLVED 2026-08-11
 
+- **Status**: `StructureBuilderForm.reset()` clears `structures` +
+  `current_structure` and the cached UI state; `OnClose` calls `reset()` so a
+  closed form never resurrects stale models, and `forge_plugmod_t._reload_inner`
+  resets the pre-reload singleton before the re-import (via a guarded import).
+  Tests: `test_on_close_clears_structure_models`,
+  `test_reload_inner_resets_structure_form_models`.
 - **Issue**: `StructureBuilderForm` singleton keeps `self.structures` and
   `self.current_structure` across `_reset_ui_state()`; stale in-memory models
   survive reload/close-reopen.
@@ -518,7 +546,14 @@ scout reports, 246-test run, official IDAPython docs cross-check).
 
 ## Tier 5 — Improvements
 
-### I.1 Revert uncommitted DEBUG log level; make log level configurable
+### I.1 Revert uncommitted DEBUG log level; make log level configurable — RESOLVED 2026-08-11
+
+- **Status**: logger defaults to INFO; `set_log_level(name|constant)` +
+  `LOG_LEVELS` (incl. `TRACE` = 5) configure it, and plugin init reads the
+  root `ForgeConfig["log_level"]` key (`_apply_log_level` in forge_plugmod_t)
+  before anything logs. `log_trace` added and used for scan-preparation noise.
+  Tests: `test_set_log_level_accepts_names_and_constants`,
+  `test_logger_defaults_to_info_not_debug`.
 
 - **Issue**: working tree sets `_logger.setLevel(logging.DEBUG)` (uncommitted);
   committed default per `fe69a5e` was INFO. Levels are hardcoded all-or-nothing.
@@ -543,7 +578,14 @@ scout reports, 246-test run, official IDAPython docs cross-check).
   class); log the new calling convention after conversion.
 - **Acceptance**: test toggling `enabled` flips action behavior.
 
-### I.3 Entity naming cleanup
+### I.3 Entity naming cleanup — RESOLVED 2026-08-11
+
+- **Status**: no `getattr(obj, "tinfo"`/`id` reads remain in src — the two
+  tinfo reads in scanner.py use `obj.tinfo` directly; `ScannedObject.create`
+  legacy migration shim deleted (unreachable: every object has an `id`), with
+  an `AssertionError` guard for unknown ids. Tests updated:
+  `test_scanned_object_create_rejects_unknown_object_type` replaces the legacy
+  shim test.
 
 - **Issue**: scan pipeline uses magic attribute access (`getattr(obj, "tinfo",
   None)`, `getattr(obj, "id", None)`) instead of defined properties; legacy
@@ -553,7 +595,15 @@ scout reports, 246-test run, official IDAPython docs cross-check).
   delete. Do not rush: scanner tests depend on current shapes.
 - **Acceptance**: grep shows no `getattr(obj, "tinfo"` reads; suite green.
 
-### I.4 Logging conventions
+### I.4 Logging conventions — RESOLVED 2026-08-11
+
+- **Status**: `log_trace` added; `visitor.py`'s `from forge.api.hexrays import
+  *` replaced with an explicit import list (conftest stub gained the now-
+  imported `get_argument`/`get_argument_index`/`get_line`/etc — T3.3-style
+  stub-drift gap). `FunctionTouchVisitor.process` reset bug fixed:
+  `self._functions = set()` between `apply_to` collection and
+  `touch_all_iterative` discarded the nested-call set, so process() touched
+  nothing below the top level; now the collected set feeds the iteration.
 
 - **Issue**: no `log_trace`; `FunctionTouchVisitor.process` resets
   `self._functions` mid-run (works by accident — re-audit); `visitor.py`
@@ -563,7 +613,12 @@ scout reports, 246-test run, official IDAPython docs cross-check).
 - **Acceptance**: ruff clean for the touched files; behavior tests for
   `FunctionTouchVisitor` (currently untested).
 
-### I.5 Extend `cxx_to_c_name.py` operators
+### I.5 Extend `cxx_to_c_name.py` operators — RESOLVED 2026-08-11
+
+- **Status**: added `operator<=>` (spaceship), `operator co_await`, and
+  `operator->*` to the replacement table (longest-first, ahead of `<`/`->`);
+  conversion operators (`operator TYPE`) already survive as `operator_<type>`
+  via sanitize — covered by tests.
 
 - **Issue**: missing `operator<=>` (spaceship), `co_await`, conversion
   operators; unary/binary `& * + -` collapse to one textual form.
@@ -573,7 +628,13 @@ scout reports, 246-test run, official IDAPython docs cross-check).
   existing `sanitize_c_identifier` behavior.
 - **Acceptance**: table-driven tests for every operator (I.4/T3.4 step 3).
 
-### I.6 Drop the `toml` dependency where possible
+### I.6 Drop the `toml` dependency where possible — RESOLVED 2026-08-11 (read path)
+
+- **Status**: config reads use stdlib `tomllib` (binary mode) on Python 3.11+
+  (IDA 9.x ships 3.12), falling back to the `toml` package on 3.9/3.10. The
+  `toml` dependency remains declared because writes still need it (tomllib is
+  read-only). The crash where tomllib objects to text-mode files is covered by
+  the binary-mode read.
 
 - **Issue**: runtime dep `toml>=0.10` in `pyproject.toml`; Python ≥3.9 IDA ships
   `tomllib` (3.11+) — IDA 9.x bundles 3.12. Keep `toml` as a fallback for
@@ -583,7 +644,11 @@ scout reports, 246-test run, official IDAPython docs cross-check).
 - **Acceptance**: config tests pass with `tomllib`; an import test asserts the
   fallback branch.
 
-### I.7 Stale docs
+### I.7 Stale docs — RESOLVED 2026-08-11
+
+- **Status**: root `README.md` rewritten (features, install, config table,
+  development/test instructions); `src/README.md` describes the package
+  layout; pyproject gained a description.
 
 - **Issue**: root `README.md` says "not functional yet"; `src/README.md` is 156B.
 - **Plan**: rewrite with feature list, install/plugin-manager instructions,

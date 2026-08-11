@@ -5,7 +5,18 @@ import ida_hexrays
 import ida_idaapi
 
 from forge.api import hexrays as hexrays_api
-from forge.api.hexrays import *
+from forge.api.hexrays import (
+    ctype,
+    decompile,
+    find_expr_address,
+    get_argument,
+    get_argument_index,
+    get_func_argument_info,
+    get_funcs_calling_address,
+    is_imported,
+    print_expr_address,
+    to_hex,
+)
 from forge.api.scan_object import (
     CallArgumentObject,
     ObjectType,
@@ -14,7 +25,7 @@ from forge.api.scan_object import (
     _extract_offset_expression,
     _make_offset_scan_object,
 )
-from forge.util.logging import log_debug, log_info, log_warning
+from forge.util.logging import log_debug, log_info, log_trace, log_warning
 
 
 class ObjectVisitor(ida_hexrays.ctree_parentee_t):
@@ -329,6 +340,10 @@ class RecursiveObjectVisitor(ObjectVisitor):
         self._skip = skip
         self._init_obj = obj
         self.crippled = self._is_func_crippled()
+        log_trace(
+            f"Preparing scan of {getattr(cfunc, 'entry_ea', ida_idaapi.BADADDR)} "
+            f"arg_idx={arg_idx} obj={getattr(obj, 'name', None)} skip={skip}"
+        )
 
     def process(self):
         self._start()
@@ -684,9 +699,11 @@ class FunctionTouchVisitor(ida_hexrays.ctree_parentee_t):
     def process(self):
         if self._cfunc.entry_ea not in self._visited:
             self._visited.add(self._cfunc.entry_ea)
+            # apply_to walks the whole tree and collects every `call` node
+            # into self._functions. Do NOT reset between collection and use:
+            # the old `self._functions = set()` here dropped the nested calls
+            # and left process() touching nothing below the top level.
             self.apply_to(self._cfunc.body, None)
-            self._functions = set()  # Reset the set of functions to visit
-            self.visit_expr(self._cfunc.body)
             self.touch_all_iterative()
             decompile(self._cfunc.entry_ea)
             return True

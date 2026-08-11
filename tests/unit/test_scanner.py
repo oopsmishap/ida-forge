@@ -487,7 +487,7 @@ def test_manipulate_handles_missing_object_tinfo(monkeypatch):
     )
 
     cexpr = SimpleNamespace(type=SimpleNamespace(is_ptr=lambda: False), dstr=lambda: "v2")
-    obj = SimpleNamespace(name="v2")
+    obj = SimpleNamespace(name="v2", tinfo=None)
 
     visitor._manipulate(cexpr, obj)
 
@@ -519,40 +519,17 @@ def test_scanned_object_create_inherits_scan_root_metadata(monkeypatch):
     assert scanned.scan_root_ea == 0x401234
     assert scanned.scan_root_function_name == "sub_401000"
 
-def test_scanned_object_create_accepts_legacy_scanned_variable_object(monkeypatch):
+def test_scanned_object_create_rejects_unknown_object_type(monkeypatch):
+    """The legacy migration shim is gone: an object with an unknown id must
+    fail loudly instead of guessing a ScannedObject kind."""
     scanner_module = _load_scanner_module()
-    monkeypatch.setattr(
-        scanner_module.ida_funcs,
-        "get_func",
-        lambda _ea: SimpleNamespace(start_ea=0x401000),
-        raising=False,
-    )
 
-    monkeypatch.setattr(
-        scanner_module.ida_hexrays,
-        "lvar_locator_t",
-        lambda location, defea: SimpleNamespace(location=location, defea=defea),
-        raising=False,
-    )
+    from forge.api.scan_object import ObjectType
 
-    source = SimpleNamespace(
-        name="arg0",
-        ea=0x402000,
-        func_ea=0x401000,
-        scan_root_function_ea=0x401000,
-        scan_root_ea=0x402000,
-        scan_root_function_name="sub_401000",
-        _ScannedVariableObject__lvar=SimpleNamespace(location="stack", defea=0x1234),
-    )
+    bogus = SimpleNamespace(id=ObjectType.unknown, name="?", ea=0x402000)
 
-    scanned = scanner_module.ScannedObject.create(source, 0x401234, 0x0)
-
-    assert scanned.name == "arg0"
-    assert scanned.ea == 0x401234
-    assert scanned.scan_root_function_ea == 0x401000
-    assert scanned.scan_root_ea == 0x402000
-    assert scanned.scan_root_function_name == "sub_401000"
-
+    with pytest.raises(AssertionError):
+        scanner_module.ScannedObject.create(bogus, 0x402000, 0x10)
 
 
 def test_scanned_object_identity_dedupes_duplicate_evidence(monkeypatch):

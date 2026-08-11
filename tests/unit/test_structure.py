@@ -569,3 +569,77 @@ def test_declaration_parses_accepts_clean_declaration(monkeypatch):
     )
 
     assert structure_module.Structure._declaration_parses("struct test { int x; };") is True
+
+
+# ---------------------------------------------------------------------------
+# Tier 4: auto_resolve dry-run + undo snapshot
+# ---------------------------------------------------------------------------
+
+
+def test_auto_resolve_preview_reports_without_mutating():
+    structure = Structure("S")
+    high = FakeMember(0, 8, score=5)
+    low = FakeMember(4, 8, score=3)
+    structure.add_member(high)
+    structure.add_member(low)
+
+    disabled = structure.auto_resolve_preview()
+
+    assert disabled == [low]
+    assert high.enabled is True and low.enabled is True  # preview is read-only
+
+    resolved = structure.auto_resolve()
+    assert resolved == [low]
+    assert high.enabled is True and low.enabled is False
+
+
+def test_auto_resolve_preview_disables_lower_scored_earlier_member():
+    structure = Structure("S")
+    low_early = FakeMember(0, 8, score=2)
+    high_late = FakeMember(4, 8, score=9)
+    structure.add_member(low_early)
+    structure.add_member(high_late)
+
+    disabled = structure.auto_resolve_preview()
+
+    assert disabled == [low_early]  # the earlier, lower-scored half is dropped
+
+    structure.auto_resolve()
+    assert low_early.enabled is False and high_late.enabled is True
+
+
+def test_set_cdecl_wraps_type_write_in_undo_snapshot(monkeypatch):
+    from types import SimpleNamespace
+
+    structure = Structure("Example")
+    events = []
+    monkeypatch.setattr(
+        structure_module,
+        "ida_undo",
+        SimpleNamespace(
+            begin_undo_action=lambda name: events.append(("begin", name)),
+            end_undo_action=lambda: events.append(("end",)),
+        ),
+    )
+    monkeypatch.setattr(
+        structure_module.forge_types, "create_type",
+        lambda name, decl: True, raising=False,
+    )
+
+    structure.set_cdecl("struct Example { int x; };")
+
+    assert [e[0] for e in events] == ["begin", "end"]
+    assert events[0][1] == "forge: set type Example"
+
+
+def test_set_cdecl_undo_is_absent_without_ida_undo(monkeypatch):
+    structure = Structure("Example")
+    monkeypatch.setattr(structure_module, "ida_undo", None)
+    monkeypatch.setattr(
+        structure_module.forge_types, "create_type",
+        lambda name, decl: True, raising=False,
+    )
+
+    result = structure.set_cdecl("struct Example { int x; };")
+
+    assert result is not None  # no undo bookkeeping required off-IDA

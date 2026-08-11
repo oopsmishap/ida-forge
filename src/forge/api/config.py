@@ -5,9 +5,29 @@ from pathlib import Path
 from typing import Any, ClassVar
 
 import ida_diskio
-import toml
+import toml  # still needed for writing; tomllib is read-only
+
+try:  # stdlib tomllib on Python 3.11+ (IDA 9.x ships 3.12)
+    import tomllib
+except ImportError:  # Python 3.9/3.10 read via the `toml` package
+    tomllib = None
 
 from forge.util.logging import log_debug, log_error
+
+
+def _load_toml_file(path: Path) -> dict:
+    """Read a TOML file via :mod:`tomllib` (stdlib) or the ``toml`` fallback."""
+    if tomllib is not None:
+        with path.open("rb") as f:  # tomllib requires binary mode
+            return tomllib.load(f)
+    with path.open("r", encoding="utf-8") as f:
+        return toml.load(f)
+
+
+def _dump_toml_file(path: Path, data: dict) -> None:
+    """Persist a dict to a TOML file via the ``toml`` package (no stdlib dumper)."""
+    with path.open("w", encoding="utf-8") as f:
+        toml.dump(data, f)
 
 ConfigDict = dict[str, Any]
 
@@ -29,12 +49,11 @@ class ConfigBase:
     def _load_config(self) -> ConfigDict:
         """Load the full configuration file."""
         try:
-            with self._config_path.open("r", encoding="utf-8") as f:
-                config = toml.load(f)
-                log_debug(
-                    f"Loaded {self._config_name} config file at {self._config_path}"
-                )
-                return config if isinstance(config, dict) else {}
+            config = _load_toml_file(self._config_path)
+            log_debug(
+                f"Loaded {self._config_name} config file at {self._config_path}"
+            )
+            return config if isinstance(config, dict) else {}
         except FileNotFoundError:
             log_debug(f"Config file not found {self._config_path}. Using default.")
             return {}
@@ -48,8 +67,7 @@ class ConfigBase:
         """Persist the full configuration file."""
         try:
             self._config_path.parent.mkdir(parents=True, exist_ok=True)
-            with self._config_path.open("w", encoding="utf-8") as f:
-                toml.dump(self._config, f)
+            _dump_toml_file(self._config_path, self._config)
             log_debug(f"Saved {self._config_name} config file at {self._config_path}")
         except Exception as e:  # persistence failures surface in the log, then re-raise
             log_error(
@@ -134,7 +152,9 @@ class ConfigBase:
 class ForgeConfig(ConfigBase):
     """Root config namespace stored in `forge.toml`."""
     name = "forge"
-    default_config: ClassVar[ConfigDict] = {}
+    default_config: ClassVar[ConfigDict] = {
+        "log_level": "INFO",
+    }
 
     def __init__(self):
         super().__init__("forge")

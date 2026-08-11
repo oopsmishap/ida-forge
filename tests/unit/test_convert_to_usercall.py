@@ -105,6 +105,7 @@ def _prepare_activation(monkeypatch, cc_name):
 
     handler = _Capture()
     forge_logger = logging.getLogger("forge")
+    forge_logger.setLevel(logging.DEBUG)
     forge_logger.addHandler(handler)
     captured["log"] = handler
 

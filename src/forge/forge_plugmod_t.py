@@ -76,7 +76,28 @@ class ForgePlugin(ida_idaapi.plugin_t):
             traceback.print_exc()
             return ida_idaapi.PLUGIN_SKIP
 
+    def _apply_log_level(self) -> None:
+        """Honor the ``log_level`` config key (DEBUG for diagnostics).
+
+        The level is applied before any other plugin code logs, so the
+        configured verbosity is in effect from the first message.
+        """
+        try:
+            from forge.api.config import ForgeConfig
+            from forge.util import logging as forge_logging
+            from forge.util.logging import log_warning
+
+            level = str(ForgeConfig()["log_level"]).strip().upper()
+        except Exception:  # noqa: BLE001 — config read must never block init
+            log_warning("Could not read forge log_level; keeping INFO")
+            return
+        if level in forge_logging.LOG_LEVELS:
+            forge_logging.set_log_level(level)
+        else:
+            log_warning(f"Unknown forge log_level {level!r}; keeping INFO")
+
     def _do_init(self) -> ida_idaapi.plugmod_t:
+        self._apply_log_level()
         log_debug(f"Checking environment for {PLUGIN_NAME}")
         if not is_python_version_supported():
             log_warning("Unsupported Python version")
@@ -156,6 +177,12 @@ class ForgePlugin(ida_idaapi.plugin_t):
         if self._ready_hook is not None:
             self._ready_hook.unhook()
             self._ready_hook = None
+
+        # Drop any in-memory scan models held by the pre-reload singleton;
+        # the re-import constructs a fresh StructureBuilderForm below.
+        with suppress(Exception):  # the feature may not be loaded
+            from forge.features.structure_builder.form import structure_form
+            structure_form.reset()
 
         forge_pkg = sys.modules.get("forge")
         if forge_pkg is None:

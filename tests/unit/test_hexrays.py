@@ -232,3 +232,59 @@ def test_collect_ctree_items_near_ea_handles_badaddr_and_none_cfunc():
     assert (
         hexrays_module.collect_ctree_items_near_ea(SimpleNamespace(), -1) == []
     )
+
+
+# ---------------------------------------------------------------------------
+# Tier 4: decompile guards (BADADDR / non-function EAs)
+# ---------------------------------------------------------------------------
+
+
+def _patch_decompile_deps(monkeypatch, hexrays_module):
+    calls = {"decompile": [], "warned": []}
+
+    monkeypatch.setattr(
+        hexrays_module.ida_hexrays, "decompile",
+        lambda ea: calls["decompile"].append(ea) or SimpleNamespace(),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        hexrays_module.ida_funcs, "get_func",
+        lambda ea: None, raising=False,
+    )
+    monkeypatch.setattr(
+        hexrays_module,
+        "log_warning",
+        lambda msg, *a, **k: calls["warned"].append(msg), raising=False,
+    )
+    return calls
+
+
+def test_decompile_rejects_badaddr(monkeypatch):
+    hexrays_module = _load_hexrays_module()
+    calls = _patch_decompile_deps(monkeypatch, hexrays_module)
+
+    assert hexrays_module.decompile(-1) is None
+    assert calls["decompile"] == []
+
+
+def test_decompile_rejects_non_function_ea(monkeypatch):
+    hexrays_module = _load_hexrays_module()
+    calls = _patch_decompile_deps(monkeypatch, hexrays_module)
+
+    assert hexrays_module.decompile(0x140000123) is None
+    assert calls["decompile"] == []
+    assert any("not a function" in msg for msg in calls["warned"])
+
+
+def test_decompile_delegates_to_real_function(monkeypatch):
+    hexrays_module = _load_hexrays_module()
+    calls = _patch_decompile_deps(monkeypatch, hexrays_module)
+    monkeypatch.setattr(
+        hexrays_module.ida_funcs, "get_func",
+        lambda ea: SimpleNamespace(start_ea=ea), raising=False,
+    )
+
+    result = hexrays_module.decompile(0x1400014F0)
+
+    assert calls["decompile"] == [0x1400014F0]
+    assert result is not None

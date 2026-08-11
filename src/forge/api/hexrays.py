@@ -33,6 +33,17 @@ def to_hex(ea: int) -> str:
 
 
 def decompile(ea: int):
+    if ea == ida_idaapi.BADADDR:
+        log_debug(f"Skipping decompile at {to_hex(ea)} (BADADDR)")
+        return None
+    # Only real functions produce a meaningful ctree; decompiling data/thunk
+    # regions wastes time and can raise on unusual inputs. The decompiler
+    # parenthesises function chunks, so get_func is the reliable check.
+    if ida_funcs.get_func(ea) is None:
+        log_warning(
+            f"Skipping decompile at {to_hex(ea)}: not a function"
+        )
+        return None
     try:
         # https://hex-rays.com/products/ida/news/8_2sp1/
         # seems like they've finally fixed the issue of needing to check both exception and return value

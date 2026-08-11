@@ -942,7 +942,8 @@ def test_structure_table_resolve_clears_stale_selection_after_refresh(monkeypatc
     table = _TableSelectionRecorder()
     structure_form.ui = SimpleNamespace(tbl_structure=table)
     structure_form.current_structure = SimpleNamespace(
-        auto_resolve=lambda: calls.append("resolve")
+        auto_resolve_preview=list,
+        auto_resolve=lambda: calls.append("resolve"),
     )
     monkeypatch.setattr(
         structure_form, "update_structure_fields", lambda: calls.append("fields")
@@ -3141,3 +3142,75 @@ def test_build_child_scan_inference_seed_explicit_parent_expr_skips_anchor(monke
     assert seed.parent_object is parent_obj
     assert seed.evidence_ea == 5
     assert seed.function_ea == 0x1400014F0
+
+
+def test_structure_table_resolve_confirms_before_disabling(monkeypatch):
+    """T4.1: auto-resolve previews what it would disable and the user must
+    confirm before the disabling commits."""
+    import ida_kernwin
+
+    monkeypatch.setattr(ida_kernwin, "ASKBTN_NO", 0, raising=False)
+    monkeypatch.setattr(ida_kernwin, "ASKBTN_YES", 1, raising=False)
+    structure_form = _make_form(monkeypatch)
+    structure = structure_form.create_structure("S")
+    structure.add_member(_FakeMember(0, 8, name="base"))
+    structure.add_member(_FakeMember(4, 8, name="overlap"))
+    structure_form.current_structure = structure
+    resolved = []
+    monkeypatch.setattr(
+        structure, "auto_resolve_preview",
+        lambda: [structure.members[1]], raising=False,
+    )
+    monkeypatch.setattr(
+        structure, "auto_resolve", lambda: resolved.append(True), raising=False,
+    )
+
+    monkeypatch.setattr(
+        ida_kernwin, "ask_yn",
+        lambda dflt, text: ida_kernwin.ASKBTN_NO, raising=False,
+    )
+    structure_form.structure_table_resolve()
+    assert resolved == []  # declined -> nothing disabled
+
+    monkeypatch.setattr(
+        ida_kernwin, "ask_yn",
+        lambda dflt, text: ida_kernwin.ASKBTN_YES, raising=False,
+    )
+    structure_form.structure_table_resolve()
+    assert resolved == [True]  # confirmed -> resolve runs
+
+
+def test_nudge_into_collision_with_unselected_member_is_rejected(monkeypatch):
+    """T4.2: nudging a selected member so it overlaps a non-selected one is
+    refused and every offset is restored."""
+    structure_form = _make_form(monkeypatch)
+    structure = structure_form.create_structure("S")
+    unselected = _FakeMember(0x8, 8, name="a")   # occupies 0x8..0x10
+    selected = _FakeMember(0x0, 8, name="b")     # occupies 0x0..0x8
+    structure.add_member(unselected)
+    structure.add_member(selected)
+    structure_form.current_structure = structure
+    monkeypatch.setattr(structure_form, "get_selected_members", lambda: [selected])
+    warnings = []
+    monkeypatch.setattr(
+        form_module, "log_warning",
+        lambda msg, *a, **k: warnings.append(msg), raising=False,
+    )
+
+    structure_form.nudge_selected_rows(4)  # 0x4..0xC would overlap 0x8..0x10
+
+    assert selected.offset == 0x0
+    assert unselected.offset == 0x8
+    assert any("non-selected member" in msg for msg in warnings)
+
+
+def test_on_close_clears_structure_models(monkeypatch):
+    """T4.4: closing the form drops the in-memory scan models."""
+    structure_form = _make_form(monkeypatch)
+    structure_form.create_structure("Foo")
+    structure_form.current_structure = structure_form.structures["Foo"]
+
+    structure_form.OnClose(None)
+
+    assert structure_form.structures == {}
+    assert structure_form.current_structure is None

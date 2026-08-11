@@ -89,39 +89,8 @@ class ScannedObject:
         origin: int,
         applicable: bool = True,
     ) -> ScannedObject:
-        obj_id = getattr(obj, "id", None)
-        if obj_id is None:
-            legacy_lvar = getattr(obj, "lvar", getattr(obj, "_ScannedVariableObject__lvar", None))
-            if legacy_lvar is not None:
-                result = ScannedVariableObject(
-                    legacy_lvar, getattr(obj, "name", ""), expression_address, origin, applicable
-                )
-            else:
-                legacy_obj_ea = getattr(
-                    obj, "object_ea", getattr(obj, "_ScannedGlobalObject__obj_ea", None)
-                )
-                if legacy_obj_ea is not None:
-                    result = ScannedGlobalObject(
-                        legacy_obj_ea, getattr(obj, "name", ""), expression_address, origin, applicable
-                    )
-                else:
-                    legacy_struct_name = getattr(
-                        obj, "struct_name", getattr(obj, "_ScannedStructureMemberObject__struct_name", None)
-                    )
-                    legacy_struct_offset = getattr(
-                        obj, "offset", getattr(obj, "_ScannedStructureMemberObject__struct_offset", None)
-                    )
-                    if legacy_struct_name is None or legacy_struct_offset is None:
-                        raise AssertionError(f"Unsupported scan object type: {obj_id}")
-                    result = ScannedStructureMemberObject(
-                        legacy_struct_name,
-                        legacy_struct_offset,
-                        getattr(obj, "name", ""),
-                        expression_address,
-                        origin,
-                        applicable,
-                    )
-        elif obj_id == ObjectType.global_object:
+        obj_id = obj.id
+        if obj_id == ObjectType.global_object:
             result = ScannedGlobalObject(
                 obj.object_ea, obj.name, expression_address, origin, applicable
             )
@@ -306,7 +275,7 @@ class ScanVisitor(ObjectVisitor):
     def _prefer_object_tinfo(
         self, obj: ScanObject, tinfo: ida_typeinf.tinfo_t | None
     ) -> ida_typeinf.tinfo_t | None:
-        obj_tinfo = getattr(obj, "tinfo", None)
+        obj_tinfo = obj.tinfo
         if obj_tinfo is None or tinfo is None:
             return tinfo
         if self._is_unknown_tinfo(tinfo) and self._is_structure_like_tinfo(obj_tinfo):
@@ -374,7 +343,7 @@ class ScanVisitor(ObjectVisitor):
     def _manipulate(self, cexpr: ida_hexrays.cexpr_t, obj: ScanObject) -> None:
         super()._manipulate(cexpr, obj)
 
-        obj_tinfo = getattr(obj, "tinfo", None)
+        obj_tinfo = obj.tinfo
         if obj_tinfo and not is_legal_type(obj_tinfo):
             # The tinfo is corrupt or incomplete — even dstr() can throw on bad tinfo_t objects.
             expr_ea = find_expr_address(cexpr, self.parents)

@@ -85,6 +85,16 @@ class StructureBuilderForm(ChildScanMixin, ida_kernwin.PluginForm):
         self.update_structure_fields()
 
     def OnClose(self, _form):
+        self.reset()
+
+    def reset(self) -> None:
+        """Drop the in-memory scan models and cached UI state.
+
+        Stale structures from a previous DB session must not survive a close
+        or plugin reload — the relaunched form starts from an empty scanner.
+        """
+        self.structures.clear()
+        self.current_structure = None
         self._reset_ui_state()
 
     def _reset_ui_state(self) -> None:
@@ -1467,6 +1477,12 @@ class StructureBuilderForm(ChildScanMixin, ida_kernwin.PluginForm):
             log_warning("Cannot move rows to a negative offset.", True)
             return
 
+        moved = {id(member) for member in members}
+        original_offsets = {
+            id(member): member.offset for member in self.current_structure.members
+        }
+        original_main_offset = self.current_structure.main_offset
+
         for member in members:
             old_offset = member.offset
             member.offset += delta
@@ -1476,6 +1492,25 @@ class StructureBuilderForm(ChildScanMixin, ida_kernwin.PluginForm):
 
         self.current_structure.members.sort()
         self.current_structure.refresh_collisions()
+
+        # Reject a nudge that overlaps a member the user did not move — the
+        # offset table must stay a valid, non-overlapping sequence.
+        collides_outside_selection = any(
+            self.current_structure.has_collision(index)
+            and id(member) not in moved
+            for index, member in enumerate(self.current_structure.members)
+        )
+        if collides_outside_selection:
+            for member in self.current_structure.members:
+                member.offset = original_offsets[id(member)]
+            self.current_structure.set_main_offset(original_main_offset)
+            self.current_structure.members.sort()
+            self.current_structure.refresh_collisions()
+            log_warning(
+                "Cannot move rows: would overlap a non-selected member.", True
+            )
+            return
+
         self.update_structure_fields()
         if self.ui is not None:
             self.ui.tbl_structure.clearSelection()
@@ -1944,6 +1979,17 @@ class StructureBuilderForm(ChildScanMixin, ida_kernwin.PluginForm):
     def structure_table_resolve(self):
         if self.current_structure is None:
             return
+
+        disabled = self.current_structure.auto_resolve_preview()
+        if disabled:
+            reply = ida_kernwin.ask_yn(
+                ida_kernwin.ASKBTN_NO,
+                "HIDECANCEL\n"
+                f"{len(disabled)} overlapping member(s) would be disabled "
+                "(collisions are resolved by scan score). Continue?",
+            )
+            if reply != ida_kernwin.ASKBTN_YES:
+                return
 
         self.current_structure.auto_resolve()
         self.update_structure_fields()

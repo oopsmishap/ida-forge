@@ -25,6 +25,7 @@ def _capture_kernwin(monkeypatch):
 
 
 def test_log_debug_and_info_go_to_output_window(_capture_kernwin):
+    forge_logging.set_log_level(logging.DEBUG)  # default is INFO; routing is the contract
     forge_logging.log_debug("debug msg")
     forge_logging.log_info("info msg")
     assert any("debug msg" in line for line in _capture_kernwin["msg"])
@@ -73,3 +74,25 @@ def test_reload_dedupes_handlers():
 
     marker_handlers = [h for h in logger.handlers if getattr(h, "_forge_marker", False)]
     assert len(marker_handlers) == 1
+
+def test_set_log_level_accepts_names_and_constants():
+    forge_logging.set_log_level("TRACE")
+    assert forge_logging._logger.level == 5
+
+    forge_logging.set_log_level("DEBUG")
+    assert forge_logging._logger.level == logging.DEBUG
+
+    forge_logging.set_log_level("info")
+    assert forge_logging._logger.level == logging.INFO
+
+    forge_logging.set_log_level(logging.WARNING)
+    assert forge_logging._logger.level == logging.WARNING
+
+    with pytest.raises(ValueError):
+        forge_logging.set_log_level("NOT_A_LEVEL")
+
+    forge_logging.set_log_level(logging.INFO)  # restore default for other tests
+
+
+def test_logger_defaults_to_info_not_debug():
+    assert forge_logging._logger.level == logging.INFO

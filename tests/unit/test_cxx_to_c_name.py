@@ -15,6 +15,9 @@ from forge.util.cxx_to_c_name import (
     [
         ("operator<<=", "operator_left_shift_assign"),
         ("operator>>=", "operator_right_shift_assign"),
+        ("operator<=>", "operator_spaceship"),
+        ("operator co_await", "operator_co_await"),
+        ("operator->*", "operator_arrow_star"),
         ("operator new[]", "operator_new_array"),
         ("operator delete[]", "operator_delete_array"),
         ("operator!=", "operator_neq"),
@@ -82,3 +85,9 @@ def test_sanitize_c_identifier_custom_fallback():
 
 def test_namespace_function_round_trip():
     assert demangled_name_to_c_str("ns::foo()") == "ns_foo"
+
+
+def test_conversion_operator_keeps_target_type():
+    """`operator TYPE` has no symbol to replace; the type survives sanitize."""
+    assert demangled_name_to_c_str("operator bool") == "operator_bool"
+    assert demangled_name_to_c_str("operator MyClass") == "operator_MyClass"
