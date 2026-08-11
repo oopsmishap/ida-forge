@@ -2111,6 +2111,118 @@ def test_execute_child_scan_plan_prefers_inferred_child_roots(monkeypatch):
 
 
 
+def test_collect_evidence_by_function_groups_and_skips_badaddr(monkeypatch):
+    structure_form = _make_form(monkeypatch)
+    ev = lambda func_ea, ea: SimpleNamespace(id=object(), func_ea=func_ea, ea=ea)
+    plan = SimpleNamespace(
+        scan_variables=(
+            ev(0x401000, 0x10),
+            ev(0x401000, 0x20),
+            ev(0x402000, 0x30),
+            ev(-1, 0x40),  # BadAddr: dropped
+        ),
+    )
+
+    grouped = structure_form._collect_evidence_by_function(plan)
+
+    assert sorted(grouped.keys()) == [0x401000, 0x402000]
+    assert [v.ea for v in grouped[0x401000]] == [0x10, 0x20]
+    assert [v.ea for v in grouped[0x402000]] == [0x30]
+
+
+def test_sorted_scan_evidence_dedupes_and_orders(monkeypatch):
+    structure_form = _make_form(monkeypatch)
+    member = SimpleNamespace(
+        scanned_variables=[
+            SimpleNamespace(func_ea=0x402000, ea=0x30, name="b"),
+            SimpleNamespace(func_ea=0x401000, ea=0x10, name="a"),
+            SimpleNamespace(func_ea=0x401000, ea=0x10, name="a"),  # duplicate
+        ]
+    )
+
+    ordered = structure_form._sorted_scan_evidence(member)
+
+    assert len(ordered) == 2
+    assert [(v.func_ea, v.ea, v.name) for v in ordered] == [
+        (0x401000, 0x10, "a"),
+        (0x402000, 0x30, "b"),
+    ]
+
+
+def test_member_scan_tinfo_validates_and_warns(monkeypatch):
+    structure_form = _make_form(monkeypatch)
+    warnings = []
+
+    legal = SimpleNamespace(is_ptr=lambda: True)
+    assert (
+        structure_form._member_scan_tinfo(SimpleNamespace(tinfo=legal), warnings.append)
+        is legal
+    )
+    assert warnings == []
+
+    assert (
+        structure_form._member_scan_tinfo(SimpleNamespace(tinfo=None), warnings.append)
+        is None
+    )
+    assert len(warnings) == 1
+
+    monkeypatch.setattr(child_scan_module, "is_legal_type", lambda tinfo: False)
+    assert (
+        structure_form._member_scan_tinfo(
+            SimpleNamespace(tinfo=SimpleNamespace(is_ptr=lambda: False)),
+            warnings.append,
+        )
+        is None
+    )
+    assert len(warnings) == 2
+
+
+def test_scan_evidence_in_function_falls_back_to_seeded_root(monkeypatch):
+    structure_form = _make_form(monkeypatch)
+    child = structure_form.create_structure("Child")
+    child.main_offset = 0x30
+
+    cfunc = SimpleNamespace(entry_ea=0x401000)
+    plan = SimpleNamespace(scan_object=SimpleNamespace(name="plan_root"))
+    seen = []
+
+    class FakeVisitor:
+        def __init__(self, cfunc, origin, obj, structure, recurse_calls=False):
+            seen.append((cfunc, origin, obj, structure, recurse_calls))
+
+        def process(self):
+            return None
+
+    monkeypatch.setattr(
+        structure_form,
+        "_seed_scan_object_from_evidence",
+        lambda plan_object, scan_variable: SimpleNamespace(name="seeded", func_ea=0x401000),
+    )
+    monkeypatch.setattr(
+        structure_form,
+        "_infer_child_scan_roots",
+        lambda _cfunc, seeded: (),  # no inferred roots -> seeded fallback
+    )
+    monkeypatch.setattr(
+        structure_form,
+        "_prepare_scan_cfunc",
+        lambda _ea: None,  # root function missing -> reuse evidence cfunc
+    )
+
+    result = structure_form._scan_evidence_in_function(
+        child, cfunc, [SimpleNamespace(name="evidence")], plan, FakeVisitor
+    )
+
+    assert result is True
+    assert len(seen) == 1
+    _cfunc, origin, obj, structure, recurse = seen[0]
+    assert _cfunc is cfunc
+    assert origin == 0x30
+    assert obj.name == "seeded"
+    assert structure is child
+    assert recurse is True
+
+
 def test_build_child_scan_inference_seed_recovers_descendant_parent_member_anchors(
     monkeypatch,
  ):

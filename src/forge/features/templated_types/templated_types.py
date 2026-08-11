@@ -47,7 +47,7 @@ class TemplatedTypes:
                     type_name = type_name.format(*args)
                     # return tuple
                     return type_name, type_struct
-                except Exception as e:
+                except Exception as e:  # noqa: BLE001 — malformed TOML entries are skipped
                     log_error(f'failed to parse struct, name: "{type_name}", error: {e}')
                     return None
             else:

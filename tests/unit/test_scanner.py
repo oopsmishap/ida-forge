@@ -587,7 +587,7 @@ def test_extract_member_uses_argument_expression_type_without_warning(monkeypatc
     monkeypatch.setattr(scanner_module, "get_func_argument_info", lambda *_args, **_kwargs: (0, None))
 
     class _FakeTypes:
-        def get_ptr(self):
+        def get_ptr_tinfo(self):
             return SimpleNamespace(dstr=lambda: "void *")
 
         def __getitem__(self, key):
@@ -713,7 +713,7 @@ def test_extract_member_falls_back_to_char_for_direct_call_context(monkeypatch):
     monkeypatch.setattr(scanner_module, "get_func_argument_info", lambda *_args, **_kwargs: (0, None))
 
     class _FakeTypes:
-        def get_ptr(self):
+        def get_ptr_tinfo(self):
             return SimpleNamespace(dstr=lambda: "void *")
 
         def __getitem__(self, key):
@@ -767,7 +767,7 @@ def test_extract_member_uses_pointer_fallback_for_call_context(monkeypatch):
     monkeypatch.setattr(scanner_module, "get_func_argument_info", lambda *_args, **_kwargs: (0, None))
 
     class _FakeTypes:
-        def get_ptr(self):
+        def get_ptr_tinfo(self):
             return SimpleNamespace(dstr=lambda: "void *")
 
         def __getitem__(self, key):

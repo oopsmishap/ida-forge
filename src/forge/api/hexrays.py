@@ -59,6 +59,65 @@ def get_line(ctree: ida_hexrays.ctree_parentee_t, cfunc) -> str:
     return ""
 
 
+def collect_ctree_items_near_ea(
+    cfunc, ea: int, *, exhaustive: bool = False
+) -> list:
+    """Return ctree items mapped to ``ea`` (items, eamap hits, closest addr).
+
+    The lookup chain is shared by the structure-builder form and the child-scan
+    engine; keep every fallback in this one place so IDA API drift (the eamap /
+    find_closest_addr shapes changed between major versions) is fixed once.
+
+    :param cfunc: decompiled function (``cfunc_t`` or a test double)
+    :param ea: target address; BADADDR returns nothing
+    :param exhaustive: when True, eamap and find_closest_addr contribute even
+        if earlier steps already found candidates (dedup by object id);
+        when False (default) later steps only run if nothing was found yet.
+    """
+    candidates: list = []
+    if cfunc is None or ea == ida_idaapi.BADADDR:
+        return candidates
+
+    for item in getattr(cfunc, "treeitems", []):
+        if getattr(item, "ea", ida_idaapi.BADADDR) == ea:
+            candidates.append(item)
+
+    eamap = getattr(cfunc, "eamap", None)
+    if (exhaustive or not candidates) and eamap is not None:
+        try:
+            candidates.extend(list(eamap.get(ea, [])))
+        except Exception:  # noqa: BLE001 — eamap shape differs across IDA versions
+            log_debug(f"eamap lookup failed for {to_hex(ea)}; skipping")
+
+    body = getattr(cfunc, "body", None)
+    if (
+        (exhaustive or not candidates)
+        and body is not None
+        and hasattr(body, "find_closest_addr")
+    ):
+        try:
+            closest_item = body.find_closest_addr(ea)
+        except Exception:  # noqa: BLE001 — stale cfunc after IDB type changes
+            log_debug(f"find_closest_addr failed for {to_hex(ea)}; skipping")
+            closest_item = None
+        if closest_item is not None:
+            candidates.append(closest_item)
+
+    if exhaustive:
+        seen: set[int] = set()
+        deduped: list = []
+        for item in candidates:
+            if item is None:
+                continue
+            marker = id(item)
+            if marker in seen:
+                continue
+            seen.add(marker)
+            deduped.append(item)
+        return deduped
+    return candidates
+
+
 def get_ordinal(tinfo: ida_typeinf.tinfo_t):
     ordinal = tinfo.get_ordinal()
     if ordinal == 0:
@@ -69,7 +128,8 @@ def get_ordinal(tinfo: ida_typeinf.tinfo_t):
     return ordinal
 
 
-def get_ptr(ea):
+def read_pointer(ea):
+    """Read a pointer-sized value from the database at ``ea``."""
     if types.width == 8:
         return ida_bytes.get_64bit(ea)
     else:
@@ -280,7 +340,7 @@ def is_legal_type(tinfo: ida_typeinf.tinfo_t) -> bool:
         clr_const = getattr(tinfo, "clr_const", None)
         if callable(clr_const):
             clr_const()
-    except Exception:
+    except Exception:  # noqa: BLE001 — broken tinfo wrappers are rejected below
         return False
 
     # Forward declarations and other incomplete wrappers are not usable root types.

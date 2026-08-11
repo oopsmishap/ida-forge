@@ -24,7 +24,11 @@ QMenu = QtWidgets.QMenu
 QTableWidgetItem = QtWidgets.QTableWidgetItem
 QWidget = QtWidgets.QWidget
 
-from forge.api.hexrays import decompile, is_legal_type
+from forge.api.hexrays import (
+    collect_ctree_items_near_ea,
+    decompile,
+    is_legal_type,
+)
 from forge.api.members import AbstractMember, Member, VirtualTable, parse_user_tinfo
 from forge.api.scan_object import ScanObject
 from forge.api.scanner import NewDeepScanVisitor
@@ -1750,34 +1754,15 @@ class StructureBuilderForm(ChildScanMixin, ida_kernwin.PluginForm):
         def _line_for_item(item) -> str | None:
             try:
                 line_no, _column = cfunc.find_item_coords(item)
-            except Exception:
+            except Exception:  # noqa: BLE001 — stale item after re-decompilation
+                log_debug("find_item_coords failed for a candidate item")
                 return None
             if 1 <= line_no <= len(pseudocode):
                 return _pseudocode_line_text(pseudocode[line_no - 1])
             return None
 
 
-        candidates = []
-        for item in getattr(cfunc, "treeitems", []):
-            if getattr(item, "ea", idaapi.BADADDR) == target_ea:
-                candidates.append(item)
-
-        eamap = getattr(cfunc, "eamap", None)
-        if not candidates and eamap is not None:
-            try:
-                candidates.extend(list(eamap.get(target_ea, [])))
-            except Exception:
-                pass
-
-        if not candidates:
-            body = getattr(cfunc, "body", None)
-            if body is not None and hasattr(body, "find_closest_addr"):
-                try:
-                    closest_item = body.find_closest_addr(target_ea)
-                except Exception:
-                    closest_item = None
-                if closest_item is not None:
-                    candidates.append(closest_item)
+        candidates = collect_ctree_items_near_ea(cfunc, target_ea)
 
         lines = []
         for item in candidates:

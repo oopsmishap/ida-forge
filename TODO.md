@@ -176,7 +176,30 @@ scout reports, 246-test run, official IDAPython docs cross-check).
 
 ---
 
-## Tier 2 — Structural debt
+## Tier 2 — Structural debt (ALL RESOLVED 2026-08-11)
+
+- T2.1 `collect_ctree_items_near_ea` in `forge/api/hexrays.py`; form.py +
+  child_scan.py chains migrated (3 sites); exhaustive vs short-circuit modes;
+  conftest carries a faithful behavioral double; 6 new tests.
+- T2.2 `_execute_visit` extracted; both loops in
+  `RecursiveDownwardsObjectVisitor._recursive_process` now share it
+  (`_VISIT_DEFERRED` sentinel distinguishes retry from drop; `progressed`
+  semantics preserved exactly).
+- T2.3 `_execute_child_scan_plan` split into `_collect_evidence_by_function`
+  + `_scan_evidence_in_function`; `_build_child_scan_plan` guards extracted to
+  `_sorted_scan_evidence` + `_member_scan_tinfo`; 4 new direct unit tests; no
+  function in child_scan.py exceeds 120 lines (max is `_build_child_scan_plan`
+  at 95).
+- T2.4 src/ is now free of BLE001/S110: silent swallows in
+  `templated_types/form.py` log warnings; eager chains log at debug; genuine
+  IDA-version-tolerance sites carry `# noqa` with reasons; explored a mutation
+  check via the stale `# noqa` removal (config.py re-raise case).
+- T2.5 `visitor.ObjectVisitor.get_line` delegates to `hexrays.get_line`.
+- T2.6 `hexrays.get_ptr(ea)` → `read_pointer(ea)`; `Types.get_ptr` →
+  `get_ptr_tinfo`; all call sites + test fakes renamed.
+- T2.7 16-bit (width 2) supported: `_size_t_enum` picks BTF_UINT16,
+  `get_ptr_type` returns u16; init assert replaced with a runtime width check;
+  new tests cover width detection and the u16 pointer path.
 
 ### T2.1 Extract the duplicated ctree-item lookup chain
 

@@ -209,7 +209,7 @@ class forge_plugmod_t(ida_idaapi.plugmod_t):
         # so we never raise from a destructor.
         try:
             self._plugin._teardown()
-        except Exception:  # noqa: BLE001
+        except Exception:  # noqa: BLE001, S110 — must never raise from __del__
             pass
 
     def run(self, arg: int) -> None:

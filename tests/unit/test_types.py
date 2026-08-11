@@ -246,6 +246,43 @@ def test_save_success_returns_stored_ordinal(monkeypatch):
     assert calls["n"] == 2
 
 
+def test_size_t_enum_follows_pointer_width():
+    types_module = _load_types_source_module()
+
+    assert types_module.Types._size_t_enum(2) == ida_typeinf.BTF_UINT16
+    assert types_module.Types._size_t_enum(4) == ida_typeinf.BTF_UINT32
+    assert types_module.Types._size_t_enum(8) == ida_typeinf.BTF_UINT64
+
+
+def test_pointer_width_detection(monkeypatch):
+    """16-bit binaries must not crash plugin init (T2.7)."""
+    types_module = _load_types_source_module()
+
+    monkeypatch.setattr(types_module.ida_ida, "inf_is_64bit", lambda: False, raising=False)
+    monkeypatch.setattr(types_module.ida_ida, "inf_is_32bit_exactly", lambda: False, raising=False)
+    monkeypatch.setattr(types_module.ida_ida, "inf_is_16bit", lambda: True, raising=False)
+    assert types_module.Types._get_ptr_width() == 2
+
+    monkeypatch.setattr(types_module.ida_ida, "inf_is_16bit", lambda: False, raising=False)
+    monkeypatch.setattr(types_module.ida_ida, "inf_is_32bit_exactly", lambda: True, raising=False)
+    assert types_module.Types._get_ptr_width() == 4
+
+    monkeypatch.setattr(types_module.ida_ida, "inf_is_32bit_exactly", lambda: False, raising=False)
+    monkeypatch.setattr(types_module.ida_ida, "inf_is_64bit", lambda: True, raising=False)
+    assert types_module.Types._get_ptr_width() == 8
+
+
+def test_get_ptr_type_supports_16bit(monkeypatch):
+    types_module = _load_types_source_module()
+    helper = _make_types_helper(types_module)
+    monkeypatch.setattr(types_module.ida_ida, "inf_is_64bit", lambda: False, raising=False)
+    monkeypatch.setattr(types_module.ida_ida, "inf_is_32bit_exactly", lambda: False, raising=False)
+    monkeypatch.setattr(types_module.ida_ida, "inf_is_16bit", lambda: True, raising=False)
+
+    assert helper.get_ptr_type().name == "u16"
+    assert helper.get_ptr_tinfo().dstr() == "u16 *"
+
+
 def test_load_miss_after_save_returns_ordinal_zero(monkeypatch):
     """Even a successful save whose lookup then misses degrades gracefully."""
     types_module = _load_types_source_module()

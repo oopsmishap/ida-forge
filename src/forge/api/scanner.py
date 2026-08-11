@@ -379,7 +379,7 @@ class ScanVisitor(ObjectVisitor):
             expr_ea = find_expr_address(cexpr, self.parents)
             try:
                 type_str = obj_tinfo.dstr()
-            except Exception:
+            except Exception:  # noqa: BLE001 — corrupt tinfo; reported as "?" below
                 type_str = "?"
             log_warning(f"Type {type_str} @ {to_hex(expr_ea)} is not supported")
             return
@@ -560,7 +560,7 @@ class ScanVisitor(ObjectVisitor):
             cexpr = context.expr_at(0)
             context.pop_front()
         else:
-            tinfo = types.get_ptr()
+            tinfo = types.get_ptr_tinfo()
 
         log_debug(f"1st default_tinfo: {self._describe_tinfo(tinfo)}")
 

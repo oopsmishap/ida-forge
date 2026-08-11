@@ -11,7 +11,7 @@ def _call_tinfo_method(tinfo, name: str, default=None):
         return default
     try:
         return method()
-    except Exception:
+    except Exception:  # noqa: BLE001 — version-tolerant probe of tinfo methods
         return default
 
 

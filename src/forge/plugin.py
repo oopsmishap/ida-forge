@@ -50,7 +50,7 @@ def register_idc_func(plugmod: Any) -> None:
     for name in (_GET_STATE_NAME, _SET_STATE_NAME):
         try:
             ida_expr.del_idc_func(name)
-        except Exception:
+        except Exception:  # noqa: BLE001, S110 — removing an unregistered name is expected
             pass
 
     _register_idc_func(_GET_STATE_NAME, plugmod.get_state, (ida_expr.VT_LONG,))
@@ -59,11 +59,8 @@ def register_idc_func(plugmod: Any) -> None:
 
 def unregister_idc_func() -> None:
     """Remove the cross-plugin IDC accessors registered by :func:`register_idc_func`."""
-    try:
-        ida_expr.del_idc_func(_GET_STATE_NAME)
-    except Exception:
-        pass
-    try:
-        ida_expr.del_idc_func(_SET_STATE_NAME)
-    except Exception:
-        pass
+    for name in (_GET_STATE_NAME, _SET_STATE_NAME):
+        try:
+            ida_expr.del_idc_func(name)
+        except Exception:  # noqa: BLE001, S110 — plugin may not have registered yet
+            pass

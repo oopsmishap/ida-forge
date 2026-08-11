@@ -52,11 +52,7 @@ class ObjectVisitor(ida_hexrays.ctree_parentee_t):
         log_debug(f"Expression {cexpr.opname} at {print_expr_address(cexpr, self.parents)} Id - {getattr(obj, 'id', None)}")
 
     def get_line(self) -> str:
-        for p in reversed(self.parents):
-            if not p.is_expr():
-                return idaapi.tag_remove(p.print1(self._cfunc.__ref__()))
-        log_warning("Parent instruction is not found")
-        return ""
+        return hexrays_api.get_line(self, self._cfunc)
 
 
 class DownwardsObjectVisitor(ObjectVisitor):
@@ -514,6 +510,59 @@ class RecursiveDownwardsObjectVisitor(RecursiveObjectVisitor, DownwardsObjectVis
             if not self._rescan_current_function:
                 break
 
+    _VISIT_DEFERRED = object()
+
+    def _execute_visit(self, func_ea: int, arg_idx: int, acc_offset: int):
+        """Scan one caller-argument visit; spool discovered children.
+
+        Returns:
+          - a list of ``(ea, arg_idx, acc_offset)`` child visits to queue,
+          - ``_VISIT_DEFERRED`` when the callee cannot accept the argument yet
+            (argidx unknown mid-analysis) and the visit must be retried,
+          - ``None`` when the visit is dropped (decompilation failure).
+        """
+        cfunc = decompile(func_ea)
+        if cfunc is None:
+            return None
+        cfunc = self._refresh_decompilation_tree(cfunc)
+        if cfunc is None:
+            return None
+
+        argidx = getattr(cfunc, "argidx", ())
+        if arg_idx is None or arg_idx < 0 or arg_idx >= len(argidx):
+            return self._VISIT_DEFERRED
+
+        arg, lvar_idx = get_argument(cfunc, arg_idx)
+        obj = VariableObject(arg, lvar_idx)
+
+        saved_cfunc = self._cfunc
+        saved_arg_index = getattr(self, "_arg_index", None)
+        saved_objects = list(getattr(self, "_objects", []))
+        saved_skip = getattr(self, "_skip", False)
+        saved_init_obj = getattr(self, "_init_obj", None)
+
+        saved_base_offset = self._callee_base_offset
+        self._callee_base_offset = acc_offset
+        self.prepare_new_scan(cfunc, lvar_idx, obj)
+        self._scan_single_function()
+        self._callee_base_offset = saved_base_offset
+
+        children: list[tuple[int, int, int]] = []
+        for child_ea, child_idx in self._new_for_visit:
+            child_offset = acc_offset + self._visit_base_offsets.get(
+                (child_ea, child_idx), 0
+            )
+            children.append((child_ea, child_idx, child_offset))
+        self._new_for_visit.clear()
+
+        self._cfunc = saved_cfunc
+        self._arg_index = saved_arg_index
+        self._objects = saved_objects
+        self._skip = saved_skip
+        self._init_obj = saved_init_obj
+
+        return children
+
     def _recursive_process(self):
         self._scan_single_function()
 
@@ -527,46 +576,12 @@ class RecursiveDownwardsObjectVisitor(RecursiveObjectVisitor, DownwardsObjectVis
         while pending_visits:
             func_ea, arg_idx, acc_offset = pending_visits.pop()
 
-            cfunc = decompile(func_ea)
-            if cfunc is None:
-                continue
-            cfunc = self._refresh_decompilation_tree(cfunc)
-            if cfunc is None:
-                continue
-
-            argidx = getattr(cfunc, "argidx", ())
-            if arg_idx is None or arg_idx < 0 or arg_idx >= len(argidx):
+            outcome = self._execute_visit(func_ea, arg_idx, acc_offset)
+            if outcome is self._VISIT_DEFERRED:
                 deferred_visits.append((func_ea, arg_idx, acc_offset))
                 continue
-
-            arg, lvar_idx = get_argument(cfunc, arg_idx)
-            obj = VariableObject(arg, lvar_idx)
-
-            saved_cfunc = self._cfunc
-            saved_arg_index = getattr(self, "_arg_index", None)
-            saved_objects = list(getattr(self, "_objects", []))
-            saved_skip = getattr(self, "_skip", False)
-            saved_init_obj = getattr(self, "_init_obj", None)
-
-            saved_base_offset = self._callee_base_offset
-            self._callee_base_offset = acc_offset
-            self.prepare_new_scan(cfunc, lvar_idx, obj)
-            self._scan_single_function()
-            self._callee_base_offset = saved_base_offset
-
-            if self._new_for_visit:
-                for child_ea, child_idx in self._new_for_visit:
-                    child_offset = acc_offset + self._visit_base_offsets.get(
-                        (child_ea, child_idx), 0
-                    )
-                    pending_visits.append((child_ea, child_idx, child_offset))
-                self._new_for_visit.clear()
-
-            self._cfunc = saved_cfunc
-            self._arg_index = saved_arg_index
-            self._objects = saved_objects
-            self._skip = saved_skip
-            self._init_obj = saved_init_obj
+            if outcome:
+                pending_visits.extend(outcome)
 
             if not pending_visits and deferred_visits:
                 pending_visits = deferred_visits
@@ -576,47 +591,16 @@ class RecursiveDownwardsObjectVisitor(RecursiveObjectVisitor, DownwardsObjectVis
             next_round: list[tuple[int, int, int]] = []
             progressed = False
             for func_ea, arg_idx, acc_offset in deferred_visits:
-                cfunc = decompile(func_ea)
-                if cfunc is None:
-                    continue
-                cfunc = self._refresh_decompilation_tree(cfunc)
-                if cfunc is None:
-                    continue
-
-                argidx = getattr(cfunc, "argidx", ())
-                if arg_idx is None or arg_idx < 0 or arg_idx >= len(argidx):
+                outcome = self._execute_visit(func_ea, arg_idx, acc_offset)
+                if outcome is self._VISIT_DEFERRED:
                     next_round.append((func_ea, arg_idx, acc_offset))
                     continue
-
-                arg, lvar_idx = get_argument(cfunc, arg_idx)
-                obj = VariableObject(arg, lvar_idx)
-
-                saved_cfunc = self._cfunc
-                saved_arg_index = getattr(self, "_arg_index", None)
-                saved_objects = list(getattr(self, "_objects", []))
-                saved_skip = getattr(self, "_skip", False)
-                saved_init_obj = getattr(self, "_init_obj", None)
-
-                saved_base_offset = self._callee_base_offset
-                self._callee_base_offset = acc_offset
-                self.prepare_new_scan(cfunc, lvar_idx, obj)
-                self._scan_single_function()
-                self._callee_base_offset = saved_base_offset
-
-                if self._new_for_visit:
-                    for child_ea, child_idx in self._new_for_visit:
-                        child_offset = acc_offset + self._visit_base_offsets.get(
-                            (child_ea, child_idx), 0
-                        )
-                        pending_visits.append((child_ea, child_idx, child_offset))
-                    self._new_for_visit.clear()
-
-                self._cfunc = saved_cfunc
-                self._arg_index = saved_arg_index
-                self._objects = saved_objects
-                self._skip = saved_skip
-                self._init_obj = saved_init_obj
-
+                if outcome is None:
+                    # Decompilation failed: the visit is dropped and counts
+                    # as no progress (matches the original loop semantics).
+                    continue
+                if outcome:
+                    pending_visits.extend(outcome)
                 progressed = True
 
             if pending_visits:

@@ -82,7 +82,7 @@ class UIActionManager:
         for menu_action in self._menu_actions:
             try:
                 ida_kernwin.detach_action_from_menu(menu_action.menu_path, menu_action.id)
-            except Exception as e:
+            except Exception as e:  # noqa: BLE001 — stale menu entries after reload
                 log_warning(f"Could not detach action {menu_action.id}: {e}")
 
         for action in self._actions:
@@ -125,7 +125,7 @@ class UIActionManager:
                 self._main_menu_name,
                 PLUGIN_NAME,
             )
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001 — menu host may be missing in batch mode
             log_warning(f"Could not create menu '{PLUGIN_NAME}': {e}")
             return False
 
@@ -146,7 +146,7 @@ class UIActionManager:
                 menu_action.id,
                 0,
             )
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001 — action may already be attached
             log_warning(f"Could not attach action {menu_action.id}: {e}")
             return
 

@@ -146,7 +146,8 @@ def _extract_offset_expression(expr, offset: int = 0, scale: int = 1, ctype_ops=
             if callable(get_ptrarr_objsize):
                 try:
                     next_scale = get_ptrarr_objsize() or scale
-                except Exception:
+                except Exception:  # noqa: BLE001 — broken tinfo wrapper
+                    log_debug(f"get_ptrarr_objsize failed; keeping scale {scale}")
                     next_scale = scale
 
             index_expr = getattr(current, "y", None)
@@ -168,7 +169,8 @@ def _extract_offset_expression(expr, offset: int = 0, scale: int = 1, ctype_ops=
             if callable(get_objsize):
                 try:
                     elem_scale = get_objsize() or 1
-                except Exception:
+                except Exception:  # noqa: BLE001 — broken tinfo wrapper
+                    log_debug("get_ptrarr_objsize failed; keeping elem_scale 1")
                     elem_scale = 1
             left = strip_wrappers(getattr(current, "x", None))
             right = strip_wrappers(getattr(current, "y", None))
@@ -217,7 +219,8 @@ def _make_offset_scan_object(base_obj, offset: int):
     result = StructureReferenceObject(struct_name, offset)
     try:
         result.name = get_member_name(base_tinfo, offset) or base_obj.name
-    except Exception:
+    except Exception:  # noqa: BLE001 — member lookup on corrupt tinfo
+        log_debug(f"get_member_name failed for offset {offset}; using base name")
         result.name = base_obj.name
     result.tinfo = base_tinfo
     result.ea = getattr(base_obj, "ea", idaapi.BADADDR)

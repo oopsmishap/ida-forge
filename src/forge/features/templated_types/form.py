@@ -89,8 +89,8 @@ class TemplatedTypesForm(ida_kernwin.PluginForm):
             btn_set_type.clicked.connect(lambda: self.create_stl_type(key))
 
             self.reload_stl_struct(key)
-        except Exception:
-            pass
+        except Exception as e:  # noqa: BLE001 — Qt widget tree may be torn down
+            log_warning(f"Failed to rebuild the templated-types form: {e}")
 
     def reload_stl_list(self):
         if self.ui is None:
@@ -113,8 +113,8 @@ class TemplatedTypesForm(ida_kernwin.PluginForm):
             args = self.get_stl_args(key)
             self.ui.stl_struct_view.setPlainText(struct.format(*args))
             self.ui.stl_title_struct.setText(base_name.format(*args))
-        except Exception:
-            pass
+        except Exception as e:  # noqa: BLE001 — user edits can produce unparsable args
+            log_warning(f"Failed to render STL struct preview for {key}: {e}")
 
     def get_stl_args(self, key):
         args = ()

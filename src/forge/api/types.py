@@ -87,7 +87,8 @@ class Types:
         self._typedefs = TypesConfig()
         self._idati = ida_typeinf.get_idati()
         self._type_width = self._get_ptr_width()
-        assert self._type_width in (4, 8), f"Invalid pointer width: {self._type_width}"
+        if self._type_width not in (2, 4, 8):
+            raise RuntimeError(f"Unsupported pointer width: {self._type_width}")
         self._type_cache: Dict[str, _TypeEntry] = {}
 
         self._load_types()
@@ -193,11 +194,17 @@ class Types:
         self._add_type_to_cache("i128", ida_typeinf.BTF_INT128)
         self._add_type_to_cache("f32", ida_typeinf.BTF_FLOAT)
         self._add_type_to_cache("f64", ida_typeinf.BTF_DOUBLE)
-        self._add_type_to_cache(
-            "size_t",
-            ida_typeinf.BTF_UINT32 if self._type_width == 4 else ida_typeinf.BTF_UINT64,
-        )
+        self._add_type_to_cache("size_t", self._size_t_enum(self._type_width))
         # TODO: add any more types that are needed
+
+    @staticmethod
+    def _size_t_enum(width: int) -> int:
+        """Pick the ``size_t`` type constant for the pointer width (16/32/64)."""
+        if width <= 2:
+            return ida_typeinf.BTF_UINT16
+        if width == 4:
+            return ida_typeinf.BTF_UINT32
+        return ida_typeinf.BTF_UINT64
 
     def _load_base_tinfo(self, entry: _TypeEntry) -> ida_typeinf.tinfo_t:
         """Return a fresh ``tinfo_t`` for a canonical type descriptor.
@@ -333,7 +340,8 @@ class Types:
 
         return work_type
 
-    def get_ptr(self):
+    def get_ptr_tinfo(self):
+        """Return a fresh ``void *``-like pointer tinfo for the pointer width."""
         return ida_typeinf.tinfo_t(self.get_ptr_type().ptr)
 
     def get_ptr_type(self):
@@ -341,6 +349,8 @@ class Types:
             return self._get_type("u64")
         elif self.width == 4:
             return self._get_type("u32")
+        elif self.width == 2:
+            return self._get_type("u16")
         else:
             raise Exception("Unsupported architecture")
 

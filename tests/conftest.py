@@ -134,6 +134,9 @@ _stub_module(
     udt_member_t=_DummyUDTMember,
     udt_type_data_t=_DummyUDTTypeData,
     BTF_STRUCT=0,
+    BTF_UINT16=0,
+    BTF_UINT32=0,
+    BTF_UINT64=0,
     get_idati=lambda: object(),
     parse_decl=lambda *args, **kwargs: False,
     import_type=lambda *args, **kwargs: 0,
@@ -302,6 +305,56 @@ _stub_module(
     else widget.exec_(*args, **kwargs),
     qt_item_flags=_qt_item_flags,
 )
+def _collect_ctree_items_near_ea(cfunc, ea: int, *, exhaustive: bool = False):
+    """Faithful behavioral double of hexrays.collect_ctree_items_near_ea.
+
+    The structure-builder tests exercise the child-scan inference engine with
+    fake cfuncs (SimpleNamespace treeitems/eamap/body), so the stub must run
+    the same chain — a lambda returning [] would silently drop candidates.
+    """
+    candidates = []
+    if cfunc is None or ea == -1:
+        return []
+
+    for item in getattr(cfunc, "treeitems", []) or []:
+        if getattr(item, "ea", -1) == ea:
+            candidates.append(item)
+
+    eamap = getattr(cfunc, "eamap", None)
+    if (exhaustive or not candidates) and eamap is not None:
+        try:
+            candidates.extend(list(eamap.get(ea, [])))
+        except Exception:
+            pass
+
+    body = getattr(cfunc, "body", None)
+    if (
+        (exhaustive or not candidates)
+        and body is not None
+        and hasattr(body, "find_closest_addr")
+    ):
+        try:
+            closest_item = body.find_closest_addr(ea)
+        except Exception:
+            closest_item = None
+        if closest_item is not None:
+            candidates.append(closest_item)
+
+    if exhaustive:
+        seen = set()
+        deduped = []
+        for item in candidates:
+            if item is None:
+                continue
+            marker = id(item)
+            if marker in seen:
+                continue
+            seen.add(marker)
+            deduped.append(item)
+        return deduped
+    return candidates
+
+
 _stub_module(
     "forge.api.hexrays",
     ctype=types.SimpleNamespace(
@@ -319,11 +372,12 @@ _stub_module(
         num=12,
     ),
     get_member_name=lambda *_args, **_kwargs: "member_name",
-    get_ptr=lambda *args, **kwargs: 0,
+    read_pointer=lambda *args, **kwargs: 0,
     is_code=lambda *args, **kwargs: False,
     is_imported=lambda *args, **kwargs: False,
     decompile=lambda *args, **kwargs: None,
     create_udt_padding_member=lambda *args, **kwargs: None,
+    collect_ctree_items_near_ea=_collect_ctree_items_near_ea,
     to_function_offset_str=lambda ea: f"sub_{ea:x}+0x0",
 )
 _stub_module("forge.api.types", types=types.SimpleNamespace(width=8), import_type=lambda *args, **kwargs: 0)

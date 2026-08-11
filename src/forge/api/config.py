@@ -39,7 +39,7 @@ class ConfigBase:
         except FileNotFoundError:
             log_debug(f"Config file not found {self._config_path}. Using default.")
             return {}
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001 — corrupt/missing files degrade to defaults
             log_error(
                 f"Failed to load {self._config_name} config file at {self._config_path}: {e}"
             )
@@ -52,7 +52,7 @@ class ConfigBase:
             with self._config_path.open("w", encoding="utf-8") as f:
                 toml.dump(self._config, f)
             log_debug(f"Saved {self._config_name} config file at {self._config_path}")
-        except Exception as e:
+        except Exception as e:  # persistence failures surface in the log, then re-raise
             log_error(
                 f"Failed to save {self._config_name} config file at {self._config_path}: {e}"
             )

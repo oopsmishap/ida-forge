@@ -16,7 +16,7 @@ import ida_xref
 import idaapi
 import idc
 
-from forge.api.hexrays import get_ptr, is_code, is_imported, decompile
+from forge.api.hexrays import read_pointer, is_code, is_imported, decompile
 from forge.api.scan_object import VariableObject
 from forge.api.scanner import NewDeepScanVisitor
 from forge.api.types import types
@@ -536,7 +536,7 @@ class VirtualTable(AbstractMember):
     def populate_virtual_functions(self):
         address = self.address
         while True:
-            ptr = get_ptr(address)
+            ptr = read_pointer(address)
             if is_code(ptr):
                 virtual_function = VirtualFunction(
                     ptr, address - self.address, self.vtable_name
@@ -703,7 +703,7 @@ class VirtualTable(AbstractMember):
         # Iterate until we find a non-function address
         while True:
             # Get the pointer to the next potential function
-            func_address = get_ptr(address)
+            func_address = read_pointer(address)
 
             # If the address is code or an imported function, then it is a function
             if is_code(func_address) or is_imported(func_address):
