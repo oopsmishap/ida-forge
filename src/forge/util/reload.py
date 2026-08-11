@@ -1,6 +1,6 @@
 # https://github.com/OALabs/hashdb-ida/blob/d2aae6fdb24b62096d02729795d3b18a573fa53e/src/hashdb/utilities/reload.py
-import sys
 import importlib
+import sys
 from types import ModuleType
 
 
@@ -22,7 +22,7 @@ def recursive_reload(module: ModuleType, exclude_prefixes: tuple[str, ...] = ())
     by a hot-reload.
     """
     module_name = module.__name__
-    module_names = sorted(name for name in sys.modules.keys() if name.startswith(module_name))
+    module_names = sorted(name for name in sys.modules if name.startswith(module_name))
 
     for name in module_names:
         if any(name == prefix or name.startswith(f"{prefix}.") for prefix in exclude_prefixes):

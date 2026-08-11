@@ -1,3 +1,5 @@
+from typing import ClassVar
+
 import ida_hexrays
 import ida_typeinf
 
@@ -8,7 +10,7 @@ from forge.util.logging import log_debug
 
 class ConvertToUsercallConfig(ForgeConfig):
     name = "ConvertToUsercall"
-    default_config = {
+    default_config: ClassVar[dict] = {
         "enabled": True,
     }
 
@@ -24,7 +26,10 @@ class ConvertToUsercall(HexRaysPopupAction):
         self.config = ConvertToUsercallConfig()
 
     def check(self, hx_view):
-        return hx_view.item.citype == ida_hexrays.VDI_FUNC
+        return (
+            self.config["enabled"]
+            and hx_view.item.citype == ida_hexrays.VDI_FUNC
+        )
 
     def activate(self, ctx):
         log_debug("Converting to __usercall")
@@ -38,6 +43,7 @@ class ConvertToUsercall(HexRaysPopupAction):
         convention = ida_typeinf.CM_CC_MASK & function_details.cc
         if convention == ida_typeinf.CM_CC_CDECL:
             function_details.cc = ida_typeinf.CM_CC_SPECIAL
+            convention_name = "__usercall"
         elif convention in (
             ida_typeinf.CM_CC_STDCALL,
             ida_typeinf.CM_CC_FASTCALL,
@@ -45,8 +51,10 @@ class ConvertToUsercall(HexRaysPopupAction):
             ida_typeinf.CM_CC_PASCAL,
         ):
             function_details.cc = ida_typeinf.CM_CC_SPECIALP
+            convention_name = "__usercall_"
         elif convention == ida_typeinf.CM_CC_ELLIPSIS:
             function_details.cc = ida_typeinf.CM_CC_SPECIALE
+            convention_name = "__usercalle_"
         else:
             log_debug("Unknown calling convention")
             return
@@ -55,4 +63,5 @@ class ConvertToUsercall(HexRaysPopupAction):
         ida_typeinf.apply_tinfo(
             vu.cfunc.entry_ea, function_tinfo, ida_typeinf.TINFO_DEFINITE
         )
+        log_debug(f"Converted to {convention_name}")
         vu.refresh_view(True)

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import pytest
+import toml
 
 from forge.features.templated_types.templated_types import TemplatedTypes
 
@@ -81,5 +82,5 @@ def test_reload_types_raises_for_invalid_toml(tmp_path):
     templated_types = TemplatedTypes()
     templated_types.file_path = str(toml_file)
 
-    with pytest.raises(Exception):
+    with pytest.raises(toml.TomlDecodeError):
         templated_types.reload_types()

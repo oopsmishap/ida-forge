@@ -15,17 +15,18 @@ import sys
 if "ida_idaapi" not in sys.modules:
     sys.modules["ida_idaapi"] = ModuleType("ida_idaapi")
 import ida_idaapi
+
 ida_idaapi.BADADDR = -1
 
 hexrays_api = import_module("forge.api.hexrays")
-setattr(hexrays_api, "ctype_to_str", lambda *_args, **_kwargs: "")
-setattr(hexrays_api, "decompile", lambda *_args, **_kwargs: None)
-setattr(hexrays_api, "find_expr_address", lambda *_args, **_kwargs: 0)
-setattr(hexrays_api, "get_func_argument_info", lambda *_args, **_kwargs: (0, None))
-setattr(hexrays_api, "get_funcs_calling_address", lambda *_args, **_kwargs: set())
-setattr(hexrays_api, "is_code", lambda *_args, **_kwargs: False)
-setattr(hexrays_api, "is_legal_type", lambda *_args, **_kwargs: True)
-setattr(hexrays_api, "to_hex", lambda value: hex(value))
+hexrays_api.ctype_to_str = lambda *_args, **_kwargs: ""
+hexrays_api.decompile = lambda *_args, **_kwargs: None
+hexrays_api.find_expr_address = lambda *_args, **_kwargs: 0
+hexrays_api.get_func_argument_info = lambda *_args, **_kwargs: (0, None)
+hexrays_api.get_funcs_calling_address = lambda *_args, **_kwargs: set()
+hexrays_api.is_code = lambda *_args, **_kwargs: False
+hexrays_api.is_legal_type = lambda *_args, **_kwargs: True
+hexrays_api.to_hex = lambda value: hex(value)
 import_module("forge.api.visitor")
 
 
@@ -58,6 +59,9 @@ class FakeType:
     def is_ptr(self):
         return self._ptr
 
+    def get_pointed_object(self):
+        return FakeType(self._name[: -2] if self._ptr else self._name)
+
     def is_udt(self):
         return self._udt
 
@@ -65,12 +69,23 @@ class FakeType:
 @pytest.mark.parametrize(
     "obj_tinfo, call_tinfo, expected_name",
     [
-        (FakeType("FixtureScene *", ptr=True), FakeType("__int64"), "FixtureScene *"),
-        (FakeType("FixtureScene", udt=True), FakeType("__int64"), "FixtureScene"),
+        # A complete scalar member type (e.g. __int64 from a cast/ptr node in a
+        # typed function) must survive: clobbering it with the root struct
+        # type made every typed-scan member come back as the struct itself.
+        (FakeType("FixtureScene *", ptr=True), FakeType("__int64"), "__int64"),
+        (FakeType("FixtureScene", udt=True), FakeType("__int64"), "__int64"),
+        # Unknown member types fall back to the object's structure-like type.
+        (FakeType("FixtureScene", udt=True), FakeType("?"), "FixtureScene"),
+        (FakeType("FixtureScene *", ptr=True), FakeType("?"), "FixtureScene *"),
+        # Structure-like member types always win over the object's.
         (FakeType("FixtureScene *", ptr=True), FakeType("Other *", ptr=True), "Other *"),
+        # No object type -> passthrough.
+        (None, FakeType("__int64"), "__int64"),
     ],
 )
-def test_prefer_object_tinfo_keeps_structure_like_members(obj_tinfo, call_tinfo, expected_name):
+def test_prefer_object_tinfo_only_falls_back_to_object_type_for_unknown_members(
+    obj_tinfo, call_tinfo, expected_name
+):
     scanner_module = _load_scanner_module()
     visitor = scanner_module.ScanVisitor.__new__(scanner_module.ScanVisitor)
     obj = SimpleNamespace(tinfo=obj_tinfo)
@@ -877,7 +892,8 @@ def test_to_function_offset_str_uses_stable_fallback_for_non_function():
     hexrays_module = util.module_from_spec(spec)
     spec.loader.exec_module(hexrays_module)
 
-    monkeypatch_get_func = lambda _ea: SimpleNamespace(start_ea=0x401000)
+    def monkeypatch_get_func(_ea):
+        return SimpleNamespace(start_ea=0x401000)
     hexrays_module.ida_funcs.get_func = monkeypatch_get_func
     hexrays_module.ida_name.get_name = lambda _ea: "sub_401000"
 
@@ -985,7 +1001,7 @@ class _ScanT:
 
 
 class _ScanNode:
-    def __init__(self, op, *, x=None, y=None, m=None, type=None, ea=-1, numval=None, obj_ea=-1):
+    def __init__(self, op, *, x=None, y=None, m=None, type=None, ea=-1, numval=None, obj_ea=-1, v=None):
         self.op = op
         self.x = x
         self.y = y
@@ -994,6 +1010,7 @@ class _ScanNode:
         self.ea = ea
         self._numval = numval
         self.obj_ea = obj_ea
+        self.v = v
         self.a = []
 
     def numval(self):
@@ -1076,7 +1093,7 @@ def _make_member_scan_harness(monkeypatch):
     scanner_module = _load_scanner_module()
     ctype = scanner_module.ctype
     if not hasattr(ctype, "asg"):
-        setattr(ctype, "asg", 13)
+        ctype.asg = 13
 
     class _FakeParentee:
         def __init__(self):
@@ -1137,7 +1154,7 @@ def _member_scan(monkeypatch, *, skip_until_object, seed_ea):
     from forge.api.scan_object import StructureReferenceObject
     from forge.api.structure import Structure
 
-    scanner_module, _ScanNode, ctype, test_ptr, nodes = _make_member_scan_harness(monkeypatch)
+    scanner_module, _ScanNode, _ctype, _test_ptr, nodes = _make_member_scan_harness(monkeypatch)
 
     structure = Structure("Child")
     obj = StructureReferenceObject("test", 0x18)
@@ -1152,6 +1169,131 @@ def _member_scan(monkeypatch, *, skip_until_object, seed_ea):
     )
     _drive_scan_visitor(visitor, nodes)
     return structure, visitor
+
+
+def _typed_var_scan(monkeypatch, node_builder):
+    """Var-rooted parent scan over typed ctrees (memptr member uses).
+
+    Reuses the member-scan harness' tinfo doubles; the root variable is
+    struct-typed (``test *``), mimicking a function whose lvars carry the
+    applied parent structure. ``node_builder(scanner_module, _ScanNode,
+    ctype, test_ptr)`` returns the pre-order node list."""
+    from forge.api.scan_object import VariableObject
+    from forge.api.structure import Structure
+
+    scanner_module, _ScanNode, ctype, test_ptr, _nodes = _make_member_scan_harness(monkeypatch)
+    nodes = node_builder(scanner_module, _ScanNode, ctype, test_ptr)
+
+    monkeypatch.setattr(
+        ida_hexrays, "lvar_locator_t", lambda *_a: SimpleNamespace(), raising=False
+    )
+
+    structure = Structure("Parent")
+    lvar = SimpleNamespace(type=lambda: test_ptr, name="v2", location="loc", defea=0x1400014F0)
+    obj = VariableObject(lvar, 0)
+    obj.func_ea = 0x1400014F0
+    obj.tinfo = test_ptr
+
+    cfunc = SimpleNamespace(entry_ea=0x1400014F0, argidx=(), body=SimpleNamespace())
+    visitor = scanner_module.NewDeepScanVisitor(
+        cfunc, 0x18, obj, structure, recurse_calls=True,
+        skip_until_object=False,
+    )
+    _drive_scan_visitor(visitor, nodes)
+    return structure, scanner_module, _ScanNode, ctype, test_ptr
+
+
+def test_typed_parent_scan_reads_member_at_memptr_offset(monkeypatch):
+    """``v2->u64_18`` — the typed ctree's memptr node is the var's first
+    parent. The member must land at the memptr delta (0x18), not 0: the
+    untyped-only extraction used to collapse typed parent scans to
+    ``field_0``."""
+    def nodes(m, N, c, tp):
+        var = N(c.var, type=tp, v=SimpleNamespace(idx=0))
+        return [
+            N(c.call, x=N(c.obj, obj_ea=0x1400019B0), type=_ScanT("void", size=0)),
+            N(c.memptr, x=var, m=0x18, type=_ScanT("__int64", size=8)),
+            var,
+        ]
+
+    structure, _s, _n, _c, _t = _typed_var_scan(monkeypatch, nodes)
+
+    offsets = sorted(m.offset for m in structure.members)
+    assert offsets == [0x18], f"expected the 0x18 member, got offsets {offsets}"
+
+
+def test_typed_parent_scan_cast_add_shape_preserves_offset_and_type(monkeypatch):
+    """``(const char *)(v2->u64_18 + 28)`` — the +28 arithmetic rides on the
+    member VALUE; the member still lands at 0x18 with the cast's type.
+    Regression: this shape used to produce a member at 0 whose type was the
+    root struct (test *) instead of the member type (char *)."""
+    def nodes(m, N, c, tp):
+        i64 = _ScanT("__int64", size=8)
+        char_ptr = _ScanT("char *", size=8)
+        var = N(c.var, type=tp, v=SimpleNamespace(idx=0))
+        memptr = N(c.memptr, x=var, m=0x18, type=i64)
+        add28 = N(c.add, x=memptr, y=N(c.num, numval=28), type=char_ptr)
+        cast_str = N(c.cast, x=add28, type=char_ptr)
+        return [
+            N(c.call, x=N(c.obj, obj_ea=0x1400019B0), type=_ScanT("void", size=0)),
+            N(c.ptr, x=cast_str, type=i64),
+            cast_str,
+            add28,
+            memptr,
+            var,
+        ]
+
+    structure, _s, _n, _c, _t = _typed_var_scan(monkeypatch, nodes)
+
+    offsets = sorted(m.offset for m in structure.members)
+    assert offsets == [0x18], f"expected the 0x18 member, got offsets {offsets}"
+    assert structure.members[0].tinfo.dstr() == "char *", structure.members[0].tinfo.dstr()
+    assert structure.members[0].tinfo.dstr() != "test *"
+
+
+def test_typed_parent_scan_assignment_uses_memptr_offset(monkeypatch):
+    """``v2->u64_18 = x`` — assignment through a memptr lands at 0x18."""
+    def nodes(m, N, c, tp):
+        i64 = _ScanT("__int64", size=8)
+        var = N(c.var, type=tp, v=SimpleNamespace(idx=0))
+        memptr = N(c.memptr, x=var, m=0x18, type=i64)
+        return [
+            N(c.asg, x=memptr, y=N(c.num, numval=1)),
+            memptr,
+            var,
+        ]
+
+    structure, _s, _n, _c, _t = _typed_var_scan(monkeypatch, nodes)
+
+    offsets = sorted(m.offset for m in structure.members)
+    assert offsets == [0x18], f"expected the 0x18 member, got offsets {offsets}"
+
+
+def test_untyped_parent_scan_add_shape_keeps_working(monkeypatch):
+    """Untyped regression guard: ``*(v2 + 0x18) + 28`` (add-carrying layout)
+    must still produce the 0x18 member — the memptr handling must not disturb
+    the raw arithmetic path."""
+    def nodes(m, N, c, tp):
+        i64 = _ScanT("__int64", size=8)
+        char_ptr = _ScanT("char *", size=8)
+        var = N(c.var, type=i64, v=SimpleNamespace(idx=0))
+        add18 = N(c.add, x=var, y=N(c.num, numval=0x18), type=i64)
+        ptr = N(c.ptr, x=add18, type=i64)
+        add28 = N(c.add, x=ptr, y=N(c.num, numval=28), type=char_ptr)
+        cast_str = N(c.cast, x=add28, type=i64)
+        return [
+            N(c.call, x=N(c.obj, obj_ea=0x1400019B0), type=_ScanT("void", size=0)),
+            cast_str,
+            add28,
+            ptr,
+            add18,
+            var,
+        ]
+
+    structure, _s, _n, _c, _t = _typed_var_scan(monkeypatch, nodes)
+
+    offsets = sorted(m.offset for m in structure.members)
+    assert offsets == [0x18], f"expected the 0x18 member, got offsets {offsets}"
 
 
 def test_member_rooted_scan_skip_gating_swallows_unmatchable_anchor(monkeypatch):

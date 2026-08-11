@@ -2,7 +2,6 @@ import threading
 from functools import wraps
 from typing import Generic, TypeVar
 
-
 T = TypeVar("T")
 
 

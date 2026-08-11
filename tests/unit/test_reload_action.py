@@ -4,9 +4,7 @@ import importlib
 import sys
 import types
 
-
 from forge.api import ui_actions
-
 
 MODULE_NAME = "forge.menu.reload"
 
@@ -34,7 +32,7 @@ def test_reload_action_registers_under_forge_menu(monkeypatch):
 
 
 def test_reload_action_calls_active_plugin_reload(monkeypatch):
-    module, registered_actions = _load_reload_module(monkeypatch)
+    _module, registered_actions = _load_reload_module(monkeypatch)
     action = registered_actions[0]
 
     reload_calls = []

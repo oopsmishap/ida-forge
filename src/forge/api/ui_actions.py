@@ -10,7 +10,6 @@ from forge.plugin import PLUGIN_NAME
 from forge.util.logging import log_debug, log_warning
 from forge.util.singleton import Singleton
 
-
 TAction = TypeVar("TAction")
 
 
@@ -169,7 +168,7 @@ def register_action(action: type[TAction]) -> type[TAction]:
 class HexraysPopupRequestHandler(ida_hexrays.Hexrays_Hooks):
     """Attach a registered action to the Hex-Rays popup menu."""
 
-    def __init__(self, action: "HexRaysPopupAction"):
+    def __init__(self, action: HexRaysPopupAction):
         super().__init__()
         self._action = action
 

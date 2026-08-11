@@ -3,18 +3,17 @@ from __future__ import annotations
 import bisect
 import itertools
 import re
+from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass, replace
-from typing import Iterator, Mapping, Sequence
 
 import ida_kernwin
 import ida_typeinf
-
-from forge.util.qt import QtWidgets
 
 import forge.api.types as forge_types
 from forge.api.hexrays import create_udt_padding_member
 from forge.api.members import AbstractMember, VirtualTable, materialize_linked_child_member_type
 from forge.util.logging import log_debug, log_error, log_warning
+from forge.util.qt import QtWidgets
 
 
 @dataclass(frozen=True)
@@ -133,7 +132,7 @@ class Structure:
         self.parent_relationships.append(relationship)
 
     def refresh_linked_member_types(
-        self, structures_by_name: Mapping[str, "Structure"]
+        self, structures_by_name: Mapping[str, Structure]
     ) -> bool:
         for relationship in self.child_relationships:
             child = structures_by_name.get(relationship.child_structure_name)
@@ -231,7 +230,7 @@ class Structure:
 
     def get_unresolved_child_names(
         self,
-        structures_by_name: Mapping[str, "Structure"],
+        structures_by_name: Mapping[str, Structure],
     ) -> list[str]:
         return sorted(
             {
@@ -259,8 +258,8 @@ class Structure:
 
     def iter_child_structures(
         self,
-        structures_by_name: Mapping[str, "Structure"],
-    ) -> Iterator["Structure"]:
+        structures_by_name: Mapping[str, Structure],
+    ) -> Iterator[Structure]:
         seen_child_names: set[str] = set()
         for relationship in self._iter_child_relationships():
             child = structures_by_name.get(relationship.child_structure_name)
@@ -271,13 +270,13 @@ class Structure:
 
     def can_create_type(
         self,
-        structures_by_name: Mapping[str, "Structure"],
+        structures_by_name: Mapping[str, Structure],
     ) -> bool:
         return not self.get_unresolved_child_names(structures_by_name)
 
     def create_type_if_ready(
         self,
-        structures_by_name: Mapping[str, "Structure"],
+        structures_by_name: Mapping[str, Structure],
         *,
         start: int | None = None,
         end: int | None = None,
@@ -296,19 +295,19 @@ class Structure:
 
     def create_subtree_types_postorder(
         self,
-        structures_by_name: Mapping[str, "Structure"],
+        structures_by_name: Mapping[str, Structure],
         *,
         visited: set[str] | None = None,
     ) -> bool:
         completed = visited if visited is not None else set()
         stack: list[str] = []
 
-        def _walk(structure: "Structure") -> bool:
+        def _walk(structure: Structure) -> bool:
             if structure.name in completed:
                 return True
             if structure.name in stack:
                 cycle_start = stack.index(structure.name)
-                cycle_path = " -> ".join(stack[cycle_start:] + [structure.name])
+                cycle_path = " -> ".join([*stack[cycle_start:], structure.name])
                 log_warning(
                     f"Cycle detected while creating type subtree: {cycle_path}",
                     True,

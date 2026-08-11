@@ -2,11 +2,11 @@ from __future__ import annotations
 
 import sys
 import traceback
-from typing import TYPE_CHECKING
+from contextlib import suppress
 
 import ida_hexrays
-import ida_idp
 import ida_idaapi
+import ida_idp
 import ida_kernwin
 
 from forge.core import ForgeCore
@@ -28,7 +28,7 @@ from forge.util.versions import (
 class _ReadyHook(ida_kernwin.UI_Hooks):
     """UI hook that attaches the plugin menu when the UI is ready."""
 
-    def __init__(self, plugin: "ForgePlugin") -> None:
+    def __init__(self, plugin: ForgePlugin) -> None:
         super().__init__()
         self._plugin = plugin
 
@@ -66,7 +66,7 @@ class ForgePlugin(ida_idaapi.plugin_t):
         self._core: ForgeCore | None = None
         self._ready_hook: _ReadyHook | None = None
         self._state_log: list[str] = []
-        self._plugmod: "forge_plugmod_t | None" = None
+        self._plugmod: forge_plugmod_t | None = None
 
     def init(self) -> ida_idaapi.plugmod_t:
         try:
@@ -199,7 +199,7 @@ class forge_plugmod_t(ida_idaapi.plugmod_t):
     :class:`ForgePlugin`.
     """
 
-    def __init__(self, plugin: "ForgePlugin") -> None:
+    def __init__(self, plugin: ForgePlugin) -> None:
         super().__init__()
         self._plugin = plugin
 
@@ -207,10 +207,9 @@ class forge_plugmod_t(ida_idaapi.plugmod_t):
         # Best-effort cleanup. IDA may unload the plugmod at any time
         # (database close, plugin unload, IDA exit). Swallow any error
         # so we never raise from a destructor.
-        try:
+        # must never raise from __del__
+        with suppress(Exception):
             self._plugin._teardown()
-        except Exception:  # noqa: BLE001, S110 — must never raise from __del__
-            pass
 
     def run(self, arg: int) -> None:
         # Called by IDA when the user activates the plugin from

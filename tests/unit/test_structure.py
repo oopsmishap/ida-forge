@@ -7,7 +7,6 @@ from forge.api import structure as structure_module
 from forge.api.structure import Structure
 
 
-
 class FakeMember:
     def __init__(
         self,
@@ -37,6 +36,7 @@ class FakeMember:
     def __lt__(self, other):
         return (self.offset, self.type_name) < (other.offset, other.type_name)
 
+    __hash__ = None  # mutable fake; __eq__ compares and merges
     def __eq__(self, other):
         return (self.offset, self.type_name) == (other.offset, other.type_name)
 
@@ -544,7 +544,7 @@ def test_set_cdecl_overwrite_deletes_and_recreates_when_declaration_valid(monkey
     structure = structure_module.Structure("test")
     structure.created_type_name = "test"
 
-    result = structure.set_cdecl("struct test { int x; };")
+    structure.set_cdecl("struct test { int x; };")
 
     assert len(recorded["deleted"]) == 1
     assert len(recorded["created"]) == 2  # failed probe + recreate after delete

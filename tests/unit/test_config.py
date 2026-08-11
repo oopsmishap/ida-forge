@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import ClassVar
 
 import pytest
 import toml
@@ -10,7 +11,7 @@ from forge.api.config import ForgeConfig
 
 class ExampleConfig(ForgeConfig):
     name = "Example"
-    default_config = {
+    default_config: ClassVar[dict] = {
         "enabled": True,
         "path": "default.bin",
     }
@@ -140,7 +141,7 @@ def test_config_backfills_new_default_keys_from_legacy_file(tmp_path, monkeypatc
 
     class _LegacyConfig(ForgeConfig):
         name = "LegacyExample"
-        default_config = {
+        default_config: ClassVar[dict] = {
             "existing": 1,
             "nested": {"old": True},
         }

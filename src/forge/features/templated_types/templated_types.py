@@ -4,15 +4,14 @@
 import os
 import pathlib
 
-import toml
-
 import ida_hexrays
 import ida_idaapi
 import ida_typeinf
+import toml
 
-from forge.util.logging import log_debug, log_error, log_info
+from forge.util.logging import log_debug, log_error
+
 from .config import config
-
 
 # from forge.util.cxx_to_c_name import demangled_name_to_c_str, maybe implement this in later
 
@@ -81,23 +80,20 @@ class TemplatedTypes:
     def get_types(self, key):
         if key in self._types_dict:
             return self._types_dict[key]["types"]
-        else:
-            log_error("type is not in type dictionary")
-            return None
+        log_error("type is not in type dictionary")
+        return None
 
     def get_struct(self, key):
         if key in self._types_dict:
             return self._types_dict[key]["struct"]
-        else:
-            log_error("struct is not in type dictionary")
-            return None
+        log_error("struct is not in type dictionary")
+        return None
 
     def get_base_name(self, key):
         if key in self._types_dict:
             return self._types_dict[key]["base_name"]
-        else:
-            log_error("struct is not in type dictionary")
-            return None
+        log_error("struct is not in type dictionary")
+        return None
 
     def set_file_path(self, path):
         self.file_path = path
@@ -107,7 +103,7 @@ class TemplatedTypes:
     def reload_types(self):
         if self.file_path == "":
             return False
-        with open(self.file_path, "r") as f:
+        with open(self.file_path) as f:
             types_dict = toml.loads(f.read())
         self._types_dict = types_dict
         self.keys = list(types_dict.keys())

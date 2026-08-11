@@ -18,17 +18,12 @@ from forge.api.scan_object import (
     StructureReferenceObject,
     _extract_offset_expression,
     _make_offset_scan_object,
- )
+)
 from forge.api.scanner import NewDeepScanVisitor
 from forge.api.structure import Structure
 from forge.util.logging import log_debug, log_info, log_warning
 
-
-
-
-
 from .dialogs import ScannedVariableChooser
-
 
 
 def _form_module():
@@ -191,7 +186,7 @@ class ChildScanMixin:
     ) -> ScanObject | None:
         evidence_ea = getattr(evidence, "ea", idaapi.BADADDR)
         evidence_func_ea = getattr(evidence, "func_ea", idaapi.BADADDR)
-        if evidence_ea == idaapi.BADADDR or evidence_func_ea == idaapi.BADADDR:
+        if idaapi.BADADDR in (evidence_ea, evidence_func_ea):
             return None
 
         seeded = copy.copy(scan_object)
@@ -446,7 +441,7 @@ class ChildScanMixin:
                 return None
             scan_object = _make_offset_scan_object(base_object, offset)
 
-        setattr(scan_object, "func_ea", getattr(cfunc, "entry_ea", idaapi.BADADDR))
+        scan_object.func_ea = getattr(cfunc, "entry_ea", idaapi.BADADDR)
         return scan_object
 
     @staticmethod
@@ -461,7 +456,7 @@ class ChildScanMixin:
 
         obj_ea = getattr(scan_object, "ea", idaapi.BADADDR)
         expr_ea = getattr(expr, "ea", idaapi.BADADDR)
-        return obj_ea != idaapi.BADADDR and expr_ea != idaapi.BADADDR and obj_ea == expr_ea
+        return idaapi.BADADDR not in (obj_ea, expr_ea) and obj_ea == expr_ea
 
     @staticmethod
     def _resolve_parent_argument_index(
@@ -598,7 +593,7 @@ class ChildScanMixin:
                     seed.scan_object,
                     parent_expr=parent_expr,
                     evidence_ea=self._expression_ea(caller_cfunc, parent_expr),
-                    caller_path=seed.caller_path + (seed.function_ea,),
+                    caller_path=(*seed.caller_path, seed.function_ea),
                 )
                 if caller_seed is not None:
                     log_debug(

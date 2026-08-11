@@ -65,12 +65,24 @@ scout reports, 246-test run, official IDAPython docs cross-check).
   drives the real visitor over the exact member-use ctree shape): gating
   reproduces the silent failure, skip-disabled creates members from a stale
   anchor, anchored runs still work.
-- **Related finding (open)**: parent scans of typed functions degrade — when a
+- **Related finding (open→RESOLVED 2026-08-11)**: parent scans of typed functions degrade — when a
   struct is applied, member uses are `memptr` nodes and
   `_extract_member_from_ptr` does not handle a `memptr` first parent, so
-  var-rooted deep scans collapse member offsets to 0 (`field_0` only). Fixing
-  the parent-scan memptr context is a follow-up (offset = `first_parent.m` +
-  surrounding add/idx analysis).
+  var-rooted deep scans collapse member offsets to 0 (`field_0` only). Fix:
+  `_extract_member_from_ptr`/`_extract_member_from_expr` now consume a
+  `memptr` first parent (offset = the memptr delta) and `_extract_member`
+  peels `add`/`idx` wrappers ahead of a cast in typed functions;
+  `_prefer_object_tinfo` only falls back to the scanned object's type when
+  the member's ctree type is incomplete (complete scalar member types like
+  `__int64`/`char *` are no longer clobbered by the root struct type).
+  Regression tests: `test_typed_parent_scan_reads_member_at_memptr_offset`,
+  `test_typed_parent_scan_cast_add_shape_preserves_offset_and_type`,
+  `test_typed_parent_scan_assignment_uses_memptr_offset`,
+  `test_untyped_parent_scan_add_shape_keeps_working`,
+  `test_prefer_object_tinfo_only_falls_back_to_object_type_for_unknown_members`
+  (+ FakeType `get_pointed_object`). Live-verified on pure_c_struct_fixture:
+  typed var-rooted scan of `a1` (test *) now recovers all five fixture
+  offsets (0x0/0x8/0x10/0x18/0x20) instead of a single `field_0`.
 
 ### Scan-log observations (2026-08-11, real deep scan) — candidates for later tiers
 
@@ -326,8 +338,11 @@ scout reports, 246-test run, official IDAPython docs cross-check).
 
 ## Tier 3 — Test infrastructure
 
-### T3.1 Add CI
+### T3.1 Add CI — RESOLVED 2026-08-11
 
+- **Status**: `.github/workflows/ci.yml` — ubuntu + windows × Python 3.9/3.12
+  matrix; installs `.[dev]` + ruff, runs `ruff check src tests` and
+  `python -m pytest`. Failing lint or tests fails the build.
 - **Issue**: no `.github/`, no lint config, no CI at all. The June 14 fixes
   (`is_imported`, `qt_item_flags`) were all found in real IDA — a CI gate would
   have caught several earlier.
@@ -338,8 +353,22 @@ scout reports, 246-test run, official IDAPython docs cross-check).
 - **Acceptance**: workflow file exists and passes on a fresh clone; failing a
   test fails the build.
 
-### T3.2 Add ruff config and fix the baseline
+### T3.2 Add ruff config and fix the baseline — RESOLVED 2026-08-11
 
+- **Status**: `[tool.ruff]` + `[tool.ruff.lint]` in pyproject.toml
+  (target-version py39, line-length 120, select E/F/I/UP/B/SIM/BLE/PL/RUF/FA/
+  PIE/TRY/RET/C4/S; class-level ignores carry reasons — E501, S101, PLR2004,
+  PLR091x complexity, PLC0415 lazy IDA imports, F403/F405 star imports
+  (tracked by I.4)). `ruff check src tests` now exits 0 (was 410 findings).
+  Notable migrations: `from __future__ import annotations` added where PEP 604
+  unions are used (py39-safe), `Optional[X]` → `X | None`, mutable class
+  defaults annotated `ClassVar` (incl. chooser `cols`), `parse_decl`/lazy-import
+  swallow sites converted to `contextlib.suppress`, en-dash doc typos fixed
+  (`x–` → `x--`), `raise Exception("Unsupported architecture")` → dedicated
+  `UnsupportedArchitectureError`, `__hash__ = None` on eq-mutating member
+  classes. Two tests were re-pointed at the real owners after F401 pruning
+  removed dead re-exports from form.py (`ChildScanPlan`,
+  `NewDeepScanVisitor`, `is_legal_type` now patched on `child_scan_module`).
 - **Issue**: 410 findings; no `ruff.toml`/`pyproject` `[tool.ruff]` section, so
   defaults apply and nobody runs it.
 - **Plan**: `[tool.ruff]` in `pyproject.toml` (target-version py39, select a
@@ -362,8 +391,20 @@ scout reports, 246-test run, official IDAPython docs cross-check).
   shape to something the stub also accepts but real IDA does not — encode the
   documented signature, not the stub's.
 
-### T3.4 Cover the untested modules
+### T3.4 Cover the untested modules — RESOLVED 2026-08-11 (priority list)
 
+- **Status**: `child_scan.py` covered (T2.3 + R7 follow-up: 6 direct tests).
+  New direct test files: `test_itanium_mangler.py` (golden corpus of
+  namespace/pointer/const/ctor/dtor/const-member-fn manglings + substitution
+  reuse + NotImplementedError boundaries for templates/function-pointers/
+  r-value refs), `test_cxx_to_c_name.py` (42-entry operator table +
+  identifier sanitation), `test_logging.py` (msg/warning routing, message-box
+  gating, reload handler dedupe), `test_singleton.py`, `test_swap_if_helper.py`
+  (condition negation + branch swap), `test_create_new_field.py`
+  (parse_declaration incl. array size), `test_convert_to_usercall.py`
+  (convention mapping incl. I.2 cleanup: `check()` honors the `enabled`
+  config key and the conversion logs the target convention). Conftest gained
+  `ctree_parentee_t` (same stub the scanner tests already needed).
 - **Issue**: no direct tests for `child_scan.py` (the 1084-line inference
   engine), `util/itanium_mangler.py`, `util/cxx_to_c_name.py`,
   `util/logging.py`, `util/qt.py`, `util/singleton.py`,
@@ -385,8 +426,29 @@ scout reports, 246-test run, official IDAPython docs cross-check).
 - **Acceptance**: every `src/forge` module has at least one direct test file;
   assertions are behavioral.
 
-### T3.5 Close the 19 form/actions/child-scan gaps (from survey)
+### T3.5 Close the 19 form/actions/child-scan gaps (from survey) — RESOLVED 2026-08-11
 
+- **Status**: every gap now has a greppable regression test.
+  G1 `test_duplicate_structure_copies_child_links_then_normalizes`; G2
+  `test_remove_structure_cleans_other_structures_relationships`; G3
+  `test_nudge_main_offset_follows_selected_member`; G4
+  `test_structure_table_clear_decline_keeps_members`; G6
+  `test_convert_to_vtable_decline_preserves_member`; G7
+  `test_structure_table_item_changed_name_vs_comment_column`; G9
+  `test_member_child_link_normalization_clears_stale_links`; G10
+  `test_make_unique_structure_name_copy_collision_loop`; G11
+  `test_propagate_child_scan_seed_unresolvable_parent_arg_is_noop`; G12
+  (pre-existing) `test_parse_left_assignee_scales_nested_index_offsets`; G13
+  `test_create_scan_object_from_expr_fallback_paths`; G14
+  `test_build_child_scan_inference_seed_explicit_parent_expr_skips_anchor`; G15
+  `test_build_child_scan_plan_warns_when_parent_type_missing_from_idb`
+  (`show_warnings=True`) + the R7 plan tests; G16
+  `test_scan_global_references_empty_xref_set_warns`; G17
+  `test_prompt_scan_depth_parses_input` (decline/empty/garbage→config-default/
+  valid); G18 `test_provenance_kind_for_object_mapping`; G19
+  `test_ensure_structure_selected_no_selection_prompts_and_warns`. G8 (tree
+  context menu) and G5 (clipboard fallback) remain UI-shell behaviors whose
+  dialogs need a live Qt harness — noted under Tier 4.
 - G1 duplicate-child duplicating; G2 orphan cleanup on remove; G3 main_offset
   follows nudge; G4 `structure_table_clear` decline path; G5 clipboard fallback
   branch; G6 `convert_to_vtable` user-declines-but-proceeds; G7 name vs comment
@@ -467,8 +529,13 @@ scout reports, 246-test run, official IDAPython docs cross-check).
 - **Acceptance**: `git status` clean (or intentional); a config test asserts the
   level follows the option.
 
-### I.2 Remove dead `ConvertToUsercallConfig` wiring
+### I.2 Remove dead `ConvertToUsercallConfig` wiring — RESOLVED 2026-08-11
 
+- **Status**: `check()` now honors `config["enabled"]` (popup item hidden when
+  disabled); `activate()` logs the converted convention (`__usercall` /
+  `__usercall_` / `__usercalle_`) after `apply_tinfo`. Covered by
+  `test_convert_to_usercall.py` (enabled-gating, convention mapping ×6,
+  unknown-cc and missing-func-type early returns).
 - **Issue**: `self.config = ConvertToUsercallConfig()` instantiated, never read;
   no `enabled` guard honored.
 - **Evidence**: `src/forge/features/convert_to_usercall/convert_to_usercall.py:9-24`.

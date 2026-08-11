@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 
 ################################################################################
 ## Form generated from reading UI file 'form.ui'
@@ -53,55 +52,55 @@ QTextEdit = QtWidgets.QTextEdit
 QVBoxLayout = QtWidgets.QVBoxLayout
 QWidget = QtWidgets.QWidget
 
-class Ui_templated_types_form(object):
+class Ui_templated_types_form:
     def setupUi(self, templated_types_form):
         if not templated_types_form.objectName():
-            templated_types_form.setObjectName(u"templated_types_form")
+            templated_types_form.setObjectName("templated_types_form")
         templated_types_form.resize(1100, 600)
         self.gridLayout = QGridLayout(templated_types_form)
-        self.gridLayout.setObjectName(u"gridLayout")
+        self.gridLayout.setObjectName("gridLayout")
         self.type_list_label = QLabel(templated_types_form)
-        self.type_list_label.setObjectName(u"type_list_label")
+        self.type_list_label.setObjectName("type_list_label")
 
         self.gridLayout.addWidget(self.type_list_label, 0, 0, 1, 1)
 
         self.stl_title_fields = QLabel(templated_types_form)
-        self.stl_title_fields.setObjectName(u"stl_title_fields")
+        self.stl_title_fields.setObjectName("stl_title_fields")
 
         self.gridLayout.addWidget(self.stl_title_fields, 0, 1, 1, 1)
 
         self.stl_title_struct = QLabel(templated_types_form)
-        self.stl_title_struct.setObjectName(u"stl_title_struct")
+        self.stl_title_struct.setObjectName("stl_title_struct")
 
         self.gridLayout.addWidget(self.stl_title_struct, 0, 2, 1, 1)
 
         self.stl_list = QListWidget(templated_types_form)
-        self.stl_list.setObjectName(u"stl_list")
+        self.stl_list.setObjectName("stl_list")
         self.stl_list.setMinimumSize(QSize(300, 0))
         self.stl_list.setMaximumSize(QSize(300, 16777215))
 
         self.gridLayout.addWidget(self.stl_list, 1, 0, 1, 1)
 
         self.stl_widget = QWidget(templated_types_form)
-        self.stl_widget.setObjectName(u"stl_widget")
+        self.stl_widget.setObjectName("stl_widget")
 
         self.gridLayout.addWidget(self.stl_widget, 1, 1, 1, 1)
 
         self.stl_struct_view = QTextEdit(templated_types_form)
-        self.stl_struct_view.setObjectName(u"stl_struct_view")
+        self.stl_struct_view.setObjectName("stl_struct_view")
         self.stl_struct_view.setReadOnly(True)
 
         self.gridLayout.addWidget(self.stl_struct_view, 1, 2, 1, 1)
 
         self.btn_reload_stl_list = QPushButton(templated_types_form)
-        self.btn_reload_stl_list.setObjectName(u"btn_reload_stl_list")
+        self.btn_reload_stl_list.setObjectName("btn_reload_stl_list")
         self.btn_reload_stl_list.setMinimumSize(QSize(300, 0))
         self.btn_reload_stl_list.setMaximumSize(QSize(300, 16777215))
 
         self.gridLayout.addWidget(self.btn_reload_stl_list, 2, 0, 1, 1)
 
         self.btn_open_stl_toml = QPushButton(templated_types_form)
-        self.btn_open_stl_toml.setObjectName(u"btn_open_stl_toml")
+        self.btn_open_stl_toml.setObjectName("btn_open_stl_toml")
         self.btn_open_stl_toml.setMinimumSize(QSize(300, 0))
         self.btn_open_stl_toml.setMaximumSize(QSize(300, 16777215))
 
@@ -114,11 +113,11 @@ class Ui_templated_types_form(object):
     # setupUi
 
     def retranslateUi(self, templated_types_form):
-        templated_types_form.setWindowTitle(QCoreApplication.translate("templated_types_form", u"Templated Types", None))
-        self.type_list_label.setText(QCoreApplication.translate("templated_types_form", u"Type List:", None))
-        self.stl_title_fields.setText(QCoreApplication.translate("templated_types_form", u"Selected Type:", None))
-        self.stl_title_struct.setText(QCoreApplication.translate("templated_types_form", u"Creating Type:", None))
-        self.btn_reload_stl_list.setText(QCoreApplication.translate("templated_types_form", u"Reload Templated Types TOML", None))
-        self.btn_open_stl_toml.setText(QCoreApplication.translate("templated_types_form", u"Open Templated Types TOML", None))
+        templated_types_form.setWindowTitle(QCoreApplication.translate("templated_types_form", "Templated Types", None))
+        self.type_list_label.setText(QCoreApplication.translate("templated_types_form", "Type List:", None))
+        self.stl_title_fields.setText(QCoreApplication.translate("templated_types_form", "Selected Type:", None))
+        self.stl_title_struct.setText(QCoreApplication.translate("templated_types_form", "Creating Type:", None))
+        self.btn_reload_stl_list.setText(QCoreApplication.translate("templated_types_form", "Reload Templated Types TOML", None))
+        self.btn_open_stl_toml.setText(QCoreApplication.translate("templated_types_form", "Open Templated Types TOML", None))
     # retranslateUi
 

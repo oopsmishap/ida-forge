@@ -1,9 +1,9 @@
 from pathlib import Path
 
-from forge.util.qt import QtGui, QtWidgets, qt_exec
-
 from forge.api.ui_actions import UIMenuAction, register_action
 from forge.plugin import AUTHOR, PLUGIN_NAME, VERSION_STRING
+from forge.util.qt import QtGui, QtWidgets, qt_exec
+
 from .ui_about import Ui_about_window
 
 

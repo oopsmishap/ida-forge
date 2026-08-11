@@ -15,9 +15,9 @@ class FakeTinfo:
         name: str,
         *,
         size: int = 4,
-        pointed: "FakeTinfo | None" = None,
+        pointed: FakeTinfo | None = None,
         array: bool = False,
-        array_element: "FakeTinfo | None" = None,
+        array_element: FakeTinfo | None = None,
         forward_decl: bool = False,
         func: bool = False,
         udt: bool = False,
@@ -120,7 +120,7 @@ def _load_types_source_module():
     module = py_types.ModuleType("forge.api.types_exec_test")
     module.__file__ = str(types_path)
     sys.modules[module.__name__] = module
-    exec(compile(trimmed_source, str(types_path), "exec"), module.__dict__)
+    exec(compile(trimmed_source, str(types_path), "exec"), module.__dict__)  # noqa: S102 — fake-tinfo harness compiles the module under test
     module.ida_typeinf.NTF_TYPE = 0
     return module
 

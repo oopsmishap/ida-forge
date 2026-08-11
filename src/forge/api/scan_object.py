@@ -1,14 +1,16 @@
-from enum import Enum
+from __future__ import annotations
+
 import re
-import traceback
+from enum import Enum
 
-import ida_hexrays
-import idaapi
 import ida_funcs
+import ida_hexrays
 import ida_name
+import idaapi
 
-from forge.api.hexrays import get_member_name, ctype
+from forge.api.hexrays import ctype, get_member_name
 from forge.util.logging import log_debug
+
 TYPE_IGNORED_TOKENS = {"const", "volatile", "struct", "class", "union", "&"}
 
 _ALLOCATOR_NAME_PREFIXES = ("j_", "imp_", "thunk_")
@@ -271,7 +273,7 @@ class ScanObject:
         if function_name is not None:
             self.scan_root_function_name = function_name
 
-    def inherit_scan_root_from(self, other: "ScanObject") -> None:
+    def inherit_scan_root_from(self, other: ScanObject) -> None:
         if getattr(other, "scan_root_function_ea", idaapi.BADADDR) != idaapi.BADADDR:
             self.scan_root_function_ea = other.scan_root_function_ea
         if getattr(other, "scan_root_ea", idaapi.BADADDR) != idaapi.BADADDR:
@@ -298,10 +300,9 @@ class ScanObject:
                     result.ea = ScanObject.get_expression_address(cfunc, arg.e)
                 return result
             # If it's not a local variable, check if it's an expression.
-            elif arg.citype != ida_hexrays.VDI_EXPR:
+            if arg.citype != ida_hexrays.VDI_EXPR:
                 return None
-            else:
-                cexpr = arg.e
+            cexpr = arg.e
         else:
             cexpr = arg
 
@@ -322,7 +323,7 @@ class ScanObject:
             result = GlobalVariableObject(cexpr.obj_ea)
             result.name = ida_name.get_short_name(cexpr.obj_ea)
         else:
-            return
+            return None
 
         result.tinfo = cexpr.type
         result.ea = ScanObject.get_expression_address(cfunc, cexpr)

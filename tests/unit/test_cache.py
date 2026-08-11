@@ -3,7 +3,6 @@ from __future__ import annotations
 from forge.api import cache
 
 
-
 def test_collect_imported_ea_clears_existing_and_subtracts_image_base(monkeypatch):
     cache.imported_ea.update({999})
     imports = {

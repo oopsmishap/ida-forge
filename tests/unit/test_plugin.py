@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from types import SimpleNamespace
-
 import forge.plugin
 from forge.plugin import (
     _GET_STATE_NAME,

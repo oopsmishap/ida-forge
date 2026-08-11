@@ -1,17 +1,19 @@
+from typing import ClassVar
+
 import ida_hexrays
 import ida_idaapi
 import ida_kernwin
 
-from forge.api.hexrays import find_expr_address, to_function_offset_str, ctype
-from forge.api.scan_object import ScanObject, ObjectType, MemoryAllocationObject
-from forge.api.visitor import RecursiveUpwardsObjectVisitor
+from forge.api.hexrays import ctype, find_expr_address, to_function_offset_str
+from forge.api.scan_object import MemoryAllocationObject, ObjectType, ScanObject
 from forge.api.ui import Choose
 from forge.api.ui_actions import HexRaysPopupAction, register_action
+from forge.api.visitor import RecursiveUpwardsObjectVisitor
 
 
 class StructureAllocationChoose(Choose):
     title = "Possible structure allocations"
-    cols = [["Function", 30], ["Variable", 10], ["Line", 50], ["Type", 10]]
+    cols: ClassVar[list] = [["Function", 30], ["Variable", 10], ["Line", 50], ["Type", 10]]
 
     def __init__(self, items):
         super().__init__(items)

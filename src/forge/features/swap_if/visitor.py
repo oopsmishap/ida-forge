@@ -1,9 +1,9 @@
 import ida_hexrays
 
-from .helper import inverse_if, inverse_if_condition
-
 from forge.api.hexrays import ctype
 from forge.util.logging import log_debug
+
+from .helper import inverse_if, inverse_if_condition
 
 
 class SwapThenElseVisitor(ida_hexrays.ctree_parentee_t):

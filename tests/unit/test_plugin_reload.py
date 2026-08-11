@@ -2,12 +2,8 @@ from __future__ import annotations
 
 import importlib
 import importlib.util
-import sys
-import types
 from pathlib import Path
-
-import ida_idaapi
-
+from typing import ClassVar
 
 _PLUG_ENTRY = Path(__file__).resolve().parents[2] / "src" / "ida_forge_plugin.py"
 _SPEC = importlib.util.spec_from_file_location("forge_plugin_entry", _PLUG_ENTRY)
@@ -28,7 +24,7 @@ class _OldCore:
 
 
 class _NewCore:
-    instances = []
+    instances: ClassVar[list] = []
 
     def __init__(self):
         self.loaded = False

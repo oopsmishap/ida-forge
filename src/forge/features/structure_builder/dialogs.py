@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import ClassVar
 
 import ida_hexrays
 import ida_kernwin
@@ -23,7 +24,7 @@ class MemberEditorValues:
 
 class ScannedVariableChooser(Choose):
     title = "Scanned Variables"
-    cols = [
+    cols: ClassVar[list] = [
         ["Origin", 10],
         ["Function", 24],
         ["Name", 24],

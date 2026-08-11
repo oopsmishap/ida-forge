@@ -2,16 +2,15 @@ from __future__ import annotations
 
 import subprocess
 
-import pytest
-
 import build_ui
+import pytest
 
 
 def test_find_uic_prefers_installed_binary(monkeypatch):
     monkeypatch.setattr(
         build_ui.shutil,
         "which",
-        lambda cmd: f"/tmp/{cmd}" if cmd == "pyside2-uic" else None,
+        lambda cmd: f"/tmp/{cmd}" if cmd == "pyside2-uic" else None,  # noqa: S108 — fake path returned by the stubbed which()
     )
 
     assert build_ui.find_uic() == ["pyside2-uic"]

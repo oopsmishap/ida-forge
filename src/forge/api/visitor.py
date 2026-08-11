@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import ida_funcs
 import ida_hexrays
 import ida_idaapi
@@ -5,10 +7,10 @@ import ida_idaapi
 from forge.api import hexrays as hexrays_api
 from forge.api.hexrays import *
 from forge.api.scan_object import (
-    ScanObject,
-    ObjectType,
-    VariableObject,
     CallArgumentObject,
+    ObjectType,
+    ScanObject,
+    VariableObject,
     _extract_offset_expression,
     _make_offset_scan_object,
 )
@@ -175,18 +177,12 @@ class DownwardsObjectVisitor(ObjectVisitor):
         if len(self._objects) < 2:
             return False
 
-        if cexpr.op == ctype.cast:
-            e = cexpr.x
-        else:
-            e = cexpr
+        e = cexpr.x if cexpr.op == ctype.cast else cexpr
 
         if e.op != ctype.call or len(e.a) == 0:
             return True
 
-        for obj in self._objects:
-            if self._matches_object(obj, e.a[0]):
-                return False
-        return True
+        return all(not self._matches_object(obj, e.a[0]) for obj in self._objects)
 
 
 
@@ -220,10 +216,7 @@ class UpwardsObjectVisitor(ObjectVisitor):
             return 0
 
         x_cexpr = cexpr.x
-        if cexpr.y.op == ctype.cast:
-            y_cexpr = cexpr.y.x
-        else:
-            y_cexpr = cexpr.y
+        y_cexpr = cexpr.y.x if cexpr.y.op == ctype.cast else cexpr.y
 
         obj_left = ScanObject.create(self._cfunc, x_cexpr)
         obj_right = ScanObject.create(self._cfunc, y_cexpr)
@@ -390,19 +383,15 @@ class RecursiveObjectVisitor(ObjectVisitor):
 
     def _start(self):
         """Called at the beginning of visiting"""
-        pass
 
     def _start_iteration(self):
         """Called every time new function visiting started"""
-        pass
 
     def _finish(self):
         """Called after all visiting happened"""
-        pass
 
     def _finish_iteration(self):
         """Called every time new function visiting finished"""
-        pass
 
     def _is_func_crippled(self):
         # Check if function is just call to another function
@@ -453,9 +442,8 @@ class RecursiveDownwardsObjectVisitor(RecursiveObjectVisitor, DownwardsObjectVis
             elif op == ctype.memptr:
                 if addr_ctx:
                     work.append((getattr(expr, "x", None), False))
-            elif op == ctype.memref:
-                if addr_ctx:
-                    work.append((getattr(expr, "x", None), True))
+            elif op == ctype.memref and addr_ctx:
+                work.append((getattr(expr, "x", None), True))
         return False
 
     def _check_call(self, cexpr: ida_hexrays.cexpr_t):

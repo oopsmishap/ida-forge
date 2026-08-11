@@ -3,17 +3,33 @@ from __future__ import annotations
 import copy
 import csv
 import io
-from dataclasses import dataclass
+from collections.abc import Iterator
 from enum import IntEnum
-from typing import Dict, Iterator, Optional
 
+import ida_funcs
 import ida_hexrays
 import ida_kernwin
 import ida_lines
-import ida_funcs
 import idaapi
 
+from forge.api.hexrays import (
+    collect_ctree_items_near_ea,
+    decompile,
+)
+from forge.api.members import AbstractMember, Member, VirtualTable, parse_user_tinfo
+from forge.api.scan_object import ScanObject
+from forge.api.structure import Structure, StructureRelationship
+from forge.api.ui import set_row_background_color, set_row_foreground_color
+from forge.features.structure_builder.child_scan import ChildScanMixin
+from forge.features.structure_builder.dialogs import (
+    BulkMemberEditorDialog,
+    MemberEditorDialog,
+    MemberEditorValues,
+)
+from forge.util.logging import log_debug, log_warning
 from forge.util.qt import QtCore, QtGui, QtWidgets, qt_exec, qt_item_flags
+
+from .config import config
 from .ui_form import Ui_view_form
 
 QSignalBlocker = QtCore.QSignalBlocker
@@ -23,26 +39,6 @@ QTreeWidgetItem = QtWidgets.QTreeWidgetItem
 QMenu = QtWidgets.QMenu
 QTableWidgetItem = QtWidgets.QTableWidgetItem
 QWidget = QtWidgets.QWidget
-
-from forge.api.hexrays import (
-    collect_ctree_items_near_ea,
-    decompile,
-    is_legal_type,
-)
-from forge.api.members import AbstractMember, Member, VirtualTable, parse_user_tinfo
-from forge.api.scan_object import ScanObject
-from forge.api.scanner import NewDeepScanVisitor
-from forge.api.structure import Structure, StructureRelationship
-from forge.api.ui import set_row_background_color, set_row_foreground_color
-from forge.features.structure_builder.child_scan import ChildScanMixin, ChildScanPlan
-from forge.features.structure_builder.dialogs import (
-    BulkMemberEditorDialog,
-    MemberEditorDialog,
-    MemberEditorValues,
-)
-from forge.util.logging import log_debug, log_warning
-from .config import config
-
 
 class Column(IntEnum):
     offset = 0
@@ -65,7 +61,7 @@ class StructureBuilderForm(ChildScanMixin, ida_kernwin.PluginForm):
         super().__init__()
         self.parent = None
         self.ui = None
-        self.structures: Dict[str, Structure] = {}
+        self.structures: dict[str, Structure] = {}
         self.current_structure: Structure | None = None
         self.layout = None
         self._shortcut_actions: list[QtGui.QAction] = []
@@ -600,7 +596,7 @@ class StructureBuilderForm(ChildScanMixin, ida_kernwin.PluginForm):
                     child,
                     parent=item,
                     relationship=child_relationship,
-                    path=path + (structure.name,),
+                    path=(*path, structure.name),
                 )
 
         roots = [
@@ -768,7 +764,7 @@ class StructureBuilderForm(ChildScanMixin, ida_kernwin.PluginForm):
 
         self._normalize_member_child_links(duplicate)
 
-    def create_structure(self, name: Optional[str]):
+    def create_structure(self, name: str | None):
         if name is None:
             return None
 
@@ -1789,7 +1785,7 @@ class StructureBuilderForm(ChildScanMixin, ida_kernwin.PluginForm):
             if root
             else getattr(scan_object, "function_name", "")
         ) or (ida_funcs.get_func_name(func_ea) if func_ea != idaapi.BADADDR else "")
-        if func_ea == idaapi.BADADDR or target_ea == idaapi.BADADDR:
+        if idaapi.BADADDR in (func_ea, target_ea):
             return function_name or ""
         return f"{function_name}@{hex(target_ea)}"
 

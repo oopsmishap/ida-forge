@@ -7,12 +7,11 @@ from types import SimpleNamespace
 
 from forge.api.structure import Structure
 
-
 hexrays_api = import_module("forge.api.hexrays")
 scanner_api = import_module("forge.api.scanner")
-setattr(hexrays_api, "get_funcs_referencing_address", lambda *_args, **_kwargs: [])
-setattr(hexrays_api, "is_legal_type", lambda *_args, **_kwargs: True)
-setattr(scanner_api, "NewShallowScanVisitor", type("NewShallowScanVisitor", (), {}))
+hexrays_api.get_funcs_referencing_address = lambda *_args, **_kwargs: []
+hexrays_api.is_legal_type = lambda *_args, **_kwargs: True
+scanner_api.NewShallowScanVisitor = type("NewShallowScanVisitor", (), {})
 
 form_module = import_module("forge.features.structure_builder.form")
 child_scan_module = import_module("forge.features.structure_builder.child_scan")
@@ -78,9 +77,13 @@ class _FakeMember:
         self.is_array = False
         self.scanned_variables = set()
 
+    def invalidate_score(self):
+        pass
+
     def __lt__(self, other):
         return (self.offset, self.type_name) < (other.offset, other.type_name)
 
+    __hash__ = None  # mutable fake; __eq__ compares and merges
     def __eq__(self, other):
         return (self.offset, self.type_name) == (other.offset, other.type_name)
 
@@ -391,7 +394,7 @@ def test_update_structure_fields_disabled_state_paints_all_columns(monkeypatch):
 
     monkeypatch.setattr(form_module, "QTableWidgetItem", _FakeItem)
     monkeypatch.setattr(form_module, "QColor", lambda hexstr: hexstr)
-    monkeypatch.setattr(structure_form, "get_selected_rows", lambda: [])
+    monkeypatch.setattr(structure_form, "get_selected_rows", list)
     monkeypatch.setattr(structure_form, "_restore_selected_rows", lambda _r: None)
     monkeypatch.setattr(structure_form, "update_action_states", lambda: None)
 
@@ -534,7 +537,7 @@ def test_update_structure_fields_collision_state_paints_all_columns(monkeypatch)
 
     monkeypatch.setattr(form_module, "QTableWidgetItem", _FakeItem)
     monkeypatch.setattr(form_module, "QColor", lambda hexstr: hexstr)
-    monkeypatch.setattr(structure_form, "get_selected_rows", lambda: [])
+    monkeypatch.setattr(structure_form, "get_selected_rows", list)
     monkeypatch.setattr(structure_form, "_restore_selected_rows", lambda _r: None)
     monkeypatch.setattr(structure_form, "update_action_states", lambda: None)
 
@@ -648,7 +651,7 @@ def test_update_structure_fields_origin_cell_uses_disabled_palette_when_row_disa
 
     monkeypatch.setattr(form_module, "QTableWidgetItem", _FakeItem)
     monkeypatch.setattr(form_module, "QColor", lambda hexstr: hexstr)
-    monkeypatch.setattr(structure_form, "get_selected_rows", lambda: [])
+    monkeypatch.setattr(structure_form, "get_selected_rows", list)
     monkeypatch.setattr(structure_form, "_restore_selected_rows", lambda _r: None)
     monkeypatch.setattr(structure_form, "update_action_states", lambda: None)
 
@@ -1102,7 +1105,7 @@ def test_update_action_states_enables_child_type_actions_for_child_relationships
         action_create_child_types=_Recorder(),
         action_create_subtree_types=_Recorder(),
     )
-    monkeypatch.setattr(structure_form, "get_selected_rows", lambda: [])
+    monkeypatch.setattr(structure_form, "get_selected_rows", list)
     monkeypatch.setattr(structure_form, "get_selected_member", lambda: None)
     monkeypatch.setattr(structure_form, "_build_child_scan_plan", lambda _member: None)
     monkeypatch.setattr(structure_form, "_update_summary_label", lambda: None)
@@ -1142,7 +1145,7 @@ def test_scan_child_structure_auto_creates_child_and_records_metadata(monkeypatc
     parent.add_member(member)
     structure_form.current_structure = parent
 
-    plan = form_module.ChildScanPlan(
+    plan = child_scan_module.ChildScanPlan(
         scan_object=SimpleNamespace(name="child_ptr"),
         function_eas=(0x401000,),
         relation_kind="embedded",
@@ -1194,7 +1197,7 @@ def test_scan_child_structure_reuses_existing_linked_child(monkeypatch):
     parent.add_member(member)
     structure_form.current_structure = parent
 
-    plan = form_module.ChildScanPlan(
+    plan = child_scan_module.ChildScanPlan(
         scan_object=SimpleNamespace(name="child_ptr"),
         function_eas=(0x401000,),
         relation_kind="pointer",
@@ -1509,7 +1512,7 @@ def test_scan_child_structure_rolls_back_new_child_when_scan_finds_nothing(
     parent.add_member(member)
     structure_form.current_structure = parent
 
-    plan = form_module.ChildScanPlan(
+    plan = child_scan_module.ChildScanPlan(
         scan_object=SimpleNamespace(name="child_ptr"),
         function_eas=(0x401000,),
         relation_kind="pointer",
@@ -1550,7 +1553,9 @@ def test_build_child_scan_plan_uses_created_parent_type(monkeypatch):
         SimpleNamespace(func_ea=0x401000, ea=0x402000, name="root"),
     ]
     structure_form.current_structure = parent
-    monkeypatch.setattr(form_module, "is_legal_type", lambda _tinfo: True)
+    # is_legal_type is bound module-level (line 13) before import_module;
+    # patching form_module would target a name form no longer holds.
+    monkeypatch.setattr(child_scan_module, "is_legal_type", lambda _tinfo: True, raising=False)
 
     plan = structure_form._build_child_scan_plan(member)
 
@@ -1588,7 +1593,9 @@ def test_build_child_scan_plan_preserves_distinct_scan_locations(monkeypatch):
     }
     parent.add_member(member)
     structure_form.current_structure = parent
-    monkeypatch.setattr(form_module, "is_legal_type", lambda _tinfo: True)
+    # is_legal_type is bound module-level (line 13) before import_module;
+    # patching form_module would target a name form no longer holds.
+    monkeypatch.setattr(child_scan_module, "is_legal_type", lambda _tinfo: True, raising=False)
 
     plan = structure_form._build_child_scan_plan(member)
 
@@ -1611,7 +1618,9 @@ def test_build_child_scan_plan_accepts_inferred_primitive_member(monkeypatch):
         SimpleNamespace(func_ea=0x401000, ea=0x402000, name="root", _name="auto_struct_001"),
     ]
     structure_form.current_structure = parent
-    monkeypatch.setattr(form_module, "is_legal_type", lambda _tinfo: True)
+    # is_legal_type is bound module-level (line 13) before import_module;
+    # patching form_module would target a name form no longer holds.
+    monkeypatch.setattr(child_scan_module, "is_legal_type", lambda _tinfo: True, raising=False)
 
     plan = structure_form._build_child_scan_plan(member)
 
@@ -1633,7 +1642,9 @@ def test_build_child_scan_plan_uses_structure_name_when_untyped(monkeypatch):
         SimpleNamespace(func_ea=0x401000, ea=0x402000, name="root"),
     ]
     structure_form.current_structure = parent
-    monkeypatch.setattr(form_module, "is_legal_type", lambda _tinfo: True)
+    # is_legal_type is bound module-level (line 13) before import_module;
+    # patching form_module would target a name form no longer holds.
+    monkeypatch.setattr(child_scan_module, "is_legal_type", lambda _tinfo: True, raising=False)
 
     plan = structure_form._build_child_scan_plan(member)
 
@@ -1654,7 +1665,9 @@ def test_build_child_scan_plan_allows_ambiguous_member_evidence_when_parent_name
         SimpleNamespace(func_ea=0x401100, ea=0x402100, name="root_b", _name="TypeB"),
     ]
     structure_form.current_structure = parent
-    monkeypatch.setattr(form_module, "is_legal_type", lambda _tinfo: True)
+    # is_legal_type is bound module-level (line 13) before import_module;
+    # patching form_module would target a name form no longer holds.
+    monkeypatch.setattr(child_scan_module, "is_legal_type", lambda _tinfo: True, raising=False)
 
     plan = structure_form._build_child_scan_plan(member)
 
@@ -1682,7 +1695,9 @@ def test_build_child_scan_plan_prefers_scan_root_evidence(monkeypatch):
         ),
     ]
     structure_form.current_structure = parent
-    monkeypatch.setattr(form_module, "is_legal_type", lambda _tinfo: True)
+    # is_legal_type is bound module-level (line 13) before import_module;
+    # patching form_module would target a name form no longer holds.
+    monkeypatch.setattr(child_scan_module, "is_legal_type", lambda _tinfo: True, raising=False)
 
     plan = structure_form._build_child_scan_plan(member)
 
@@ -1941,7 +1956,7 @@ def test_execute_child_scan_plan_enables_recursive_child_traversal(monkeypatch):
         def process(self):
             return None
 
-    monkeypatch.setattr(form_module, "NewDeepScanVisitor", FakeVisitor)
+    monkeypatch.setattr(child_scan_module, "NewDeepScanVisitor", FakeVisitor)
 
     assert structure_form._execute_child_scan_plan(child, plan) is True
     assert captured["args"] == (0x401000, 0x30, "child_ptr", 0x402000, "Child", True)
@@ -1995,7 +2010,7 @@ def test_execute_child_scan_plan_runs_for_each_scan_location(monkeypatch):
         def process(self):
             return None
 
-    monkeypatch.setattr(form_module, "NewDeepScanVisitor", FakeVisitor)
+    monkeypatch.setattr(child_scan_module, "NewDeepScanVisitor", FakeVisitor)
 
     assert structure_form._execute_child_scan_plan(child, plan) is True
     assert captured == [
@@ -2016,7 +2031,9 @@ def test_build_child_scan_plan_warns_when_parent_type_missing_from_idb(monkeypat
         SimpleNamespace(func_ea=0x401000, ea=0x402000, name="root_a", _name="TypeA"),
     ]
     structure_form.current_structure = parent
-    monkeypatch.setattr(form_module, "is_legal_type", lambda _tinfo: True)
+    # is_legal_type is bound module-level (line 13) before import_module;
+    # patching form_module would target a name form no longer holds.
+    monkeypatch.setattr(child_scan_module, "is_legal_type", lambda _tinfo: True, raising=False)
 
     warnings = []
     monkeypatch.setattr(
@@ -2102,7 +2119,7 @@ def test_execute_child_scan_plan_normalizes_legacy_scan_variables(monkeypatch):
         def process(self):
             return None
 
-    monkeypatch.setattr(form_module, "NewDeepScanVisitor", FakeVisitor)
+    monkeypatch.setattr(child_scan_module, "NewDeepScanVisitor", FakeVisitor)
 
     assert structure_form._execute_child_scan_plan(child, plan) is True
     assert captured["args"][0:4] == (0x401000, 0x30, "child_ptr", 0x402000)
@@ -2150,7 +2167,7 @@ def test_execute_child_scan_plan_prefers_inferred_child_roots(monkeypatch):
         def process(self):
             return None
 
-    monkeypatch.setattr(form_module, "NewDeepScanVisitor", FakeVisitor)
+    monkeypatch.setattr(child_scan_module, "NewDeepScanVisitor", FakeVisitor)
 
     assert structure_form._execute_child_scan_plan(child, plan) is True
     assert captured["args"] == (0x402000, 0x30, "child_var", 0x500123, "Child", True)
@@ -2165,7 +2182,8 @@ def test_execute_child_scan_plan_prefers_inferred_child_roots(monkeypatch):
 
 def test_collect_evidence_by_function_groups_and_skips_badaddr(monkeypatch):
     structure_form = _make_form(monkeypatch)
-    ev = lambda func_ea, ea: SimpleNamespace(id=object(), func_ea=func_ea, ea=ea)
+    def ev(func_ea, ea):
+        return SimpleNamespace(id=object(), func_ea=func_ea, ea=ea)
     plan = SimpleNamespace(
         scan_variables=(
             ev(0x401000, 0x10),
@@ -2569,7 +2587,7 @@ def test_execute_child_scan_plan_falls_back_to_seeded_member_when_inference_fail
         def process(self):
             return None
 
-    monkeypatch.setattr(form_module, "NewDeepScanVisitor", FakeVisitor)
+    monkeypatch.setattr(child_scan_module, "NewDeepScanVisitor", FakeVisitor)
 
     assert structure_form._execute_child_scan_plan(child, plan) is True
     assert captured["args"] == (0x401000, 0x30, "child_ptr", 0x402000, "Child", True)
@@ -2590,9 +2608,11 @@ def test_scan_child_structure_uses_absolute_member_origin(monkeypatch):
     member.tinfo = SimpleNamespace(is_ptr=lambda: False, is_udt=lambda: False)
     member.scanned_variables = [SimpleNamespace(func_ea=0x401000, ea=0x402000, name="root")]
     structure_form.current_structure = parent
-    monkeypatch.setattr(form_module, "is_legal_type", lambda _tinfo: True)
+    # is_legal_type is bound module-level (line 13) before import_module;
+    # patching form_module would target a name form no longer holds.
+    monkeypatch.setattr(child_scan_module, "is_legal_type", lambda _tinfo: True, raising=False)
 
-    plan = form_module.ChildScanPlan(
+    plan = child_scan_module.ChildScanPlan(
         scan_object=SimpleNamespace(name="child_ptr"),
         function_eas=(0x401000,),
         relation_kind="embedded",
@@ -2788,6 +2808,8 @@ def test_convert_to_vtable_replaces_member_with_virtual_table(monkeypatch):
                 getattr(other, "type_name", ""),
             )
 
+        __hash__ = None  # mutable fake; __eq__ compares
+
         def __eq__(self, other):
             return (self.offset, self.type_name) == (
                 getattr(other, "offset", 0),
@@ -2806,3 +2828,316 @@ def test_convert_to_vtable_replaces_member_with_virtual_table(monkeypatch):
     assert captured["origin"] == 0
     assert vtable.scanned_variables == {"sv1", "sv2"}
     assert vtable.comment == "from deep scan"
+
+# ---------------------------------------------------------------------------
+# T3.5 G-gap regression tests
+# ---------------------------------------------------------------------------
+
+
+def test_duplicate_structure_copies_child_links_then_normalizes(monkeypatch):
+    """G1: duplicating a structure re-targets self-child links (name,
+    offset, kind) and re-normalizes member links."""
+    structure_form = _make_form(monkeypatch)
+    parent = structure_form.create_structure("Parent")
+    child = structure_form.create_structure("Child")
+    linked = _FakeMember(0x10, 8, name="child_ptr")
+    linked.linked_child_structure_name = "Child"
+    linked.child_relation_kind = "pointer"
+    parent.add_member(linked)
+    parent.add_child_relationship(child_structure_name="Child", parent_member_offset=0x10, parent_member_name="child_ptr", relation_kind="pointer")
+    child.add_member(_FakeMember(0x0, 4))
+    structure_form.current_structure = parent
+    assert child.parent_relationships == []
+
+    structure_form.duplicate_structure()
+
+    duplicate = structure_form.structures["Parent Copy"]
+    assert duplicate.child_relationships[0].parent_member_offset == 0x10
+    assert duplicate.child_relationships[0].child_structure_name == "Child"
+    assert duplicate.child_relationships[0].relation_kind == "pointer"
+    member = duplicate.get_member_by_offset(0x10)
+    assert member.linked_child_structure_name == "Child"
+    assert member.child_relation_kind == "pointer"
+    assert len(child.parent_relationships) == 1
+    parent_rel = child.parent_relationships[0]
+    assert parent_rel.parent_structure_name == "Parent Copy"
+    assert parent_rel.parent_member_offset == 0x10
+
+
+def test_remove_structure_cleans_other_structures_relationships(monkeypatch):
+    """G2: removing a structure drops every relationship pointing at it."""
+    structure_form = _make_form(monkeypatch)
+    parent = structure_form.create_structure("Parent")
+    child = structure_form.create_structure("Child")
+    parent.add_child_relationship(child_structure_name="Child", parent_member_offset=0x8, parent_member_name="u64_8", relation_kind="pointer")
+    structure_form.ui = SimpleNamespace(tree_structures=object())
+    structure_form.set_structure("Parent")
+    monkeypatch.setattr(structure_form, "_current_tree_structure", lambda: parent)
+
+    structure_form.remove_structure()
+
+    assert "Parent" not in structure_form.structures
+    assert child.parent_relationships == []
+
+
+def test_nudge_main_offset_follows_selected_member(monkeypatch):
+    """G3: nudging the member that owns main_offset moves main_offset with it."""
+    structure_form = _make_form(monkeypatch)
+    structure = structure_form.create_structure("S")
+    structure.set_main_offset(0x10)
+    member_at_main = _FakeMember(0x10, 8, name="root")
+    other = _FakeMember(0x0, 8, name="field_0")
+    structure.add_member(member_at_main)
+    structure.add_member(other)
+    structure_form.current_structure = structure
+    monkeypatch.setattr(structure_form, "get_selected_members", lambda: [member_at_main])
+
+    structure_form.nudge_selected_rows(8)
+
+    assert member_at_main.offset == 0x18
+    assert structure.main_offset == 0x18
+    assert other.offset == 0x0
+
+
+def test_structure_table_clear_decline_keeps_members(monkeypatch):
+    """G4: declining the clear dialog leaves all members intact."""
+    import ida_kernwin
+
+    monkeypatch.setattr(ida_kernwin, "ASKBTN_NO", 0, raising=False)
+    monkeypatch.setattr(ida_kernwin, "ASKBTN_YES", 1, raising=False)
+    structure_form = _make_form(monkeypatch)
+    structure = structure_form.create_structure("S")
+    structure.add_member(_FakeMember(0x0, 8))
+    structure_form.current_structure = structure
+    monkeypatch.setattr(ida_kernwin, "ask_yn", lambda dflt, text: ida_kernwin.ASKBTN_NO, raising=False)
+
+    structure_form.structure_table_clear()
+
+    assert len(structure.members) == 1
+
+    monkeypatch.setattr(ida_kernwin, "ask_yn", lambda dflt, text: ida_kernwin.ASKBTN_YES, raising=False)
+    structure_form.structure_table_clear()
+    assert structure.members == []
+
+
+def test_convert_to_vtable_decline_preserves_member(monkeypatch):
+    """G6: declining the 'convert anyway' prompt keeps the member as-is."""
+    import ida_kernwin
+
+    monkeypatch.setattr(ida_kernwin, "ASKBTN_NO", 0, raising=False)
+    monkeypatch.setattr(ida_kernwin, "ASKBTN_YES", 1, raising=False)
+    monkeypatch.setattr(ida_kernwin, "HIST_IDENT", 1, raising=False)
+    monkeypatch.setattr(ida_kernwin, "warning", lambda *a, **k: None, raising=False)
+    structure_form = _make_form(monkeypatch)
+    structure = structure_form.create_structure("S")
+    member = _FakeMember(0x10, 8, name="vtbl", origin=0x10)
+    structure.add_member(member)
+    structure_form.current_structure = structure
+    monkeypatch.setattr(structure_form, "get_selected_member", lambda: member)
+    monkeypatch.setattr(ida_kernwin, "ask_str", lambda dflt, hist, title: "140001000", raising=False)
+    monkeypatch.setattr(ida_kernwin, "ask_yn", lambda dflt, text: ida_kernwin.ASKBTN_NO, raising=False)
+
+    class _FakeVirtualTable:
+        def __init__(self, offset, address, scanned_variable=None, origin=None):
+            self.offset = offset
+            self.origin = origin
+            self.name = "vtbl"
+            self.enabled = True
+            self.is_array = False
+            self.comment = ""
+            self.scanned_variables = set()
+
+        def invalidate_score(self):
+            pass
+
+        @staticmethod
+        def is_virtual_table(address):
+            return 0
+
+    monkeypatch.setattr(form_module, "VirtualTable", _FakeVirtualTable)
+
+    structure_form.convert_to_vtable()
+
+    assert structure.members == [member]
+
+    monkeypatch.setattr(ida_kernwin, "ask_yn", lambda dflt, text: ida_kernwin.ASKBTN_YES, raising=False)
+    structure_form.convert_to_vtable()
+
+    assert len(structure.members) == 1
+    assert structure.members[0].offset == 0x10
+    assert structure.members[0].origin == 0x10
+
+
+def test_structure_table_item_changed_name_vs_comment_column(monkeypatch):
+    """G7: name-column edits strip and fall back to the old name; comment
+    edits apply verbatim; other columns are ignored."""
+    structure_form = _make_form(monkeypatch)
+    structure = structure_form.create_structure("S")
+    member = _FakeMember(0x0, 8, name="field_0", comment="old")
+    structure.add_member(member)
+    structure_form.current_structure = structure
+    form_module.StructureBuilderForm = form_module.StructureBuilderForm  # type: ignore[attr-defined]
+
+    class _Item:
+        def __init__(self, row, column, text):
+            self.row_ = row
+            self.column_ = column
+            self.text_ = text
+
+        def row(self):
+            return self.row_
+
+        def column(self):
+            return self.column_
+
+        def text(self):
+            return self.text_
+
+    structure_form.structure_table_item_changed(_Item(0, form_module.Column.name, "  renamed  "))
+    assert member.name == "renamed"
+    structure_form.structure_table_item_changed(_Item(0, form_module.Column.name, "   "))
+    assert member.name == "renamed"  # empty edit keeps the old name
+    structure_form.structure_table_item_changed(_Item(0, form_module.Column.comment, "new note"))
+    assert member.comment == "new note"
+    structure_form.structure_table_item_changed(_Item(0, form_module.Column.score, "99"))
+    assert member.name == "renamed"
+    assert member.comment == "new note"
+
+
+def test_member_child_link_normalization_clears_stale_links(monkeypatch):
+    """G9: a member whose child link points at a relationship that no longer
+    exists gets its link cleared; existing links keep their kind."""
+    structure_form = _make_form(monkeypatch)
+    structure = structure_form.create_structure("S")
+    member = _FakeMember(0x10, 8, name="ptr")
+    member.linked_child_structure_name = "Ghost"
+    member.child_relation_kind = "pointer"
+    structure.add_member(member)
+    live = _FakeMember(0x18, 8, name="live")
+    live.linked_child_structure_name = "Child"
+    live.child_relation_kind = "array"
+    structure.add_member(live)
+    structure.add_child_relationship(child_structure_name="Child", parent_member_offset=0x18, parent_member_name="live", relation_kind="array")
+
+    structure_form._normalize_member_child_links(structure)
+
+    assert member.linked_child_structure_name is None
+    assert member.child_relation_kind is None
+    assert live.linked_child_structure_name == "Child"
+    assert live.child_relation_kind == "array"
+
+
+def test_make_unique_structure_name_copy_collision_loop(monkeypatch):
+    """G10: 'Copy N' naming increments past every existing collision."""
+    structure_form = _make_form(monkeypatch)
+    for name in ("Foo", "Foo Copy", "Foo Copy 2", "Foo Copy 3"):
+        structure_form.create_structure(name)
+
+    assert structure_form._make_unique_structure_name("Foo") == "Foo Copy 4"
+    assert structure_form._make_unique_structure_name("Bar") == "Bar"
+
+    structure_form.create_structure("Foo Copy 5")
+    assert structure_form._make_unique_structure_name("Foo") == "Foo Copy 4"
+
+
+def test_propagate_child_scan_seed_unresolvable_parent_arg_is_noop(monkeypatch):
+    """G11: a seed whose parent object cannot resolve to an argument index
+    propagates nothing and never decompiles callers."""
+    form = _make_form(monkeypatch)
+    from types import SimpleNamespace as NS
+
+    seed = child_scan_module.ChildScanInferenceSeed(
+        function_ea=0x1400014F0,
+        evidence_ea=0x140001579,
+        scan_object=NS(id=1),
+        parent_object=NS(id=999),  # not a local variable -> arg index is None
+    )
+    touched = []
+    monkeypatch.setattr(
+        child_scan_module,
+        "_get_funcs_calling_address",
+        lambda ea: touched.append(ea) or [0x140001000],
+    )
+
+    propagated = form._propagate_child_scan_seed(None, seed)
+
+    assert propagated == ()
+    assert touched == []
+
+
+def test_create_scan_object_from_expr_fallback_paths(monkeypatch):
+    """G13: expression-derived objects fall back to the offset-expression
+    walker when ScanObject.create cannot parse the raw expression."""
+    form = _make_form(monkeypatch)
+    from types import SimpleNamespace as NS
+
+    cfunc = NS(entry_ea=0x1400014F0)
+    base = NS(name="base")
+
+    assert form._create_scan_object_from_expr(cfunc, None) is None
+
+    monkeypatch.setattr(
+        child_scan_module.ScanObject, "create",
+        staticmethod(lambda cfunc, expr: base if expr is base else None), raising=False,
+    )
+    monkeypatch.setattr(
+        child_scan_module, "_extract_offset_expression",
+        lambda expr: (None, 0), raising=False,
+    )
+    assert form._create_scan_object_from_expr(cfunc, NS(ea=1)) is None
+
+    monkeypatch.setattr(
+        child_scan_module, "_extract_offset_expression",
+        lambda expr: (base, 4), raising=False,
+    )
+    monkeypatch.setattr(
+        child_scan_module, "_make_offset_scan_object",
+        lambda scan_object, offset: offset, raising=False,
+    )
+
+    offset_object = NS(name="offset")
+    monkeypatch.setattr(
+        child_scan_module, "_make_offset_scan_object",
+        lambda scan_object, offset: offset_object, raising=False,
+    )
+
+    result = form._create_scan_object_from_expr(cfunc, NS(ea=1))
+    assert result is offset_object  # the offset scan object from the walker
+    assert result.func_ea == 0x1400014F0
+
+
+def test_build_child_scan_inference_seed_explicit_parent_expr_skips_anchor(monkeypatch):
+    """G14: an explicitly provided parent expression bypasses member-anchor
+    resolution entirely (used by the caller-side propagation path)."""
+    form = _make_form(monkeypatch)
+    from types import SimpleNamespace as NS
+
+    resolved = []
+    monkeypatch.setattr(
+        child_scan_module.ChildScanMixin,
+        "_resolve_member_anchor",
+        staticmethod(lambda *a, **k: resolved.append(a) or object()),
+    )
+    parent_expr = NS(ea=5)
+    parent_obj = NS(id=1)
+    monkeypatch.setattr(
+        child_scan_module.ChildScanMixin,
+        "_create_scan_object_from_expr",
+        staticmethod(lambda cfunc, expr: parent_obj if expr is parent_expr else None),
+    )
+    monkeypatch.setattr(
+        child_scan_module.ChildScanMixin,
+        "_expression_ea",
+        staticmethod(lambda cfunc, expr: getattr(expr, "ea", 0)),
+    )
+
+    seed = form._build_child_scan_inference_seed(
+        NS(entry_ea=0x1400014F0),
+        NS(id=1),
+        parent_expr=parent_expr,
+    )
+
+    assert resolved == []
+    assert seed.parent_object is parent_obj
+    assert seed.evidence_ea == 5
+    assert seed.function_ea == 0x1400014F0

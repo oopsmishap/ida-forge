@@ -1,13 +1,15 @@
+from __future__ import annotations
+
 from dataclasses import dataclass
-from typing import Dict, Optional, Tuple
+from typing import ClassVar
 
 import ida_ida
 import ida_idaapi
 import ida_typeinf
 
 from forge.api.config import ForgeConfig
-from forge.util.util import DocIntEnum
 from forge.util.logging import log_debug, log_error, log_warning
+from forge.util.util import DocIntEnum
 
 # Design note: this module never caches live ``tinfo_t`` objects.
 # IDA invalidates existing ``tinfo_t`` handles whenever new types are created
@@ -18,9 +20,13 @@ from forge.util.logging import log_debug, log_error, log_warning
 # fresh handles from the IDB, so results always reflect the current type table.
 
 
+class UnsupportedArchitectureError(RuntimeError):
+    """Raised when the IDB pointer width is neither 8, 4 nor 2 bits."""
+
+
 class TypesConfig(ForgeConfig):
     name = "Types"
-    default_config = {
+    default_config: ClassVar[dict] = {
         "u8": "u8",
         "u16": "u16",
         "u32": "u32",
@@ -89,7 +95,7 @@ class Types:
         self._type_width = self._get_ptr_width()
         if self._type_width not in (2, 4, 8):
             raise RuntimeError(f"Unsupported pointer width: {self._type_width}")
-        self._type_cache: Dict[str, _TypeEntry] = {}
+        self._type_cache: dict[str, _TypeEntry] = {}
 
         self._load_types()
 
@@ -154,10 +160,7 @@ class Types:
         :param name: The name of the type.
         :param type_enum: The enum value of the type.
         """
-        if save:
-            ordinal = self._save_or_load_typedef_to_idb(name, type_enum)
-        else:
-            ordinal = 0
+        ordinal = self._save_or_load_typedef_to_idb(name, type_enum) if save else 0
 
         self._type_cache[name] = _TypeEntry(name, ordinal, type_enum, save)
 
@@ -289,8 +292,8 @@ class Types:
 
     def convert_to_simple_type(
         self,
-        in_type: Optional[ida_typeinf.tinfo_t],
-    ) -> Optional[ida_typeinf.tinfo_t]:
+        in_type: ida_typeinf.tinfo_t | None,
+    ) -> ida_typeinf.tinfo_t | None:
         """
         Canonicalize scalar aliases while preserving meaningful type structure.
 
@@ -347,12 +350,11 @@ class Types:
     def get_ptr_type(self):
         if self.width == 8:
             return self._get_type("u64")
-        elif self.width == 4:
+        if self.width == 4:
             return self._get_type("u32")
-        elif self.width == 2:
+        if self.width == 2:
             return self._get_type("u16")
-        else:
-            raise Exception("Unsupported architecture")
+        raise UnsupportedArchitectureError(self.width)
 
     @staticmethod
     def _get_ptr_width():
@@ -363,7 +365,7 @@ class Types:
         elif ida_ida.inf_is_16bit():
             width = 2
         else:
-            raise Exception("Unsupported architecture")
+            raise UnsupportedArchitectureError(None)
         return width
 
     def __getitem__(self, item):

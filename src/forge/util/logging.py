@@ -6,7 +6,6 @@ import ida_kernwin
 
 from forge.plugin import PLUGIN_NAME
 
-
 _logger = logging.getLogger("forge")
 _logger.setLevel(logging.DEBUG)
 

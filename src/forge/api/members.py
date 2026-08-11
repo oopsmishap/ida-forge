@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import re
 from collections import defaultdict
-from typing import Optional
 
 import ida_auto
 import ida_bytes
@@ -16,16 +15,14 @@ import ida_xref
 import idaapi
 import idc
 
-from forge.api.hexrays import read_pointer, is_code, is_imported, decompile
+import forge.api.types as forge_types
+from forge.api.hexrays import decompile, is_code, is_imported, read_pointer
 from forge.api.scan_object import VariableObject
 from forge.api.scanner import NewDeepScanVisitor
 from forge.api.types import types
 from forge.api.visitor import FunctionTouchVisitor
 from forge.util.cxx_to_c_name import demangled_name_to_c_str
 from forge.util.logging import log_debug, log_error, log_info, log_warning
-
-import forge.api.types as forge_types
-
 
 TYPE_DECL_ALIASES = {
     "_BYTE": "u8",
@@ -63,7 +60,7 @@ def normalize_type_declaration(declaration: str) -> str:
     return normalized
 
 
-def _parse_decl_attempt(declaration: str) -> Optional[ida_typeinf.tinfo_t]:
+def _parse_decl_attempt(declaration: str) -> ida_typeinf.tinfo_t | None:
     tinfo = ida_typeinf.tinfo_t()
     flags = ida_typeinf.PT_TYP | ida_typeinf.PT_SIL
     if ida_typeinf.parse_decl(tinfo, None, declaration, flags):
@@ -71,7 +68,7 @@ def _parse_decl_attempt(declaration: str) -> Optional[ida_typeinf.tinfo_t]:
     return None
 
 
-def _parse_idc_decl_attempt(declaration: str) -> Optional[ida_typeinf.tinfo_t]:
+def _parse_idc_decl_attempt(declaration: str) -> ida_typeinf.tinfo_t | None:
     result = idaapi.idc_parse_decl(ida_typeinf.get_idati(), declaration, idaapi.PT_TYP)
     if result is None:
         return None
@@ -82,7 +79,7 @@ def _parse_idc_decl_attempt(declaration: str) -> Optional[ida_typeinf.tinfo_t]:
     return tinfo
 
 
-def _build_pointer_tinfo(base_declaration: str, pointer_depth: int) -> Optional[ida_typeinf.tinfo_t]:
+def _build_pointer_tinfo(base_declaration: str, pointer_depth: int) -> ida_typeinf.tinfo_t | None:
     base_tinfo = parse_user_tinfo(base_declaration)
     if base_tinfo is None:
         return None
@@ -95,7 +92,7 @@ def _build_pointer_tinfo(base_declaration: str, pointer_depth: int) -> Optional[
     return resolved_tinfo
 
 
-def _build_array_tinfo(base_declaration: str, element_count: int) -> Optional[ida_typeinf.tinfo_t]:
+def _build_array_tinfo(base_declaration: str, element_count: int) -> ida_typeinf.tinfo_t | None:
     if element_count <= 0:
         return None
 
@@ -113,7 +110,7 @@ def _build_array_tinfo(base_declaration: str, element_count: int) -> Optional[id
     return None
 
 
-def _parse_named_like_type(normalized: str) -> Optional[ida_typeinf.tinfo_t]:
+def _parse_named_like_type(normalized: str) -> ida_typeinf.tinfo_t | None:
     array_match = re.fullmatch(
         r"(?P<base>.+?)\s*\[\s*(?P<count>0x[0-9a-fA-F]+|\d+)\s*\]",
         normalized,
@@ -135,7 +132,7 @@ def _parse_named_like_type(normalized: str) -> Optional[ida_typeinf.tinfo_t]:
     return None
 
 
-def parse_user_tinfo(declaration: str) -> Optional[ida_typeinf.tinfo_t]:
+def parse_user_tinfo(declaration: str) -> ida_typeinf.tinfo_t | None:
     normalized = normalize_type_declaration(declaration)
     attempts = [
         normalized,
@@ -223,40 +220,38 @@ class AbstractMember:
         # TODO: reimplement the score calculation into something better
         if self._score != 0:
             return self._score
+        # Calculate the score based on the size and alignment of the type
+        score = 0
+        if self.alignment == 0:
+            if self.size in (8, 4, 2, 1):
+                score += 8 // self.size
+        elif self.alignment == 4:
+            if self.size in (4, 2, 1):
+                score += 8 // self.size
+        elif self.alignment in (2, 6):
+            if self.size in (2, 1):
+                score += 8 // self.size
+        elif self.alignment in (1, 3, 5, 7) and self.size == 1:
+            score += 8 // self.size
+
+        # Add the number of scanned variables to the score
+        score += len(self.scanned_variables)
+
+        # Ajdust the score based on the type
+        if self.is_simple_type():
+            score -= 1
+        elif self.tinfo.is_funcptr():
+            score += 1000 + len(self.tinfo.dstr())
+        elif "struct " in self.tinfo.dstr():
+            score -= 10
         else:
-            # Calculate the score based on the size and alignment of the type
-            score = 0
-            if self.alignment == 0:
-                if self.size in (8, 4, 2, 1):
-                    score += 8 // self.size
-            elif self.alignment == 4:
-                if self.size in (4, 2, 1):
-                    score += 8 // self.size
-            elif self.alignment in (2, 6):
-                if self.size in (2, 1):
-                    score += 8 // self.size
-            elif self.alignment in (1, 3, 5, 7):
-                if self.size == 1:
-                    score += 8 // self.size
+            score += 1
 
-            # Add the number of scanned variables to the score
-            score += len(self.scanned_variables)
+        # Ensure the score is not negative
+        score = max(0, score)
 
-            # Ajdust the score based on the type
-            if self.is_simple_type():
-                score -= 1
-            elif self.tinfo.is_funcptr():
-                score += 1000 + len(self.tinfo.dstr())
-            elif "struct " in self.tinfo.dstr():
-                score -= 10
-            else:
-                score += 1
-
-            # Ensure the score is not negative
-            score = max(0, score)
-
-            self._score = score
-            return self._score
+        self._score = score
+        return self._score
 
     @property
     def alignment(self):
@@ -312,6 +307,8 @@ class AbstractMember:
 
     def __repr__(self):
         return f"{self.type_name}:{hex(self.offset)}[{hex(self.size)}]"
+
+    __hash__ = None  # __eq__ merges state; hashing would be unstable
 
     def __eq__(self, other):
         if self.offset == other.offset and self.type_name == other.type_name:
@@ -514,7 +511,7 @@ class ImportedVirtualFunction(VirtualFunction):
 
     @property
     def tinfo(self):
-        print("[INFO] Ignoring import function at 0x{:08X}".format(self.address))
+        print(f"[INFO] Ignoring import function at 0x{self.address:08X}")
         tinfo = ida_typeinf.tinfo_t()
         if ida_typeinf.guess_tinfo(tinfo, self.address):
             return tinfo
@@ -570,7 +567,7 @@ class VirtualTable(AbstractMember):
                 "Found duplicate virtual functions", udt_data[first_entry_idx].name
             )
             for num, dup in enumerate(duplicates):
-                udt_data[dup].name = "duplicate_{}_{}".format(first_entry_idx, num + 1)
+                udt_data[dup].name = f"duplicate_{first_entry_idx}_{num + 1}"
                 tinfo = ida_typeinf.tinfo_t()
                 tinfo.create_ptr(types["func_t"].type)
                 udt_data[dup].type = tinfo
@@ -635,7 +632,7 @@ class VirtualTable(AbstractMember):
                 0x10000, cdecl_typedef, "The following new type will be created"
             )
             if not cdecl_typedef:
-                return
+                return None
         previous_ordinal = idaapi.get_type_ordinal(idaapi.cvar.idati, self.vtable_name)
         if previous_ordinal:
             idaapi.del_numbered_type(idaapi.cvar.idati, previous_ordinal)
@@ -674,10 +671,11 @@ class VirtualTable(AbstractMember):
 
     def type_equals_to(self, tinfo: ida_typeinf.tinfo_t) -> bool:
         udt_data = ida_typeinf.udt_type_data_t()
-        if tinfo.is_ptr() and tinfo.get_pointed_object().get_udt_details(udt_data):
-            if udt_data[0].type.is_funcptr():
-                return True
-        return False
+        return (
+            tinfo.is_ptr()
+            and tinfo.get_pointed_object().get_udt_details(udt_data)
+            and udt_data[0].type.is_funcptr()
+        )
 
     def switch_array_flag(self):
         return None
@@ -741,7 +739,7 @@ class VirtualTable(AbstractMember):
             if original_name.startswith("off_"):
                 # case off_XXXXXXXX
                 return f"vtbl{original_name[3:]}", False
-            elif "table" in original_name:
+            if "table" in original_name:
                 return original_name, True
 
         demangled_name = ida_name.demangle_name(

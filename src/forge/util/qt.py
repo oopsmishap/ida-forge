@@ -2,15 +2,17 @@
 
 from __future__ import annotations
 
+import importlib.util as _import_util
+
 QT_BINDING: str
 
-try:
-    from PySide6 import QtCore, QtGui, QtWidgets
+if _import_util.find_spec("PySide6"):
+    from PySide6 import QtCore, QtGui, QtWidgets  # noqa: F401 — importing QtGui/QtWidgets registers the submodules
 
     QT_BINDING = "PySide6"
     Signal = QtCore.Signal
-except ImportError:
-    from PyQt5 import QtCore, QtGui, QtWidgets
+else:
+    from PyQt5 import QtCore
 
     QT_BINDING = "PyQt5"
     Signal = QtCore.pyqtSignal

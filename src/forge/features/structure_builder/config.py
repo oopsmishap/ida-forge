@@ -1,10 +1,12 @@
+from typing import ClassVar
+
 from forge.api.config import ForgeConfig
 
 
 class StructureBuilderConfig(ForgeConfig):
     name = "StructureBuilder"
 
-    default_config = {
+    default_config: ClassVar[dict] = {
         "enabled": True,
         "show_structure_form_hotkey": "Alt+Shift+F9",
         "shallow_scan_hotkey": "Alt+S",

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from contextlib import suppress
 from typing import Any, Callable
 
 import ida_expr
@@ -48,10 +49,9 @@ def register_idc_func(plugmod: Any) -> None:
     ``add_state(value: str) -> int`` methods.
     """
     for name in (_GET_STATE_NAME, _SET_STATE_NAME):
-        try:
+        # removing an unregistered name is expected
+        with suppress(Exception):
             ida_expr.del_idc_func(name)
-        except Exception:  # noqa: BLE001, S110 — removing an unregistered name is expected
-            pass
 
     _register_idc_func(_GET_STATE_NAME, plugmod.get_state, (ida_expr.VT_LONG,))
     _register_idc_func(_SET_STATE_NAME, plugmod.add_state, (ida_expr.VT_STR,))
@@ -60,7 +60,6 @@ def register_idc_func(plugmod: Any) -> None:
 def unregister_idc_func() -> None:
     """Remove the cross-plugin IDC accessors registered by :func:`register_idc_func`."""
     for name in (_GET_STATE_NAME, _SET_STATE_NAME):
-        try:
+        # the plugin may not have registered yet
+        with suppress(Exception):
             ida_expr.del_idc_func(name)
-        except Exception:  # noqa: BLE001, S110 — plugin may not have registered yet
-            pass

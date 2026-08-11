@@ -28,6 +28,7 @@ class FakeMember:
     def __lt__(self, other):
         return (self.offset, self.type_name) < (other.offset, other.type_name)
 
+    __hash__ = None  # mutable fake; __eq__ compares and merges
     def __eq__(self, other):
         return (self.offset, self.type_name) == (other.offset, other.type_name)
 

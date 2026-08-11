@@ -2,13 +2,12 @@ from __future__ import annotations
 
 from copy import deepcopy
 from pathlib import Path
-from typing import Any
+from typing import Any, ClassVar
 
-import toml
 import ida_diskio
+import toml
 
 from forge.util.logging import log_debug, log_error
-
 
 ConfigDict = dict[str, Any]
 
@@ -17,7 +16,7 @@ class ConfigBase:
     """Base class for TOML-backed configuration management."""
 
     name: str | None = None
-    default_config: ConfigDict = {}
+    default_config: ClassVar[ConfigDict] = {}
 
     def __init__(self, config_name: str):
         if not self.name:
@@ -59,11 +58,11 @@ class ConfigBase:
             raise
 
     @staticmethod
-    def _default_config_for(cls: type["ConfigBase"]) -> ConfigDict:
+    def _default_config_for(config_cls: type[ConfigBase]) -> ConfigDict:
         """Return a detached copy of a class's default configuration."""
-        return deepcopy(getattr(cls, "default_config", {}))
+        return deepcopy(getattr(config_cls, "default_config", {}))
 
-    def get_class_config(self, cls: type["ConfigBase"]) -> ConfigDict:
+    def get_class_config(self, cls: type[ConfigBase]) -> ConfigDict:
         """Get the configuration block for a specific config subclass."""
         if cls.name not in self._config:
             default_config = self._default_config_for(cls)
@@ -98,12 +97,12 @@ class ConfigBase:
                     changed = True
         return changed
 
-    def set_class_config(self, cls: type["ConfigBase"], config: ConfigDict) -> None:
+    def set_class_config(self, cls: type[ConfigBase], config: ConfigDict) -> None:
         """Set the configuration block for a specific config subclass."""
         self._config[cls.name] = config
         self._save_config()
 
-    def get_option(self, cls: type["ConfigBase"], option_name: str) -> Any:
+    def get_option(self, cls: type[ConfigBase], option_name: str) -> Any:
         """Get a specific option from a config subclass block."""
         config = self.get_class_config(cls)
         if option_name not in config:
@@ -112,7 +111,7 @@ class ConfigBase:
             )
         return config[option_name]
 
-    def set_option(self, cls: type["ConfigBase"], option_name: str, option_value: Any) -> None:
+    def set_option(self, cls: type[ConfigBase], option_name: str, option_value: Any) -> None:
         """Set a specific option in a config subclass block."""
         config = deepcopy(self.get_class_config(cls))
         config[option_name] = option_value
@@ -135,7 +134,7 @@ class ConfigBase:
 class ForgeConfig(ConfigBase):
     """Root config namespace stored in `forge.toml`."""
     name = "forge"
-    default_config: ConfigDict = {}
+    default_config: ClassVar[ConfigDict] = {}
 
     def __init__(self):
         super().__init__("forge")

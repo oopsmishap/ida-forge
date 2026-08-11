@@ -1,17 +1,17 @@
-# standalone hexrays helper functions
-from typing import List, Tuple
+from __future__ import annotations
 
+# standalone hexrays helper functions
 import ida_bytes
 import ida_funcs
 import ida_hexrays
 import ida_ida
 import ida_idaapi
 import ida_lines
+import ida_nalt
 import ida_name
 import ida_segment
 import ida_typeinf
 import ida_xref
-import ida_nalt
 
 from forge.api import cache
 from forge.api.tinfo import is_incomplete_tinfo
@@ -132,18 +132,14 @@ def read_pointer(ea):
     """Read a pointer-sized value from the database at ``ea``."""
     if types.width == 8:
         return ida_bytes.get_64bit(ea)
-    else:
-        ptr = ida_bytes.get_32bit(ea)
-        if ida_ida.idainfo.procname == "ARM":
-            ptr &= -2  # clear thumb bit
-        return ptr
+    ptr = ida_bytes.get_32bit(ea)
+    if ida_ida.idainfo.procname == "ARM":
+        ptr &= -2  # clear thumb bit
+    return ptr
 
 
 def is_code(ea: int):
-    if ida_ida.idainfo.procname == "ARM":
-        flags = ida_bytes.get_full_flags(ea & -2)
-    else:
-        flags = ida_bytes.get_full_flags(ea)
+    flags = ida_bytes.get_full_flags(ea & -2) if ida_ida.idainfo.procname == "ARM" else ida_bytes.get_full_flags(ea)
     return ida_bytes.is_code(flags)
 
 
@@ -156,7 +152,7 @@ def is_imported(ea: int):
 
 def get_argument(
     cfunc: ida_hexrays.cfunc_t, idx: int
-) -> Tuple[ida_hexrays.lvar_t, int]:
+) -> tuple[ida_hexrays.lvar_t, int]:
     """
     Returns the argument at the specified index in the specified function.
     :param cfunc: The function to get the argument from.
@@ -371,10 +367,9 @@ def print_expr_address(cexpr: ida_hexrays.cexpr_t, parents) -> str:
 def ctype_to_str(t):
     if isinstance(t, int):
         return ctype(t).name
-    elif isinstance(t, list):
+    if isinstance(t, list):
         return [ctype_to_str(x) for x in t]
-    else:
-        return str(t)
+    return str(t)
 
 
 def create_udt_padding_member(offset, size):
@@ -439,7 +434,7 @@ class e_mopt(DocIntEnum):
     v = 6, "global variable"
     b = 7, "micro basic block (mblock_t)"
     f = 8, "list of arguments"
-    l = 9, "local variable"
+    l = 9, "local variable"  # noqa: E741 — mirrors the IDA C API name
     a = 10, "mop_addr_t: address of operand (mop_l, mop_v, mop_S, mop_r)"
     h = 11, "helper function"
     c = 12, "mcases"
@@ -510,9 +505,9 @@ class ctype(DocIntEnum):
     ptr = 51, '*x, access size in "ptrsize"'
     ref = 52, "&x"
     postinc = 53, "x++"
-    postdec = 54, "x–"
+    postdec = 54, "x--"
     preinc = 55, "++x"
-    predec = 56, "–x"
+    predec = 56, "--x"
     call = 57, "x(...)"
     idx = 58, "x[y]"
     memref = 59, "x.m"

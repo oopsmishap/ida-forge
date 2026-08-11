@@ -7,7 +7,6 @@ from types import SimpleNamespace
 import ida_typeinf
 
 
-
 def _load_hexrays_module():
     hexrays_path = Path(__file__).resolve().parents[2] / "src" / "forge" / "api" / "hexrays.py"
     spec = util.spec_from_file_location("forge.api.hexrays_test", hexrays_path)

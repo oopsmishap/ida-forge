@@ -1,10 +1,12 @@
+import re
+from typing import ClassVar
+
 import ida_hexrays
 import ida_idaapi
 import ida_typeinf
-import re
 
 from forge.api.config import ForgeConfig
-from forge.api.hexrays import get_member_name, create_udt_padding_member
+from forge.api.hexrays import create_udt_padding_member
 from forge.api.types import types
 from forge.api.ui_actions import HexRaysPopupAction, register_action
 from forge.util.logging import log_error, log_warning
@@ -12,7 +14,7 @@ from forge.util.logging import log_error, log_warning
 
 class CreateNewFieldConfig(ForgeConfig):
     name = "CreateNewField"
-    default_config = {"enabled": True, "hotkey": "Ctrl+F"}
+    default_config: ClassVar[dict] = {"enabled": True, "hotkey": "Ctrl+F"}
 
 
 _config = CreateNewFieldConfig()
@@ -35,10 +37,7 @@ class CreateNewField(HexRaysPopupAction):
             return False
 
         cexpr = item.it.to_specific_type
-        if cexpr.op not in (ida_hexrays.cot_memptr, ida_hexrays.cot_memref):
-            return False
-
-        return True
+        return cexpr.op in (ida_hexrays.cot_memptr, ida_hexrays.cot_memref)
 
         # TODO: Look into why the names do not match what is being attempted to apply
         # struct_type = cexpr.x.type

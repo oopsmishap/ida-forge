@@ -1,12 +1,15 @@
+from __future__ import annotations
+
 import ida_hexrays
 import ida_idaapi
 import ida_kernwin
 
 from forge.api.hexrays import decompile, get_funcs_referencing_address, is_legal_type
 from forge.api.scan_object import GlobalVariableObject, ObjectType, ScanObject
-from forge.api.scanner import NewShallowScanVisitor, NewDeepScanVisitor
-from forge.api.ui_actions import register_action, UIMenuAction, HexRaysPopupAction
+from forge.api.scanner import NewDeepScanVisitor, NewShallowScanVisitor
+from forge.api.ui_actions import HexRaysPopupAction, UIMenuAction, register_action
 from forge.util.logging import log_warning
+
 from .config import config
 from .form import structure_form
 

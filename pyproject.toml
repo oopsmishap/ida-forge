@@ -20,3 +20,38 @@ where = ["src"]
 [tool.pytest.ini_options]
 addopts = "-q"
 testpaths = ["tests"]
+
+[tool.ruff]
+target-version = "py39"
+line-length = 120
+extend-exclude = ["tests/fixtures"]
+
+[tool.ruff.lint]
+# E/F/I core correctness, UP/B modern idioms, SIM/BLE/PL readability,
+# FA/PIE/TRY/RET/C4/RUF/S hygiene. Deliberate exceptions carry per-line
+# `noqa` comments with reasons; class-level ignores are reasoned below.
+select = [
+    "E", "F", "I", "UP", "B", "SIM", "BLE", "PL", "RUF", "FA", "PIE",
+    "TRY", "RET", "C4", "S",
+]
+ignore = [
+    "E501",    # line length is not enforced project-wide (no formatter)
+    "S101",    # assert is the idiomatic test assertion and a runtime guard here
+    "PLR2004", # hex constants (EAs/byte offsets) are legitimately magic
+    "PLR0911", # complexity metrics are tracked as refactor debt, not lint gates
+    "PLR0912",
+    "PLR0913",
+    "PLR0915",
+    "PLR0917",
+    "PLC0415", # lazy IDA-API imports inside functions keep plugin startup lean
+    "F403",    # deliberate `from forge.api.hexrays import *`; removed by I.4
+    "F405",
+    "TRY003",  # raise-vanilla-args noise; TRY002 (wrong exception class) stays
+    "TRY300",  # try-consider-else is a style preference
+    "RET503",  # implicit-return None is idiomatic in visitor callbacks
+    "PLW0108", # unnecessary-lambda is a refactor-opportunity rule, not a bug
+]
+
+[tool.ruff.lint.per-file-ignores]
+# tests set up stub modules before imports by design
+"tests/**" = ["E402"]

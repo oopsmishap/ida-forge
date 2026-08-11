@@ -1,11 +1,8 @@
 from __future__ import annotations
 
+import contextlib
 import shutil
-import traceback
 from pathlib import Path
-
-import ida_idaapi
-import ida_kernwin
 
 
 def _purge_stale_pycache() -> None:
@@ -25,10 +22,8 @@ def _purge_stale_pycache() -> None:
             continue
         pycache = cache_dir / "__pycache__"
         if pycache.is_dir():
-            try:
+            with contextlib.suppress(OSError):
                 shutil.rmtree(pycache)
-            except OSError:
-                pass
 
 
 _purge_stale_pycache()

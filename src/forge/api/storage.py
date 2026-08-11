@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import contextlib
 import json
 import zlib
-from typing import Any, Iterable, TypeAlias
+from collections.abc import Iterable
+from typing import Any, TypeAlias
 
 import ida_netnode
 
@@ -66,17 +68,14 @@ class Storage:
         slot = self._n.suplast(tag)
         if slot is None or slot == ida_netnode.BADNODE:
             return 0
-        else:
-            return slot + 1
+        return slot + 1
 
     def _int_set(self, key: int, value: bytes) -> None:
         assert isinstance(key, int)
         assert value is not None
 
-        try:
+        with contextlib.suppress(KeyError):
             self._int_del(key)
-        except KeyError:
-            pass
 
         if len(value) > BLOB_SIZE:
             store_key = self._get_next_slot(INT_KEYS_TAG)
@@ -123,10 +122,8 @@ class Storage:
         assert isinstance(key, str)
         assert value is not None
 
-        try:
+        with contextlib.suppress(KeyError):
             self._str_del(key)
-        except KeyError:
-            pass
 
         if len(value) > BLOB_SIZE:
             store_key = self._get_next_slot(STR_KEYS_TAG)

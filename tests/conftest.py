@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import shutil
 import sys
 import tempfile
@@ -7,6 +8,7 @@ import types
 from pathlib import Path
 
 import pytest
+
 ROOT = Path(__file__).resolve().parents[1]
 SRC = ROOT / "src"
 UTIL = ROOT / "util"
@@ -196,6 +198,7 @@ _stub_module(
     cfunc_type=lambda *args, **kwargs: object(),
     Hexrays_Hooks=_DummyHexraysHooks,
     ctree_item_t=type("ctree_item_t", (), {}),
+    ctree_parentee_t=type("ctree_parentee_t", (), {}),
     cfunc_t=type("cfunc_t", (), {}),
     cexpr_t=type("cexpr_t", (), {}),
     lvar_t=type("lvar_t", (), {}),
@@ -323,10 +326,8 @@ def _collect_ctree_items_near_ea(cfunc, ea: int, *, exhaustive: bool = False):
 
     eamap = getattr(cfunc, "eamap", None)
     if (exhaustive or not candidates) and eamap is not None:
-        try:
+        with contextlib.suppress(Exception):
             candidates.extend(list(eamap.get(ea, [])))
-        except Exception:
-            pass
 
     body = getattr(cfunc, "body", None)
     if (
@@ -336,7 +337,7 @@ def _collect_ctree_items_near_ea(cfunc, ea: int, *, exhaustive: bool = False):
     ):
         try:
             closest_item = body.find_closest_addr(ea)
-        except Exception:
+        except Exception:  # noqa: BLE001 — stub doubles may raise anything
             closest_item = None
         if closest_item is not None:
             candidates.append(closest_item)

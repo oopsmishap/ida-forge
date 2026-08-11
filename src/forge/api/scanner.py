@@ -1,13 +1,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional
 
 import ida_bytes
 import ida_funcs
 import ida_hexrays
-import idaapi
 import ida_typeinf
+import idaapi
 
 from forge.api.hexrays import (
     ctype,
@@ -19,7 +18,7 @@ from forge.api.hexrays import (
     is_legal_type,
     to_hex,
 )
-from forge.api.scan_object import ScanObject, ObjectType, _extract_offset_expression
+from forge.api.scan_object import ObjectType, ScanObject, _extract_offset_expression
 from forge.api.tinfo import is_incomplete_tinfo
 from forge.api.types import types
 from forge.api.visitor import (
@@ -38,10 +37,10 @@ class ParentExpressionContext:
     def ops(self) -> list[ctype]:
         return [expression.op for expression in self.expressions]
 
-    def expr_at(self, index: int) -> Optional[ida_hexrays.cexpr_t]:
+    def expr_at(self, index: int) -> ida_hexrays.cexpr_t | None:
         return self.expressions[index] if index < len(self.expressions) else None
 
-    def op_at(self, index: int) -> Optional[ctype]:
+    def op_at(self, index: int) -> ctype | None:
         ops = self.ops
         return ops[index] if index < len(ops) else None
 
@@ -89,7 +88,7 @@ class ScannedObject:
         expression_address: int,
         origin: int,
         applicable: bool = True,
-    ) -> "ScannedObject":
+    ) -> ScannedObject:
         obj_id = getattr(obj, "id", None)
         if obj_id is None:
             legacy_lvar = getattr(obj, "lvar", getattr(obj, "_ScannedVariableObject__lvar", None))
@@ -284,33 +283,35 @@ class ScanVisitor(ObjectVisitor):
 
 
     @staticmethod
-    def _describe_tinfo(tinfo: Optional[ida_typeinf.tinfo_t]) -> str:
+    def _describe_tinfo(tinfo: ida_typeinf.tinfo_t | None) -> str:
         if tinfo is None:
             return "<none>"
         return getattr(tinfo, "dstr", lambda: str(tinfo))()
 
     @staticmethod
     def _describe_call_argument(
-        idx: Optional[int], call_cexpr: ida_hexrays.cexpr_t
+        idx: int | None, call_cexpr: ida_hexrays.cexpr_t
     ) -> str:
         label = f"argument {idx}" if idx is not None else "unmatched argument"
         return f"{label} at {to_hex(call_cexpr.ea)}"
 
     @staticmethod
-    def _is_unknown_tinfo(tinfo: Optional[ida_typeinf.tinfo_t]) -> bool:
+    def _is_unknown_tinfo(tinfo: ida_typeinf.tinfo_t | None) -> bool:
         return is_incomplete_tinfo(tinfo)
 
     @staticmethod
-    def _is_structure_like_tinfo(tinfo: Optional[ida_typeinf.tinfo_t]) -> bool:
+    def _is_structure_like_tinfo(tinfo: ida_typeinf.tinfo_t | None) -> bool:
         return tinfo is not None and (tinfo.is_ptr() or tinfo.is_udt())
 
     def _prefer_object_tinfo(
-        self, obj: ScanObject, tinfo: Optional[ida_typeinf.tinfo_t]
-    ) -> Optional[ida_typeinf.tinfo_t]:
+        self, obj: ScanObject, tinfo: ida_typeinf.tinfo_t | None
+    ) -> ida_typeinf.tinfo_t | None:
         obj_tinfo = getattr(obj, "tinfo", None)
-        if obj_tinfo is None:
+        if obj_tinfo is None or tinfo is None:
             return tinfo
-        if self._is_structure_like_tinfo(obj_tinfo) and not self._is_structure_like_tinfo(tinfo):
+        if self._is_unknown_tinfo(tinfo) and self._is_structure_like_tinfo(obj_tinfo):
+            # The ctree could not tell us the member's type; fall back to the
+            # scanned object's structure-like type.
             return obj_tinfo
         return tinfo
 
@@ -331,8 +332,8 @@ class ScanVisitor(ObjectVisitor):
     def _infer_data_object_tinfo(
         self,
         obj_ea: int,
-        current_tinfo: Optional[ida_typeinf.tinfo_t],
-    ) -> Optional[ida_typeinf.tinfo_t]:
+        current_tinfo: ida_typeinf.tinfo_t | None,
+    ) -> ida_typeinf.tinfo_t | None:
         if not self._is_unknown_tinfo(current_tinfo):
             return current_tinfo
 
@@ -407,8 +408,8 @@ class ScanVisitor(ObjectVisitor):
         offset: int,
         cexpr: ida_hexrays.cexpr_t,
         obj: ScanObject,
-        tinfo: Optional[ida_typeinf.tinfo_t],
-        obj_ea: Optional[int] = None,
+        tinfo: ida_typeinf.tinfo_t | None,
+        obj_ea: int | None = None,
     ):
         """Build a structure member from the expression/type context."""
         offset += self._callee_base_offset
@@ -462,6 +463,16 @@ class ScanVisitor(ObjectVisitor):
         if first_parent is None:
             return self._extract_member(cexpr, obj, 0, context)
 
+        if first_parent.op == getattr(ctype, "memptr", None):
+            # `obj->member` — typed structure dereference. The member offset
+            # is the memptr delta itself; outer add/idx nodes operate on the
+            # member value and are resolved by `_extract_member` (which
+            # consumes add/idx wrappers ahead of casts).
+            offset = first_parent.m
+            cexpr = first_parent
+            context.pop_front()
+            return self._extract_member(cexpr, obj, offset, context)
+
         if first_parent.op in (ctype.idx, ctype.add):
             # `expr[idx]`
             # `(TYPE*) + x`
@@ -499,6 +510,10 @@ class ScanVisitor(ObjectVisitor):
         )
 
         first_parent = context.expr_at(0)
+        if first_parent is not None and first_parent.op == ctype.memptr:
+            # `obj->member` outside an explicit pointer context (plain value
+            # read). The member offset is the memptr delta.
+            return self._extract_member(first_parent, obj, first_parent.m, context)
         if context.op_at(0) == ctype.add and first_parent is not None:
             other = first_parent.theother(cexpr)
             if other.op != ctype.num:
@@ -553,6 +568,21 @@ class ScanVisitor(ObjectVisitor):
                     )
 
         has_explicit_tinfo = False
+        if (
+            context.op_at(0) in (ctype.add, ctype.idx, getattr(ctype, "memptr", None))
+            and context.op_at(1) == ctype.cast
+            and context.expr_at(0) is not None
+            and context.expr_at(1) is not None
+        ):
+            # `(TYPE)obj->member[+k]` — in typed functions the struct deref
+            # rides under add/idx ahead of the cast; the cast carries the
+            # member's expression type. Peel the wrapper so the cast branch
+            # below can consume the type.
+            tinfo = context.expr_at(1).type
+            has_explicit_tinfo = True
+            cexpr = context.expr_at(0)
+            context.pop_front()
+
         if context.op_at(0) == ctype.cast and context.expr_at(0) is not None:
             # `(TYPE)expr`
             tinfo = context.expr_at(0).type
@@ -584,13 +614,12 @@ class ScanVisitor(ObjectVisitor):
                 if second_expr.x == first_expr:
                     # `*((TYPE*)expr + x) = ...`
                     obj_ea = self._extract_obj_ea(second_expr.y)
-                    log_debug(f"pointer assignment to object")
+                    log_debug("pointer assignment to object")
                     return self._get_member(offset, cexpr, obj, second_expr.y.type, obj_ea)
-                else:
-                    # `*(TYPE*)expr = ...`
-                    log_debug(f"cast assignment to object")
-                    return self._get_member(offset, cexpr, obj, second_expr.x.type)
-            elif context.op_at(1) == ctype.call and second_expr is not None and first_expr is not None:
+                # `*(TYPE*)expr = ...`
+                log_debug("cast assignment to object")
+                return self._get_member(offset, cexpr, obj, second_expr.x.type)
+            if context.op_at(1) == ctype.call and second_expr is not None and first_expr is not None:
                 log_debug(f"pointer passed as argument to function at {hex(second_expr.ea)}")
                 if second_expr.x == first_expr:
                     # ((void (__some_call*)(..., expr[idx], ...)
@@ -615,7 +644,7 @@ class ScanVisitor(ObjectVisitor):
 
         if context.op_at(0) == ctype.asg and context.expr_at(0) is not None:
             # `TYPE parent.x = expr(...);`
-            log_debug(f"assignment to object")
+            log_debug("assignment to object")
             assignment_parent = context.expr_at(0)
             if assignment_parent.x == cexpr:
                 tinfo = assignment_parent.x.type
@@ -624,7 +653,7 @@ class ScanVisitor(ObjectVisitor):
         return self._get_member(offset, cexpr, obj, self._deref_tinfo(tinfo))
 
     @staticmethod
-    def _deref_tinfo(tinfo: ida_typeinf.tinfo_t) -> Optional[ida_typeinf.tinfo_t]:
+    def _deref_tinfo(tinfo: ida_typeinf.tinfo_t) -> ida_typeinf.tinfo_t | None:
         """
         Get the pointed object from a pointer tinfo.
 
@@ -653,7 +682,7 @@ class ScanVisitor(ObjectVisitor):
         return None  # Turns into VoidMember
 
     @staticmethod
-    def _extract_obj_ea(cexpr: ida_hexrays.cexpr_t) -> Optional[int]:
+    def _extract_obj_ea(cexpr: ida_hexrays.cexpr_t) -> int | None:
         """
         Extracts the effective address of an object from a cexpr.
 
@@ -666,16 +695,15 @@ class ScanVisitor(ObjectVisitor):
         ):
             cexpr = cexpr.x
 
-        if cexpr is not None and cexpr.op == ctype.obj:
-            if cexpr.obj_ea != idaapi.BADADDR:
-                return cexpr.obj_ea
+        if cexpr is not None and cexpr.op == ctype.obj and cexpr.obj_ea != idaapi.BADADDR:
+            return cexpr.obj_ea
 
     def _parse_call(
         self,
         call_cexpr: ida_hexrays.cexpr_t,
         arg_cexpr: ida_hexrays.cexpr_t,
-        fallback_tinfo: Optional[ida_typeinf.tinfo_t] = None,
-    ) -> Optional[ida_typeinf.tinfo_t]:
+        fallback_tinfo: ida_typeinf.tinfo_t | None = None,
+    ) -> ida_typeinf.tinfo_t | None:
         """Infer the argument type used at a call site."""
         idx, tinfo = get_func_argument_info(call_cexpr, arg_cexpr)
         argument_context = self._describe_call_argument(idx, call_cexpr)
