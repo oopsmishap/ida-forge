@@ -918,3 +918,268 @@ def test_new_deep_scan_visitor_initializes_recursive_state(monkeypatch):
     assert visitor._origin == 0x10
     assert visitor._structure is structure
     assert visitor._new_for_visit == set()
+
+
+# ---------------------------------------------------------------------------
+# Child-scan member-rooted regressions (skip-gating on unmatchable anchors)
+# ---------------------------------------------------------------------------
+
+class _ScanT:
+    """tinfo double covering the member-creation probes."""
+
+    def __init__(self, name, pointed=None, size=4):
+        self._name = name
+        self._pointed = pointed
+        self._size = size
+
+    def clone(self):
+        return _ScanT(self._name, self._pointed, self._size)
+
+    def dstr(self):
+        return self._name
+
+    def is_ptr(self):
+        return self._pointed is not None
+
+    def get_pointed_object(self):
+        return self._pointed
+
+    def get_ptrarr_objsize(self):
+        return None if self._pointed is None else self._size
+
+    def is_udt(self):
+        return False
+
+    def is_array(self):
+        return False
+
+    def is_func(self):
+        return False
+
+    def is_funcptr(self):
+        return False
+
+    def is_void(self):
+        return False
+
+    def is_integral(self):
+        return False
+
+    def is_signed(self):
+        return False
+
+    def is_float(self):
+        return False
+
+    def is_floating(self):
+        return False
+
+    def clr_const(self):
+        return None
+
+    def equals_to(self, other):
+        return isinstance(other, _ScanT) and self.dstr() == other.dstr()
+
+    def get_size(self):
+        return self._size
+
+
+class _ScanNode:
+    def __init__(self, op, *, x=None, y=None, m=None, type=None, ea=-1, numval=None, obj_ea=-1):
+        self.op = op
+        self.x = x
+        self.y = y
+        self.m = m
+        self.type = type
+        self.ea = ea
+        self._numval = numval
+        self.obj_ea = obj_ea
+        self.a = []
+
+    def numval(self):
+        return self._numval
+
+    @property
+    def opname(self):
+        return f"op{self.op}"
+
+
+class _ScanParents(list):
+    def size(self):
+        return len(self)
+
+    def at(self, index):
+        return self[index]
+
+
+def _scan_wrap(node):
+    return SimpleNamespace(cexpr=node, ea=node.ea, op=node.op)
+
+
+def _drive_scan_visitor(visitor, nodes):
+    """Simulate pre-order visit_expr / post-order leave_expr traversal."""
+    parents = []
+    visitor.parent_expr = lambda: (parents[-1].cexpr if parents else None)
+    for node in nodes:
+        visitor.parents = _ScanParents(parents)
+        visitor.visit_expr(node)
+        parents.append(_scan_wrap(node))
+    for node in reversed(nodes):
+        parents.pop()
+        visitor.parents = _ScanParents(parents)
+        visitor.leave_expr(node)
+
+
+def _make_member_scan_harness(monkeypatch):
+    """Real scanner/visitor with the exact member-use ctree shape:
+    ``(const char *)(v2->u64_18 + 28)`` and ``*(_DWORD *)v2->u64_18``."""
+    import ida_typeinf
+
+    class _FakeParentee:
+        def __init__(self):
+            self.cv_flags = 0
+
+    monkeypatch.setattr(ida_hexrays, "ctree_parentee_t", _FakeParentee, raising=False)
+
+    def walker(cexpr, parents):
+        if getattr(cexpr, "ea", -1) != -1:
+            return cexpr.ea
+        for p in reversed(parents):
+            if getattr(p, "ea", -1) != -1:
+                return p.ea
+        return -1
+
+    # Must run BEFORE _load_scanner_module: the visitor binds these names at
+    # import time from the conftest stub module.
+    monkeypatch.setattr(hexrays_api, "find_expr_address", walker, raising=False)
+    monkeypatch.setattr(hexrays_api, "print_expr_address", lambda cexpr, parents: hex(getattr(cexpr, "ea", -1)), raising=False)
+    monkeypatch.setattr(hexrays_api, "is_legal_type", lambda *_a, **_k: True, raising=False)
+
+    class _TypesStub:
+        width = 8
+
+        def __getitem__(self, key):
+            return SimpleNamespace(type=_ScanT(key), ptr=_ScanT(f"{key} *", size=8), name=key)
+
+        @staticmethod
+        def convert_to_simple_type(t):
+            return t
+
+        @staticmethod
+        def get_ptr_tinfo():
+            return _ScanT("void *", size=8)
+
+    types_module = sys.modules.get("forge.api.types")
+    monkeypatch.setattr(types_module, "types", _TypesStub(), raising=False)
+    monkeypatch.setattr(ida_typeinf, "tinfo_t", lambda value=None: value.clone() if isinstance(value, _ScanT) else _ScanT("tmp"), raising=False)
+
+    scanner_module = _load_scanner_module()
+    ctype = scanner_module.ctype
+    if not hasattr(ctype, "asg"):
+        setattr(ctype, "asg", 13)
+
+    class _FakeParentee:
+        def __init__(self):
+            self.cv_flags = 0
+
+    monkeypatch.setattr(ida_hexrays, "ctree_parentee_t", _FakeParentee, raising=False)
+
+    class _TypesStub:
+        width = 8
+
+        def __getitem__(self, key):
+            return SimpleNamespace(type=_ScanT(key), ptr=_ScanT(f"{key} *", size=8), name=key)
+
+        @staticmethod
+        def convert_to_simple_type(t):
+            return t
+
+        @staticmethod
+        def get_ptr_tinfo():
+            return _ScanT("void *", size=8)
+
+    types_module = sys.modules.get("forge.api.types")
+    monkeypatch.setattr(types_module, "types", _TypesStub(), raising=False)
+    monkeypatch.setattr(ida_typeinf, "tinfo_t", lambda value=None: value.clone() if isinstance(value, _ScanT) else _ScanT("tmp"), raising=False)
+
+    test_ptr = _ScanT("test *", pointed=_ScanT("test", size=8), size=8)
+    char_ptr = _ScanT("char *", size=8)
+    dword_ptr = _ScanT("_DWORD *", pointed=_ScanT("_DWORD", size=4), size=8)
+    i64 = _ScanT("__int64", size=8)
+
+    var = _ScanNode(ctype.var, type=test_ptr)
+
+    memptr_str = _ScanNode(ctype.memptr, x=var, m=0x18, type=i64)
+    add28 = _ScanNode(ctype.add, x=memptr_str, y=_ScanNode(ctype.num, numval=28), type=char_ptr)
+    cast_str = _ScanNode(ctype.cast, x=add28, type=char_ptr)
+
+    memptr_dw = _ScanNode(ctype.memptr, x=var, m=0x18, type=i64)
+    cast_dw = _ScanNode(ctype.cast, x=memptr_dw, type=dword_ptr)
+    ptr_dw = _ScanNode(ctype.ptr, x=cast_dw, type=i64)
+
+    call = _ScanNode(ctype.call, x=_ScanNode(ctype.obj, obj_ea=0x1400019B0), type=_ScanT("void", size=0))
+    call.ea = 0x140001575
+    call.a = [SimpleNamespace(cexpr=cast_str), SimpleNamespace(cexpr=ptr_dw)]
+
+    nodes = [
+        call,
+        cast_str,
+        add28,
+        memptr_str,
+        ptr_dw,
+        cast_dw,
+        memptr_dw,
+    ]
+    return scanner_module, _ScanNode, ctype, test_ptr, nodes
+
+
+def _member_scan(monkeypatch, *, skip_until_object, seed_ea):
+    from forge.api.scan_object import StructureReferenceObject
+    from forge.api.structure import Structure
+
+    scanner_module, _ScanNode, ctype, test_ptr, nodes = _make_member_scan_harness(monkeypatch)
+
+    structure = Structure("Child")
+    obj = StructureReferenceObject("test", 0x18)
+    obj.ea = seed_ea
+    obj.func_ea = 0x1400014F0
+    obj.tinfo = None
+
+    cfunc = SimpleNamespace(entry_ea=0x1400014F0, argidx=(), body=SimpleNamespace())
+    visitor = scanner_module.NewDeepScanVisitor(
+        cfunc, 0x18, obj, structure, recurse_calls=True,
+        skip_until_object=skip_until_object,
+    )
+    _drive_scan_visitor(visitor, nodes)
+    return structure, visitor
+
+
+def test_member_rooted_scan_skip_gating_swallows_unmatchable_anchor(monkeypatch):
+    """Child-scan evidence anchors at instructions that never satisfy the
+    member matcher (var/assignment eas). Skip-gating used to silently swallow
+    the entire scan: zero members and no error."""
+    structure, visitor = _member_scan(monkeypatch, skip_until_object=True, seed_ea=0x1400014F4)
+
+    assert visitor._skip is True
+    assert structure.members == []
+
+
+def test_member_rooted_scan_with_skip_disabled_creates_members_from_stale_anchor(monkeypatch):
+    """The fix: member-rooted scans run body-wide (the matcher is precise),
+    so a stale anchor cannot gate out the whole function."""
+    structure, visitor = _member_scan(monkeypatch, skip_until_object=False, seed_ea=0x1400014F4)
+
+    assert visitor._skip is False
+    offsets = sorted(m.offset for m in structure.members)
+    assert 0x1C in offsets, f"expected the +28 member, got offsets {offsets}"
+    assert 0x00 in offsets, f"expected the +0 member, got offsets {offsets}"
+
+
+def test_member_rooted_scan_anchored_at_use_instruction_still_works(monkeypatch):
+    """Anchored evidence (memptr instruction ea) keeps working with defaults."""
+    structure, visitor = _member_scan(monkeypatch, skip_until_object=True, seed_ea=0x140001575)
+
+    assert visitor._skip is False  # cleared at the memptr use
+    offsets = sorted(m.offset for m in structure.members)
+    assert 0x00 in offsets, f"expected the +0 member, got offsets {offsets}"
+    assert 0x1C in offsets, f"expected the +28 member, got offsets {offsets}"

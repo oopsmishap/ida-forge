@@ -42,6 +42,36 @@ scout reports, 246-test run, official IDAPython docs cross-check).
   The lesson applies to any future config-key removal: grep all readers before
   dropping a default.
 
+### R7 Child scan on typed pointer members silently produced nothing — RESOLVED 2026-08-11
+
+- **Symptom**: "Unable to derive child structure scan results" when child
+  scanning `u64_10`/`u64_18` (members holding pointers, declared `__int64`).
+- **Root cause (live-reproduced on pure_c_struct_fixture via ida MCP)**: the
+  child-scan visitor is created with skip-until-object gating anchored at the
+  *evidence ea*. Real evidence anchors at the parent-scan instruction EAs
+  (var/asg instructions), and no node at those EAs ever satisfies the
+  `StructureReferenceObject` matcher (it only matches `memptr` nodes at the
+  member offset). `_skip` therefore never cleared: `_check_call` still spooled
+  callee visits (the observed `Add visit` + logger decompiles), but
+  `leave_expr` early-returned → zero members, zero member logs. The engine
+  itself was fine: evidence anchored at real memptr instruction EAs produced
+  the correct child struct (`0x0/0x4/0x8/0x10 _DWORD + 0x1C i8*`).
+- **Fix**: `NewDeepScanVisitor` gained `skip_until_object: bool = True`;
+  `_scan_evidence_in_function` passes `skip_until_object=False` — member-rooted
+  child scans run body-wide (the memptr matcher is precise, so whole-function
+  matching is safe and the anchor becomes irrelevant). Var-rooted deep scans
+  keep the skip.
+- **Tests**: 3 regressions in `test_scanner.py` (`_make_member_scan_harness`
+  drives the real visitor over the exact member-use ctree shape): gating
+  reproduces the silent failure, skip-disabled creates members from a stale
+  anchor, anchored runs still work.
+- **Related finding (open)**: parent scans of typed functions degrade — when a
+  struct is applied, member uses are `memptr` nodes and
+  `_extract_member_from_ptr` does not handle a `memptr` first parent, so
+  var-rooted deep scans collapse member offsets to 0 (`field_0` only). Fixing
+  the parent-scan memptr context is a follow-up (offset = `first_parent.m` +
+  surrounding add/idx analysis).
+
 ### Scan-log observations (2026-08-11, real deep scan) — candidates for later tiers
 
 - **Format-string/logger callee pollution**: deep scan descended into

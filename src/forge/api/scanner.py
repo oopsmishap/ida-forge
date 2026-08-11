@@ -735,6 +735,8 @@ class NewDeepScanVisitor(ScanVisitor, RecursiveDownwardsObjectVisitor):
         structure,
         recurse_calls: bool = False,
         max_depth: int | None = None,
+        skip_until_object: bool = True,
     ):
         super().__init__(cfunc, origin, obj, structure, recurse_calls=recurse_calls)
         self._max_depth = max_depth
+        self._skip = skip_until_object and self._skip

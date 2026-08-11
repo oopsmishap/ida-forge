@@ -1928,7 +1928,7 @@ def test_execute_child_scan_plan_enables_recursive_child_traversal(monkeypatch):
     )
 
     class FakeVisitor:
-        def __init__(self, cfunc, origin, obj, structure, recurse_calls=False):
+        def __init__(self, cfunc, origin, obj, structure, recurse_calls=False, skip_until_object=True):
             captured["args"] = (
                 cfunc.entry_ea,
                 origin,
@@ -1979,7 +1979,7 @@ def test_execute_child_scan_plan_runs_for_each_scan_location(monkeypatch):
     captured = []
 
     class FakeVisitor:
-        def __init__(self, cfunc, origin, obj, structure, recurse_calls=False):
+        def __init__(self, cfunc, origin, obj, structure, recurse_calls=False, skip_until_object=True):
             captured.append(
                 (
                     cfunc.entry_ea,
@@ -2035,7 +2035,7 @@ def test_execute_child_scan_plan_normalizes_legacy_scan_variables(monkeypatch):
     captured = {}
 
     class FakeVisitor:
-        def __init__(self, cfunc, origin, obj, structure, recurse_calls=False):
+        def __init__(self, cfunc, origin, obj, structure, recurse_calls=False, skip_until_object=True):
             captured["args"] = (
                 cfunc.entry_ea,
                 origin,
@@ -2085,7 +2085,7 @@ def test_execute_child_scan_plan_prefers_inferred_child_roots(monkeypatch):
     captured = {}
 
     class FakeVisitor:
-        def __init__(self, cfunc, origin, obj, structure, recurse_calls=False):
+        def __init__(self, cfunc, origin, obj, structure, recurse_calls=False, skip_until_object=True):
             captured["args"] = (
                 cfunc.entry_ea,
                 origin,
@@ -2187,7 +2187,7 @@ def test_scan_evidence_in_function_falls_back_to_seeded_root(monkeypatch):
     seen = []
 
     class FakeVisitor:
-        def __init__(self, cfunc, origin, obj, structure, recurse_calls=False):
+        def __init__(self, cfunc, origin, obj, structure, recurse_calls=False, skip_until_object=True):
             seen.append((cfunc, origin, obj, structure, recurse_calls))
 
         def process(self):
@@ -2504,7 +2504,7 @@ def test_execute_child_scan_plan_falls_back_to_seeded_member_when_inference_fail
     captured = {}
 
     class FakeVisitor:
-        def __init__(self, cfunc, origin, obj, structure, recurse_calls=False):
+        def __init__(self, cfunc, origin, obj, structure, recurse_calls=False, skip_until_object=True):
             captured["args"] = (
                 cfunc.entry_ea,
                 origin,

@@ -904,6 +904,7 @@ class ChildScanMixin:
                     root,
                     child_structure,
                     recurse_calls=True,
+                    skip_until_object=False,
                 )
                 visitor.process()
                 scanned_any = True
