@@ -423,6 +423,138 @@ def test_update_structure_fields_disabled_state_paints_all_columns(monkeypatch):
         )
 
 
+def test_update_structure_fields_collision_state_paints_all_columns(monkeypatch):
+    """Colliding members must paint every column with the collision palette.
+
+    Regression: the dark-theme rework (b04c129) removed
+    ``collision_foreground_color`` from the config defaults while
+    ``update_structure_fields`` kept reading it, so the first collision row
+    crashed with ``KeyError: 'collision_foreground_color'`` at
+    ``QColor(config["form"]["collision_foreground_color"])``.
+    """
+    structure_form = _make_form(monkeypatch)
+    captured = []
+
+    class _FakeItem:
+        def __init__(self, text):
+            self.text = text
+            self.background = None
+            self.foreground = None
+
+        def setFlags(self, _flags):
+            pass
+
+        def setBackground(self, color):
+            self.background = color
+
+        def setForeground(self, color):
+            self.foreground = color
+
+    class _FakeTable:
+        def __init__(self):
+            self._items = {}
+            self.column_count = 5
+
+        def columnCount(self):
+            return self.column_count
+
+        def rowCount(self):
+            return 2
+
+        def setRowCount(self, _n):
+            self._items.clear()
+
+        def setItem(self, row, col, item):
+            captured.append((row, col, item))
+            self._items[(row, col)] = item
+
+        def item(self, row, col):
+            return self._items.get((row, col))
+
+        def setEnabled(self, _v):
+            pass
+
+        def setDisabled(self, _v):
+            pass
+
+        def clearSelection(self):
+            pass
+
+        def selectRow(self, _row):
+            pass
+
+        def setRangeSelected(self, *_args, **_kwargs):
+            pass
+
+        def setCurrentCell(self, *_args, **_kwargs):
+            pass
+
+        def verticalScrollBar(self):
+            return SimpleNamespace(value=lambda: 0, setValue=lambda _v: None)
+
+    table = _FakeTable()
+    structure_form.ui = SimpleNamespace(
+        tbl_structure=table,
+        input_name=SimpleNamespace(setText=lambda _t: None),
+    )
+
+    # Two enabled members overlapping at offset 0x0 -> collision.
+    class _FakeMember(SimpleNamespace):
+        def __lt__(self, other):
+            return (self.offset, self.name) < (other.offset, other.name)
+
+    structure = Structure("collision_check")
+    structure.add_member(
+        _FakeMember(
+            offset=0x0,
+            size=8,
+            name="field_a",
+            type_name="u64",
+            score=0,
+            comment="",
+            enabled=True,
+            is_array=False,
+        )
+    )
+    structure.add_member(
+        _FakeMember(
+            offset=0x0,
+            size=4,
+            name="field_b",
+            type_name="u32",
+            score=0,
+            comment="",
+            enabled=True,
+            is_array=False,
+        )
+    )
+    # Use a different main_offset so the origin highlight does not repaint.
+    structure.main_offset = 0x20
+    structure_form.current_structure = structure
+
+    monkeypatch.setattr(form_module, "QTableWidgetItem", _FakeItem)
+    monkeypatch.setattr(form_module, "QColor", lambda hexstr: hexstr)
+    monkeypatch.setattr(structure_form, "get_selected_rows", lambda: [])
+    monkeypatch.setattr(structure_form, "_restore_selected_rows", lambda _r: None)
+    monkeypatch.setattr(structure_form, "update_action_states", lambda: None)
+
+    form_module.StructureBuilderForm.update_structure_fields.__get__(structure_form)()
+
+    assert len(captured) == 10, (
+        f"expected 10 setItem calls (2 rows x 5 columns), got {len(captured)}"
+    )
+    for col in range(5):
+        for row in range(2):
+            item = table.item(row, col)
+            assert item is not None, f"row {row} column {col} has no item"
+            assert item.background == form_module.config["form"]["collision_background_color"], (
+                f"row {row} column {col} did not receive the collision background"
+            )
+            assert item.foreground == form_module.config["form"]["collision_foreground_color"], (
+                f"row {row} column {col} did not receive the collision foreground"
+            )
+
+
 def test_update_structure_fields_origin_cell_uses_disabled_palette_when_row_disabled(
     monkeypatch,
 ):

@@ -54,6 +54,44 @@ def test_config_contains_checks_declared_options_only(tmp_path, monkeypatch):
     assert "missing" not in config
 
 
+def test_config_forward_fills_missing_nested_form_keys(tmp_path, monkeypatch):
+    """A persisted file missing a newly added *nested* key must pick it up
+    on read and persist the merge.
+
+    Regression: the structure builder crashed with
+    ``KeyError: 'collision_foreground_color'`` when a legacy forge.toml
+    (or one written before the dark-theme rework) lacked the key, while the
+    key was also missing from the class defaults.
+    """
+    from forge.features.structure_builder.config import StructureBuilderConfig
+
+    monkeypatch.setattr("ida_diskio.get_user_idadir", lambda: str(tmp_path))
+    config_path = Path(tmp_path) / "cfg" / "forge.toml"
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    config_path.write_text(
+        '[StructureBuilder]\n'
+        'enabled = true\n'
+        '[StructureBuilder.form]\n'
+        'cell_background_color = "#2A2A2A"\n'
+        'cell_foreground_color = "#E0E0E0"\n'
+        'origin_color = "#006699"\n'
+        'origin_foreground_color = "#FFFFFF"\n'
+        'disabled_color = "#3D3D3D"\n'
+        'disabled_foreground_color = "#D0D0D0"\n'
+        'collision_background_color = "#CC4B4B"\n',
+        encoding="utf-8",
+    )
+
+    config = StructureBuilderConfig()
+
+    # The exact access that crashed in update_structure_fields.
+    assert config["form"]["collision_foreground_color"] == "#F0DB2B"
+
+    # The merge must have been written back to disk.
+    data = toml.loads(config_path.read_text(encoding="utf-8"))
+    assert data["StructureBuilder"]["form"]["collision_foreground_color"] == "#F0DB2B"
+
+
 def test_config_recovers_from_malformed_toml(tmp_path, monkeypatch):
     monkeypatch.setattr("ida_diskio.get_user_idadir", lambda: str(tmp_path))
     config_path = Path(tmp_path) / "cfg" / "forge.toml"

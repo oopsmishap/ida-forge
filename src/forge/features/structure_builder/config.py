@@ -18,6 +18,10 @@ class StructureBuilderConfig(ForgeConfig):
             "disabled_color": "#3D3D3D",
             "disabled_foreground_color": "#D0D0D0",
             "collision_background_color": "#CC4B4B",
+            # Restored 2026-08-11: the dark-theme rework (b04c129) dropped
+            # this key from the defaults while form.py still reads it, so any
+            # collision row crashed update_structure_fields with KeyError.
+            "collision_foreground_color": "#F0DB2B",
         },
     }
 
