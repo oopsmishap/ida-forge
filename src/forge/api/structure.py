@@ -597,6 +597,28 @@ class Structure:
         return None
 
     @staticmethod
+    def _declaration_parses(cdecl: str) -> bool:
+        """True when ``cdecl`` parses as a C type declaration.
+
+        Used to gate the destructive overwrite path in :meth:`set_cdecl`.
+        ``parse_decl`` returns the declared name on success and ``None`` on
+        failure (``PT_SIL`` keeps IDA quiet about malformed edits).
+        """
+        if not cdecl:
+            return False
+        try:
+            out_tif = ida_typeinf.tinfo_t()
+            parsed_name = ida_typeinf.parse_decl(
+                out_tif,
+                ida_typeinf.get_idati(),
+                cdecl,
+                ida_typeinf.PT_TYP | ida_typeinf.PT_SIL,
+            )
+        except Exception:  # noqa: BLE001 — version/format tolerance
+            return False
+        return parsed_name is not None
+
+    @staticmethod
     def _load_named_type(name: str) -> ida_typeinf.tinfo_t | None:
         tinfo = ida_typeinf.tinfo_t()
         if tinfo.get_named_type(ida_typeinf.get_idati(), name):
@@ -646,6 +668,18 @@ class Structure:
         if reply != QtWidgets.QMessageBox.Yes:
             log_error(
                 f"Structure {structure_name} probably already exists. Please check manually.",
+                True,
+            )
+            return None
+
+        # The overwrite flow deletes the old type before creating the new
+        # one. Validate the edited declaration first so a malformed edit
+        # cannot destroy the existing type (the DB would end up with no
+        # type at all — which silently breaks child scans on the parent).
+        if not self._declaration_parses(cdecl):
+            log_error(
+                "The edited declaration could not be parsed; "
+                f"the existing type {structure_name} was kept.",
                 True,
             )
             return None

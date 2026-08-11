@@ -73,7 +73,7 @@ class _DummyTInfo:
         return True
 
     def get_named_type(self, *args, **kwargs):
-        return False
+        return True
 
     def dstr(self):
         return self._name
@@ -143,6 +143,7 @@ _stub_module(
     PT_TYP=0,
     PT_SIL=0,
     BADSIZE=-1,
+    NTF_TYPE=0,
     STRMEM_OFFSET=0,
     cvar=types.SimpleNamespace(idati=object()),
 )

@@ -2004,6 +2004,58 @@ def test_execute_child_scan_plan_runs_for_each_scan_location(monkeypatch):
     ]
 
 
+def test_build_child_scan_plan_warns_when_parent_type_missing_from_idb(monkeypatch):
+    """A form-only parent structure (missing IDB type) used to fail with a
+    silent 'Unable to derive child structure scan results'. The plan builder
+    now fails fast with an actionable warning."""
+    structure_form = _make_form(monkeypatch)
+    parent = structure_form.create_structure("Parent")
+    member = _FakeMember(0x30, 8, type_name="Child *", name="child_ptr")
+    member.tinfo = SimpleNamespace(is_ptr=lambda: True, is_udt=lambda: False)
+    member.scanned_variables = [
+        SimpleNamespace(func_ea=0x401000, ea=0x402000, name="root_a", _name="TypeA"),
+    ]
+    structure_form.current_structure = parent
+    monkeypatch.setattr(form_module, "is_legal_type", lambda _tinfo: True)
+
+    warnings = []
+    monkeypatch.setattr(
+        child_scan_module.ChildScanMixin, "_parent_type_exists_in_idb",
+        staticmethod(lambda name: False),
+    )
+    monkeypatch.setattr(child_scan_module, "log_warning",
+                        lambda message, *_a, **_k: warnings.append(message), raising=False)
+
+    plan = structure_form._build_child_scan_plan(member, show_warnings=True)
+
+    assert plan is None
+    assert any("not defined in the IDB" in w for w in warnings), warnings
+
+
+def test_parent_type_exists_in_idb_queries_the_type_table(monkeypatch):
+    structure_form = _make_form(monkeypatch)
+
+    monkeypatch.setattr(
+        child_scan_module.ida_typeinf.tinfo_t,
+        "get_named_type",
+        lambda self, _idati, _name, _flags=0: True,
+        raising=False,
+    )
+    assert (
+        structure_form._parent_type_exists_in_idb("Parent") is True
+    )
+
+    monkeypatch.setattr(
+        child_scan_module.ida_typeinf.tinfo_t,
+        "get_named_type",
+        lambda self, _idati, _name, _flags=0: False,
+        raising=False,
+    )
+    assert (
+        structure_form._parent_type_exists_in_idb("Parent") is False
+    )
+
+
 def test_execute_child_scan_plan_normalizes_legacy_scan_variables(monkeypatch):
     structure_form = _make_form(monkeypatch)
     child = structure_form.create_structure("Child")

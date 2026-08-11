@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from types import SimpleNamespace
 
 import ida_hexrays
+import ida_typeinf
 import idaapi
 
 from forge.api import hexrays as hexrays_api
@@ -92,6 +93,23 @@ def _get_funcs_calling_address(ea: int) -> set[int]:
 
 
 class ChildScanMixin:
+    @staticmethod
+    def _parent_type_exists_in_idb(parent_struct_name: str) -> bool:
+        """True when ``parent_struct_name`` resolves in the IDB type table.
+
+        Child scanning matches ``memptr``/``memref`` nodes, which the
+        decompiler only emits for structures defined in the IDB. Checking up
+        front turns the silent "no results" case into an actionable warning.
+        """
+        if not parent_struct_name:
+            return False
+        try:
+            tinfo = ida_typeinf.tinfo_t()
+            return tinfo.get_named_type(
+                ida_typeinf.get_idati(), parent_struct_name, ida_typeinf.NTF_TYPE
+            )
+        except Exception:  # noqa: BLE001 — wait for the IDB to be fully loaded
+            return False
     @staticmethod
     def _warn_unimplemented(action_name: str) -> None:
         log_warning(f"{action_name} is not implemented yet.", True)
@@ -772,6 +790,21 @@ class ChildScanMixin:
                 return None
             parent_struct_name = parent_struct_names[0]
             scan_object = type(scan_object)(parent_struct_name, member.offset)
+
+        # The child scan matches member-access (memptr) nodes in the
+        # decompilation, which only exist when the parent structure is defined
+        # in the IDB type table. A form-only structure (e.g. after the IDA type
+        # was deleted) decompiles to raw integer arithmetic that no matcher can
+        # recover — fail fast with an actionable reason instead of silently
+        # producing "Unable to derive child structure scan results".
+        if not self._parent_type_exists_in_idb(parent_struct_name):
+            warn(
+                "The parent structure type "
+                f"'{parent_struct_name}' is not defined in the IDB. "
+                "Create the type first (Create Type on the parent), "
+                "then retry the child scan.",
+            )
+            return None
 
         function_eas = tuple(
             sorted(
