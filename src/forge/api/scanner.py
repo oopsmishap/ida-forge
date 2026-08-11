@@ -15,7 +15,6 @@ from forge.api.hexrays import (
     decompile,
     find_expr_address,
     get_func_argument_info,
-    get_funcs_calling_address,
     is_code,
     is_legal_type,
     to_hex,
@@ -739,31 +738,3 @@ class NewDeepScanVisitor(ScanVisitor, RecursiveDownwardsObjectVisitor):
     ):
         super().__init__(cfunc, origin, obj, structure, recurse_calls=recurse_calls)
         self._max_depth = max_depth
-
-
-class DeepScanReturnVisitor(NewDeepScanVisitor):
-    def __init__(self, cfunc: ida_hexrays.cfunc_t, origin: int, obj: ScanObject, structure):
-        super().__init__(cfunc, origin, obj, structure)
-        self._callers_ea = get_funcs_calling_address(cfunc.entry_ea)
-        self._call_obj = obj
-
-    def _start(self):
-        for ea in self._callers_ea:
-            self._add_scan_tree_info(ea, -1)
-        assert self._prepare_scanner()
-
-    def _finish(self):
-        if self._prepare_scanner():
-            self._recursive_process()
-
-    def _prepare_scanner(self):
-        try:
-            cfunc = next(self._iter_callers())
-        except StopIteration:
-            return False
-
-    def _iter_callers(self):
-        for ea in self._callers_ea:
-            cfunc = decompile(ea)
-            if cfunc:
-                yield cfunc

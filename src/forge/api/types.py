@@ -7,14 +7,15 @@ import ida_typeinf
 
 from forge.api.config import ForgeConfig
 from forge.util.util import DocIntEnum
-from forge.util.logging import log_debug, log_error
+from forge.util.logging import log_debug, log_error, log_warning
 
-
-# leimurr — Today at 5:11 PM
-# watch out with anything that "caches" tinfo_t objects; I used to do things like that in my project, but I found that
-# IDA would invalidate existing tinfo_t objects any time I created new ones. if you use this code further, and you get
-# issues where the types coming out of the cache are invalid, something like that is probably happening
-
+# Design note: this module never caches live ``tinfo_t`` objects.
+# IDA invalidates existing ``tinfo_t`` handles whenever new types are created
+# (a known footgun — the original implementation cached derived handles here and
+# they went stale mid-session), and this plugin creates types constantly
+# (create_type / set_cdecl / save_tinfo). Only the *descriptors* of canonical
+# types (typedef name, ordinal, fallback enum) are cached; every access builds
+# fresh handles from the IDB, so results always reflect the current type table.
 
 
 class TypesConfig(ForgeConfig):
@@ -41,12 +42,34 @@ class TypesConfig(ForgeConfig):
 
 @dataclass
 class Type:
+    """Canonical type plus its common variations.
+
+    Instances are built on demand and must not be stored beyond the immediate
+    operation they were requested for: the ``tinfo_t`` members are only valid
+    until the next type-table mutation.
+    """
+
     name: str
     type: ida_typeinf.tinfo_t
     ptr: ida_typeinf.tinfo_t
     const: ida_typeinf.tinfo_t
     const_ptr: ida_typeinf.tinfo_t
     ordinal: int
+
+
+@dataclass(frozen=True)
+class _TypeEntry:
+    """Persistent descriptor for a canonical type.
+
+    ``typedef_name`` is the named IDA type to load (empty when the type is only
+    representable via ``type_enum``); ``save`` records whether the typedef was
+    committed to the IDB. ``func_t`` is special-cased in :meth:`Types._get_type`.
+    """
+
+    typedef_name: str
+    ordinal: int
+    type_enum: int
+    save: bool
 
 
 # noinspection PyPep8Naming, SpellCheckingInspection
@@ -65,13 +88,15 @@ class Types:
         self._idati = ida_typeinf.get_idati()
         self._type_width = self._get_ptr_width()
         assert self._type_width in (4, 8), f"Invalid pointer width: {self._type_width}"
-        self._type_cache: Dict[str, Type] = {}
+        self._type_cache: Dict[str, _TypeEntry] = {}
 
         self._load_types()
-        self._create_dummy_func()
 
-        for k, v in self._type_cache.items():
-            log_debug(f"{k}: {v.type}, {v.ptr}, {v.const}, {v.const_ptr}")
+        for name, entry in self._type_cache.items():
+            log_debug(
+                f"{name}: typedef={entry.typedef_name}, ordinal={entry.ordinal}, "
+                f"enum={entry.type_enum}, save={entry.save}"
+            )
 
     @property
     def width(self):
@@ -79,12 +104,13 @@ class Types:
 
     def _save_or_load_typedef_to_idb(
         self, name: str, type_enum: int
-    ) -> Tuple[ida_typeinf.tinfo_t, int]:
+    ) -> int:
         """
         Save a type to the IDB, or load it from the IDB if it already exists.
+
         :param name: The name of the type.
         :param type_enum: The enum value of the type.
-        :return: The type info object.
+        :return: The ordinal of the type in the IDB.
         """
         # Check if the type already exists in the IDB
         named_type = ida_typeinf.get_named_type(
@@ -100,61 +126,49 @@ class Types:
                 )
                 != tinfo_code.TERR_OK
             ):
-                raise RuntimeError(f"Failed to save type '{name}' to IDB")
+                # Some IDB states refuse names that alias IDA builtins (e.g.
+                # "u8" -> unsigned __int8). This is not fatal: the enum-based
+                # (ordinal 0) entry yields the same underlying type.
+                log_warning(
+                    f"Failed to save type '{name}' to IDB; "
+                    "falling back to the built-in type"
+                )
+                return 0
 
             named_type = ida_typeinf.get_named_type(
                 self._idati, self._typedefs[name], ida_typeinf.NTF_TYPE
             )
 
-        # Load the type from the IDB into a tinfo_t object
-        out_type = ida_typeinf.tinfo_t()
-        if out_type.get_numbered_type(self._idati, named_type[6]):
-            # Return the tinfo_t object and the ordinal
-            return out_type, named_type[6]
-        else:
-            # Return a new tinfo_t object if the type could not be loaded
-            return ida_typeinf.tinfo_t(type_enum), 0
+        if named_type is None:
+            log_warning(f"Type '{name}' could not be located after save; using ordinal 0")
+            return 0
+
+        # The tuple returned by get_named_type carries the type ordinal at [6]
+        return named_type[6]
 
     def _add_type_to_cache(self, name: str, type_enum: int, save: bool = True) -> None:
         """
-        Add a type to the type cache, along with its variations (pointer, const, const pointer).
+        Register a canonical type descriptor.
 
         :param name: The name of the type.
         :param type_enum: The enum value of the type.
         """
-        # Create the base type and add it to the type cache
         if save:
-            type_def, ordinal = self._save_or_load_typedef_to_idb(name, type_enum)
+            ordinal = self._save_or_load_typedef_to_idb(name, type_enum)
         else:
-            type_def = ida_typeinf.tinfo_t(type_enum)
             ordinal = 0
 
-        # Create a pointer variation of the type
-        type_def_ptr = ida_typeinf.tinfo_t()
-        type_def_ptr.create_ptr(type_def)
+        self._type_cache[name] = _TypeEntry(name, ordinal, type_enum, save)
 
-        # Create a const variation of the type
-        type_def_const = ida_typeinf.tinfo_t(type_def)
-        type_def_const.set_const()
-
-        # Create a const pointer variation of the type
-        type_def_const_ptr = ida_typeinf.tinfo_t()
-        type_def_const_ptr.create_ptr(type_def_const)
-
-        # Add the type to the type cache
-        self._type_cache[name] = Type(
-            name, type_def, type_def_ptr, type_def_const, type_def_const_ptr, ordinal
-        )
-
-    def _create_dummy_func(self):
+    def _build_func_type(self) -> Type:
+        """Build a fresh ``func_t`` placeholder type (no arguments, unknown cc)."""
         func_data = ida_typeinf.func_type_data_t()
-        func_data.rettype = self._type_cache["void"].ptr
+        func_data.rettype = self._get_type("void").ptr
         func_data.cc = ida_typeinf.CM_CC_UNKNOWN
         dummy_func = ida_typeinf.tinfo_t()
         dummy_func.create_func(func_data, ida_typeinf.BT_FUNC)
 
-        func = Type("func_t", dummy_func, dummy_func, dummy_func, dummy_func, 0)
-        self._type_cache["func_t"] = func
+        return Type("func_t", dummy_func, dummy_func, dummy_func, dummy_func, 0)
 
     def _load_types(self) -> None:
         """
@@ -184,6 +198,51 @@ class Types:
             ida_typeinf.BTF_UINT32 if self._type_width == 4 else ida_typeinf.BTF_UINT64,
         )
         # TODO: add any more types that are needed
+
+    def _load_base_tinfo(self, entry: _TypeEntry) -> ida_typeinf.tinfo_t:
+        """Return a fresh ``tinfo_t`` for a canonical type descriptor.
+
+        Prefers the committed typedef so user redefinitions are honored;
+        falls back to the enum constant when the typedef is missing.
+        """
+        if entry.save and entry.typedef_name:
+            resolved = ida_typeinf.tinfo_t()
+            if resolved.get_named_type(self._idati, entry.typedef_name):
+                return resolved
+
+        return ida_typeinf.tinfo_t(entry.type_enum)
+
+    def _base_type_of(self, name: str) -> ida_typeinf.tinfo_t:
+        """Return a fresh base ``tinfo_t`` for a canonical type name."""
+        if name == "func_t":
+            return self._build_func_type().type
+        return self._load_base_tinfo(self._type_cache[name])
+
+    def _get_type(self, name: str) -> Type:
+        """Build a fresh :class:`Type` with all variations for ``name``.
+
+        Every access re-loads the base type from the IDB so the returned
+        ``tinfo_t`` handles reflect the current type table — never cached.
+        """
+        if name == "func_t":
+            return self._build_func_type()
+
+        entry = self._type_cache[name]
+        base_type = self._load_base_tinfo(entry)
+
+        # Create a pointer variation of the type
+        type_def_ptr = ida_typeinf.tinfo_t()
+        type_def_ptr.create_ptr(base_type)
+
+        # Create a const variation of the type
+        type_def_const = ida_typeinf.tinfo_t(base_type)
+        type_def_const.set_const()
+
+        # Create a const pointer variation of the type
+        type_def_const_ptr = ida_typeinf.tinfo_t()
+        type_def_const_ptr.create_ptr(type_def_const)
+
+        return Type(name, base_type, type_def_ptr, type_def_const, type_def_const_ptr, entry.ordinal)
 
     @staticmethod
     def _is_meaningful_type_shape(tinfo: ida_typeinf.tinfo_t) -> bool:
@@ -216,7 +275,7 @@ class Types:
             "size_t",
         )
         return any(
-            tinfo.equals_to(self._type_cache[name].type)
+            tinfo.equals_to(self._base_type_of(name))
             for name in scalar_names
             if name in self._type_cache
         )
@@ -265,23 +324,23 @@ class Types:
         if size in [1, 2, 4, 8, 16]:
             if work_type.is_integral():
                 return ida_typeinf.tinfo_t(
-                    self._type_cache[
+                    self._base_type_of(
                         f"{'i' if work_type.is_signed() else 'u'}{size * 8}"
-                    ].type
+                    )
                 )
             if work_type.is_float():
-                return ida_typeinf.tinfo_t(self._type_cache[f"f{size * 8}"].type)
+                return ida_typeinf.tinfo_t(self._base_type_of(f"f{size * 8}"))
 
         return work_type
 
     def get_ptr(self):
         return ida_typeinf.tinfo_t(self.get_ptr_type().ptr)
-        
+
     def get_ptr_type(self):
         if self.width == 8:
-            return self._type_cache["u64"]
+            return self._get_type("u64")
         elif self.width == 4:
-            return self._type_cache["u32"]
+            return self._get_type("u32")
         else:
             raise Exception("Unsupported architecture")
 
@@ -298,7 +357,7 @@ class Types:
         return width
 
     def __getitem__(self, item):
-        return self._type_cache[item]
+        return self._get_type(item)
 
     def __contains__(self, item):
         return item in self._type_cache

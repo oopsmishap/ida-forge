@@ -73,6 +73,11 @@ class FakeTinfo:
         self._name = f"{pointed.dstr()} *"
         return True
 
+    def set_const(self):
+        if not self._name.startswith("const "):
+            self._name = f"const {self._name}"
+        return True
+
     def is_array(self):
         return self._array
 
@@ -116,29 +121,45 @@ def _load_types_source_module():
     module.__file__ = str(types_path)
     sys.modules[module.__name__] = module
     exec(compile(trimmed_source, str(types_path), "exec"), module.__dict__)
+    module.ida_typeinf.NTF_TYPE = 0
     return module
 
+
+def _make_named_types():
+    return {
+        "bool": FakeTinfo("bool", size=1, integral=True),
+        "char": FakeTinfo("char", size=1, integral=True),
+        "u8": FakeTinfo("u8", size=1, integral=True),
+        "u16": FakeTinfo("u16", size=2, integral=True),
+        "u32": FakeTinfo("u32", size=4, integral=True),
+        "u64": FakeTinfo("u64", size=8, integral=True),
+        "u128": FakeTinfo("u128", size=16, integral=True),
+        "i8": FakeTinfo("i8", size=1, integral=True, signed=True),
+        "i16": FakeTinfo("i16", size=2, integral=True, signed=True),
+        "i32": FakeTinfo("i32", size=4, integral=True, signed=True),
+        "i64": FakeTinfo("i64", size=8, integral=True, signed=True),
+        "i128": FakeTinfo("i128", size=16, integral=True, signed=True),
+        "f32": FakeTinfo("f32", size=4, floating=True),
+        "f64": FakeTinfo("f64", size=8, floating=True),
+        "size_t": FakeTinfo("size_t", size=8, integral=True),
+    }
 
 
 def _make_types_helper(module):
     helper = module.Types.__new__(module.Types)
+    helper._idati = object()
+
+    named = _make_named_types()
     helper._type_cache = {
-        "bool": py_types.SimpleNamespace(type=FakeTinfo("bool", size=1, integral=True)),
-        "char": py_types.SimpleNamespace(type=FakeTinfo("char", size=1, integral=True)),
-        "u8": py_types.SimpleNamespace(type=FakeTinfo("u8", size=1, integral=True)),
-        "u16": py_types.SimpleNamespace(type=FakeTinfo("u16", size=2, integral=True)),
-        "u32": py_types.SimpleNamespace(type=FakeTinfo("u32", size=4, integral=True)),
-        "u64": py_types.SimpleNamespace(type=FakeTinfo("u64", size=8, integral=True)),
-        "u128": py_types.SimpleNamespace(type=FakeTinfo("u128", size=16, integral=True)),
-        "i8": py_types.SimpleNamespace(type=FakeTinfo("i8", size=1, integral=True, signed=True)),
-        "i16": py_types.SimpleNamespace(type=FakeTinfo("i16", size=2, integral=True, signed=True)),
-        "i32": py_types.SimpleNamespace(type=FakeTinfo("i32", size=4, integral=True, signed=True)),
-        "i64": py_types.SimpleNamespace(type=FakeTinfo("i64", size=8, integral=True, signed=True)),
-        "i128": py_types.SimpleNamespace(type=FakeTinfo("i128", size=16, integral=True, signed=True)),
-        "f32": py_types.SimpleNamespace(type=FakeTinfo("f32", size=4, floating=True)),
-        "f64": py_types.SimpleNamespace(type=FakeTinfo("f64", size=8, floating=True)),
-        "size_t": py_types.SimpleNamespace(type=FakeTinfo("size_t", size=8, integral=True)),
+        name: module._TypeEntry(name, 0, 0, False) for name in named
     }
+
+    def _load_base_tinfo(entry):
+        return named[entry.typedef_name].clone()
+
+    helper._load_base_tinfo = _load_base_tinfo
+    helper._named = named
+
     module.ida_typeinf.tinfo_t = lambda value=None: value.clone() if isinstance(value, FakeTinfo) else FakeTinfo("tmp", size=0)
     return helper
 
@@ -192,6 +213,51 @@ def test_convert_to_simple_type_preserves_meaningful_shapes():
 
 
 
+def test_save_failure_falls_back_to_ordinal_zero(monkeypatch):
+    """Named-type commit failures (builtin-alias conflicts, unsynced til) must
+    not abort plugin init; the enum-based entry yields the same underlying type."""
+    types_module = _load_types_source_module()
+    helper = _make_types_helper(types_module)
+    helper._typedefs = {"u8": "u8"}
+
+    monkeypatch.setattr(types_module.ida_typeinf, "get_named_type", lambda *a, **k: None, raising=False)
+    monkeypatch.setattr(types_module.ida_typeinf, "save_tinfo", lambda *a, **k: -1, raising=False)
+
+    assert helper._save_or_load_typedef_to_idb("u8", 1) == 0
+
+
+def test_save_success_returns_stored_ordinal(monkeypatch):
+    types_module = _load_types_source_module()
+    helper = _make_types_helper(types_module)
+    helper._typedefs = {"u8": "u8"}
+
+    calls = {"n": 0}
+
+    def get_named_type(*a, **k):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return None  # not yet saved
+        return (1, b"u8", None, None, None, 0, 42)
+
+    monkeypatch.setattr(types_module.ida_typeinf, "get_named_type", get_named_type, raising=False)
+    monkeypatch.setattr(types_module.ida_typeinf, "save_tinfo", lambda *a, **k: 0, raising=False)
+
+    assert helper._save_or_load_typedef_to_idb("u8", 1) == 42
+    assert calls["n"] == 2
+
+
+def test_load_miss_after_save_returns_ordinal_zero(monkeypatch):
+    """Even a successful save whose lookup then misses degrades gracefully."""
+    types_module = _load_types_source_module()
+    helper = _make_types_helper(types_module)
+    helper._typedefs = {"u8": "u8"}
+
+    monkeypatch.setattr(types_module.ida_typeinf, "get_named_type", lambda *a, **k: None, raising=False)
+    monkeypatch.setattr(types_module.ida_typeinf, "save_tinfo", lambda *a, **k: 0, raising=False)
+
+    assert helper._save_or_load_typedef_to_idb("u8", 1) == 0
+
+
 def test_convert_to_simple_type_canonicalizes_scalar_alias_pointers():
     types_module = _load_types_source_module()
     helper = _make_types_helper(types_module)
@@ -204,3 +270,54 @@ def test_convert_to_simple_type_canonicalizes_scalar_alias_pointers():
     assert result.dstr() == "u64 *"
     assert result.is_ptr() is True
     assert result.get_pointed_object().dstr() == "u64"
+
+
+
+def test_canonical_types_are_rebuilt_fresh_per_access():
+    """Regression: cached ``tinfo_t`` handles go stale when IDA creates new
+    types, so every access must rebuild from the type table."""
+    types_module = _load_types_source_module()
+    helper = _make_types_helper(types_module)
+
+    first = helper["u64"]
+    second = helper["u64"]
+
+    # Distinct objects every access — never a shared handle.
+    assert first is not second
+    assert first.type is not second.type
+    assert first.ptr is not second.ptr
+
+    # …but they must compare equal and carry the expected shape.
+    assert first.type.equals_to(second.type)
+    assert first.type.dstr() == "u64"
+    assert first.ptr.dstr() == "u64 *"
+    assert first.const.dstr() == "const u64"
+    assert first.const_ptr.dstr() == "const u64 *"
+    assert first.ordinal == 0
+
+
+
+def test_conversion_reflects_named_type_redefinition():
+    """Regression: when the named type is replaced mid-session (as IDA does on
+    re-analysis / type creation), canonicalization must use the NEW type."""
+    types_module = _load_types_source_module()
+    helper = _make_types_helper(types_module)
+    named = helper._named
+
+    aliased = FakeTinfo("unsigned __int64", size=8, integral=True, signed=False)
+    assert helper.convert_to_simple_type(aliased).dstr() == "u64"
+
+    # Simulate IDA re-creating the "u64" typedef with a new handle.
+    replacement = FakeTinfo("u64", size=8, integral=True)
+    named["u64"] = replacement
+
+    result = helper.convert_to_simple_type(
+        FakeTinfo("unsigned __int64", size=8, integral=True, signed=False)
+    )
+    assert result.dstr() == "u64"
+
+    # The freshly built type reflects the replacement, not a stale snapshot.
+    fresh = helper["u64"]
+    assert fresh.type.equals_to(replacement)
+    assert fresh.type is not replacement
+    assert fresh.type is not helper["u64"].type

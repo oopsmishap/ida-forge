@@ -56,6 +56,7 @@ def get_line(ctree: ida_hexrays.ctree_parentee_t, cfunc) -> str:
         if not p.is_expr():
             return ida_lines.tag_remove(p.print1(cfunc.__ref__()))
     log_warning("Parent instruction is not found")
+    return ""
 
 
 def get_ordinal(tinfo: ida_typeinf.tinfo_t):

@@ -5,7 +5,7 @@ import csv
 import io
 from dataclasses import dataclass
 from enum import IntEnum
-from typing import Dict, Optional
+from typing import Dict, Iterator, Optional
 
 import ida_hexrays
 import ida_kernwin

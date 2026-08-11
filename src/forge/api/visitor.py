@@ -51,11 +51,12 @@ class ObjectVisitor(ida_hexrays.ctree_parentee_t):
     def __manipulate(self, cexpr, obj):
         log_debug(f"Expression {cexpr.opname} at {print_expr_address(cexpr, self.parents)} Id - {getattr(obj, 'id', None)}")
 
-    def get_line(self) -> int:
+    def get_line(self) -> str:
         for p in reversed(self.parents):
             if not p.is_expr():
                 return idaapi.tag_remove(p.print1(self._cfunc.__ref__()))
-        AssertionError("Parent instruction is not found")
+        log_warning("Parent instruction is not found")
+        return ""
 
 
 class DownwardsObjectVisitor(ObjectVisitor):
