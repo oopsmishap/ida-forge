@@ -1435,8 +1435,13 @@ def guess_allocation(
 ) -> list:
     """Guess the allocation sites of a variable (heap/stack/global).
 
-    Runs the same ``GuessAllocationVisitor`` as the action over the chosen root
-    variable and returns its collected rows instead of showing a chooser.
+    Walks upward from the variable's occurrences through the function's
+    assignment graph until it reaches an allocator call (``malloc``, ``calloc``,
+    ``realloc``, ``new``/``operator new``, ...), a stack address or a global
+    reference. Roots that are parameters or otherwise never reassigned yield no
+    rows - scan a local that receives an allocator result instead. Runs the
+    same ``GuessAllocationVisitor`` as the action and returns its collected
+    rows instead of showing a chooser.
 
     Returns:
         list of ``{"ea": int, "var": str, "line": str, "kind": "HEAP"|"STACK"|"GLOBAL"}``.
