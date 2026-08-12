@@ -4,7 +4,6 @@ from forge.api import members
 from forge.util.cxx_to_c_name import demangled_name_to_c_str
 
 
-
 def test_normalize_type_declaration_rewrites_known_aliases():
     assert members.normalize_type_declaration("_DWORD *") == "u32 *"
     assert members.normalize_type_declaration("unsigned __int64") == "u64"
@@ -17,7 +16,6 @@ def test_parse_user_tinfo_uses_parse_decl_attempts_before_fallbacks(monkeypatch)
 
     def fake_parse_decl_attempt(declaration: str):
         attempts.append(declaration)
-        return None
 
     monkeypatch.setattr(members, "_parse_decl_attempt", fake_parse_decl_attempt)
     monkeypatch.setattr(members, "_parse_named_like_type", lambda declaration: sentinel)

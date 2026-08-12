@@ -183,10 +183,144 @@ public:
 
 private:
     Player *target_;
-    Enemy *next_; 
+    Enemy *next_;
     std::uint32_t aggressiveness_;
     std::uint32_t threat_;
     std::uint32_t patrol_index_;
+};
+
+// ---- expanded surface (2026-08): records, systems, collectibles -----
+
+struct Waypoint {
+    Vec3 pos;
+    float wait_seconds;
+    std::uint32_t flags;
+};
+
+struct PatrolRoute {
+    Waypoint waypoints[12];
+    std::uint32_t count;
+    std::uint32_t loop_index;
+};
+
+struct LeaderboardEntry {
+    Player *player;
+    std::uint32_t score;
+    std::uint32_t rank;
+};
+
+struct DialogLine {
+    const char *text;
+    const char *speaker;
+    std::uint32_t flags;
+};
+
+struct DialogNode {
+    DialogLine line;
+    DialogNode *options[4];
+    DialogNode *next;
+};
+
+template <class T>
+struct ArrayRef {
+    T *data;
+    std::size_t len;
+};
+
+class Renderable {
+public:
+    virtual ~Renderable();
+    virtual void render() const = 0;
+    std::uint32_t mesh_id() const;
+
+protected:
+    std::uint32_t mesh_id_ = 0;
+};
+
+class Collectible : public Entity, public Renderable {
+public:
+    Collectible(std::uint32_t id, const char *label, std::uint32_t value);
+    ~Collectible() override;
+
+    const char *kind() const override;
+    void tick(World &world) override;
+    int score() const override;
+    void render() const override;
+
+    std::uint32_t value() const;
+    const char *label() const;
+
+private:
+    const char *label_;
+    std::uint32_t value_;
+    std::uint32_t weight_;
+};
+
+class System {
+public:
+    virtual ~System();
+    virtual const char *name() const = 0;
+    virtual void update(World &world, float dt) = 0;
+};
+
+class PhysicsSystem final : public System {
+public:
+    ~PhysicsSystem() override;
+    const char *name() const override;
+    void update(World &world, float dt) override;
+
+private:
+    std::uint32_t steps_ = 0;
+    std::uint32_t collisions_ = 0;
+};
+
+class AISystem final : public System {
+public:
+    ~AISystem() override;
+    const char *name() const override;
+    void update(World &world, float dt) override;
+
+private:
+    std::uint32_t decisions_ = 0;
+    std::uint32_t path_recomputes_ = 0;
+};
+
+class RenderSystem final : public System {
+public:
+    ~RenderSystem() override;
+    const char *name() const override;
+    void update(World &world, float dt) override;
+
+private:
+    std::uint32_t frames_ = 0;
+    std::uint32_t draw_calls_ = 0;
+};
+
+class AudioSystem final : public System {
+public:
+    ~AudioSystem() override;
+    const char *name() const override;
+    void update(World &world, float dt) override;
+
+private:
+    std::uint32_t cues_ = 0;
+    std::uint32_t played_ = 0;
+};
+
+class Guild {
+public:
+    Guild();
+    void add_member(Player *member);
+    Player *lead() const;
+    std::uint32_t member_count() const;
+    std::uint32_t treasury() const;
+    void add_funds(std::uint32_t amount);
+
+private:
+    Player *members_[16];
+    Player *lead_;
+    std::uint32_t member_count_;
+    std::uint32_t treasury_;
 };
 
 class World {
@@ -203,6 +337,12 @@ public:
     SceneNode *root();
     const SceneNode *root() const;
 
+    void register_system(System *system);
+    void tick_systems(float dt);
+    void add_leaderboard_entry(Player *player, std::uint32_t score);
+    const LeaderboardEntry *top_entry() const;
+    std::uint32_t leaderboard_count() const;
+
 private:
     SceneNode root_;
     SceneNode nodes_[8];
@@ -215,8 +355,29 @@ private:
     std::uint32_t frame_;
     std::uint32_t checksum_;
     std::uint32_t padding_[24];
+    // ---- expanded surface (2026-08): systems, patrols, leaderboard ----
+    System *systems_[4];
+    std::uint32_t system_count_;
+    PatrolRoute patrols_[8];
+    std::uint32_t patrol_count_;
+    LeaderboardEntry leaderboard_[16];
+    std::uint32_t leaderboard_count_;
+    std::uint32_t simulation_time_;
 };
 
+/* globals for global-reference scans */
+extern World g_world;
+extern const char *g_scene_name;
+extern Player *g_main_player;
+
 int run_demo();
+
+/* additional expanded entry points */
+int run_systems_demo();
+int run_patrol_demo();
+int run_dialog_demo();
+int run_guild_demo();
+int run_render_demo();
+int run_templated_demo();
 
 } // namespace fixture

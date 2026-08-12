@@ -1,10 +1,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from importlib import import_module
 
 from forge.api import structure as structure_module
 from forge.api.structure import Structure
-
 
 
 class FakeMember:
@@ -36,6 +36,7 @@ class FakeMember:
     def __lt__(self, other):
         return (self.offset, self.type_name) < (other.offset, other.type_name)
 
+    __hash__ = None  # mutable fake; __eq__ compares and merges
     def __eq__(self, other):
         return (self.offset, self.type_name) == (other.offset, other.type_name)
 
@@ -476,3 +477,169 @@ def test_create_subtree_types_postorder_detects_cycles(monkeypatch):
         warning == "Cannot create subtree for A: child subtree B could not be finalized"
         for warning in warnings
     )
+
+# ---------------------------------------------------------------------------
+# Type-preservation guard: overwrite flow validates before deleting
+# ---------------------------------------------------------------------------
+
+def _overwrite_setup(monkeypatch, structure_module):
+    """Reusable setup: existing type, user confirms overwrite.
+
+    ``create_type`` fails on the first call (the type exists) and succeeds on
+    the second (after the delete) — mirroring the real flow.
+    """
+    recorded = {"deleted": [], "created": []}
+
+    def create_type(name, decl):
+        recorded["created"].append((name, decl))
+        return len(recorded["created"]) >= 2
+
+    monkeypatch.setattr(
+        structure_module.ida_typeinf, "del_named_type",
+        lambda *_a, **_k: recorded["deleted"].append(_a), raising=False,
+    )
+    monkeypatch.setattr(structure_module.forge_types, "create_type", create_type, raising=False)
+
+    class _QMessageBox:
+        Yes = 1
+        No = 0
+
+        @staticmethod
+        def question(*_a, **_k):
+            return _QMessageBox.Yes
+
+    monkeypatch.setattr(structure_module.QtWidgets, "QMessageBox", _QMessageBox)
+    return recorded
+
+
+def test_set_cdecl_overwrite_keeps_existing_type_when_declaration_invalid(monkeypatch):
+    structure_module = import_module("forge.api.structure")
+    recorded = _overwrite_setup(monkeypatch, structure_module)
+
+    # parse_decl(out_tif, til, decl, pt_flags) -> name | None
+    monkeypatch.setattr(
+        structure_module.ida_typeinf, "parse_decl", lambda *_a, **_k: None, raising=False,
+    )
+
+    structure = structure_module.Structure("test")
+    structure.created_type_name = "test"
+
+    result = structure.set_cdecl("struct test { int x; };")
+
+    assert result is None
+    assert recorded["deleted"] == [], "the existing type must NOT be deleted"
+    assert len(recorded["created"]) == 1, (
+        "only the initial existence probe may run; no recreate after a failed parse"
+    )
+
+
+def test_set_cdecl_overwrite_deletes_and_recreates_when_declaration_valid(monkeypatch):
+    structure_module = import_module("forge.api.structure")
+    recorded = _overwrite_setup(monkeypatch, structure_module)
+
+    monkeypatch.setattr(
+        structure_module.ida_typeinf, "parse_decl", lambda *_a, **_k: "test", raising=False,
+    )
+
+    structure = structure_module.Structure("test")
+    structure.created_type_name = "test"
+
+    structure.set_cdecl("struct test { int x; };")
+
+    assert len(recorded["deleted"]) == 1
+    assert len(recorded["created"]) == 2  # failed probe + recreate after delete
+
+
+def test_declaration_parses_rejects_bad_declarations(monkeypatch):
+    structure_module = import_module("forge.api.structure")
+
+    monkeypatch.setattr(
+        structure_module.ida_typeinf, "parse_decl", lambda *_a, **_k: None, raising=False,
+    )
+
+    assert structure_module.Structure._declaration_parses("struct test {") is False
+    assert structure_module.Structure._declaration_parses("") is False
+
+
+def test_declaration_parses_accepts_clean_declaration(monkeypatch):
+    structure_module = import_module("forge.api.structure")
+
+    monkeypatch.setattr(
+        structure_module.ida_typeinf, "parse_decl", lambda *_a, **_k: "test", raising=False,
+    )
+
+    assert structure_module.Structure._declaration_parses("struct test { int x; };") is True
+
+
+# ---------------------------------------------------------------------------
+# Tier 4: auto_resolve dry-run + undo snapshot
+# ---------------------------------------------------------------------------
+
+
+def test_auto_resolve_preview_reports_without_mutating():
+    structure = Structure("S")
+    high = FakeMember(0, 8, score=5)
+    low = FakeMember(4, 8, score=3)
+    structure.add_member(high)
+    structure.add_member(low)
+
+    disabled = structure.auto_resolve_preview()
+
+    assert disabled == [low]
+    assert high.enabled is True and low.enabled is True  # preview is read-only
+
+    resolved = structure.auto_resolve()
+    assert resolved == [low]
+    assert high.enabled is True and low.enabled is False
+
+
+def test_auto_resolve_preview_disables_lower_scored_earlier_member():
+    structure = Structure("S")
+    low_early = FakeMember(0, 8, score=2)
+    high_late = FakeMember(4, 8, score=9)
+    structure.add_member(low_early)
+    structure.add_member(high_late)
+
+    disabled = structure.auto_resolve_preview()
+
+    assert disabled == [low_early]  # the earlier, lower-scored half is dropped
+
+    structure.auto_resolve()
+    assert low_early.enabled is False and high_late.enabled is True
+
+
+def test_set_cdecl_wraps_type_write_in_undo_snapshot(monkeypatch):
+    from types import SimpleNamespace
+
+    structure = Structure("Example")
+    events = []
+    monkeypatch.setattr(
+        structure_module,
+        "ida_undo",
+        SimpleNamespace(
+            begin_undo_action=lambda name: events.append(("begin", name)),
+            end_undo_action=lambda: events.append(("end",)),
+        ),
+    )
+    monkeypatch.setattr(
+        structure_module.forge_types, "create_type",
+        lambda name, decl: True, raising=False,
+    )
+
+    structure.set_cdecl("struct Example { int x; };")
+
+    assert [e[0] for e in events] == ["begin", "end"]
+    assert events[0][1] == "forge: set type Example"
+
+
+def test_set_cdecl_undo_is_absent_without_ida_undo(monkeypatch):
+    structure = Structure("Example")
+    monkeypatch.setattr(structure_module, "ida_undo", None)
+    monkeypatch.setattr(
+        structure_module.forge_types, "create_type",
+        lambda name, decl: True, raising=False,
+    )
+
+    result = structure.set_cdecl("struct Example { int x; };")
+
+    assert result is not None  # no undo bookkeeping required off-IDA

@@ -1,18 +1,31 @@
+from __future__ import annotations
+
 import ida_funcs
 import ida_hexrays
 import ida_idaapi
 
 from forge.api import hexrays as hexrays_api
-from forge.api.hexrays import *
+from forge.api.hexrays import (
+    ctype,
+    decompile,
+    find_expr_address,
+    get_argument,
+    get_argument_index,
+    get_func_argument_info,
+    get_funcs_calling_address,
+    is_imported,
+    print_expr_address,
+    to_hex,
+)
 from forge.api.scan_object import (
-    ScanObject,
-    ObjectType,
-    VariableObject,
     CallArgumentObject,
+    ObjectType,
+    ScanObject,
+    VariableObject,
     _extract_offset_expression,
     _make_offset_scan_object,
 )
-from forge.util.logging import log_debug, log_info, log_warning
+from forge.util.logging import log_debug, log_info, log_trace, log_warning
 
 
 class ObjectVisitor(ida_hexrays.ctree_parentee_t):
@@ -51,11 +64,8 @@ class ObjectVisitor(ida_hexrays.ctree_parentee_t):
     def __manipulate(self, cexpr, obj):
         log_debug(f"Expression {cexpr.opname} at {print_expr_address(cexpr, self.parents)} Id - {getattr(obj, 'id', None)}")
 
-    def get_line(self) -> int:
-        for p in reversed(self.parents):
-            if not p.is_expr():
-                return idaapi.tag_remove(p.print1(self._cfunc.__ref__()))
-        AssertionError("Parent instruction is not found")
+    def get_line(self) -> str:
+        return hexrays_api.get_line(self, self._cfunc)
 
 
 class DownwardsObjectVisitor(ObjectVisitor):
@@ -178,18 +188,12 @@ class DownwardsObjectVisitor(ObjectVisitor):
         if len(self._objects) < 2:
             return False
 
-        if cexpr.op == ctype.cast:
-            e = cexpr.x
-        else:
-            e = cexpr
+        e = cexpr.x if cexpr.op == ctype.cast else cexpr
 
         if e.op != ctype.call or len(e.a) == 0:
             return True
 
-        for obj in self._objects:
-            if self._matches_object(obj, e.a[0]):
-                return False
-        return True
+        return all(not self._matches_object(obj, e.a[0]) for obj in self._objects)
 
 
 
@@ -223,10 +227,7 @@ class UpwardsObjectVisitor(ObjectVisitor):
             return 0
 
         x_cexpr = cexpr.x
-        if cexpr.y.op == ctype.cast:
-            y_cexpr = cexpr.y.x
-        else:
-            y_cexpr = cexpr.y
+        y_cexpr = cexpr.y.x if cexpr.y.op == ctype.cast else cexpr.y
 
         obj_left = ScanObject.create(self._cfunc, x_cexpr)
         obj_right = ScanObject.create(self._cfunc, y_cexpr)
@@ -339,6 +340,10 @@ class RecursiveObjectVisitor(ObjectVisitor):
         self._skip = skip
         self._init_obj = obj
         self.crippled = self._is_func_crippled()
+        log_trace(
+            f"Preparing scan of {getattr(cfunc, 'entry_ea', ida_idaapi.BADADDR)} "
+            f"arg_idx={arg_idx} obj={getattr(obj, 'name', None)} skip={skip}"
+        )
 
     def process(self):
         self._start()
@@ -393,19 +398,15 @@ class RecursiveObjectVisitor(ObjectVisitor):
 
     def _start(self):
         """Called at the beginning of visiting"""
-        pass
 
     def _start_iteration(self):
         """Called every time new function visiting started"""
-        pass
 
     def _finish(self):
         """Called after all visiting happened"""
-        pass
 
     def _finish_iteration(self):
         """Called every time new function visiting finished"""
-        pass
 
     def _is_func_crippled(self):
         # Check if function is just call to another function
@@ -456,9 +457,8 @@ class RecursiveDownwardsObjectVisitor(RecursiveObjectVisitor, DownwardsObjectVis
             elif op == ctype.memptr:
                 if addr_ctx:
                     work.append((getattr(expr, "x", None), False))
-            elif op == ctype.memref:
-                if addr_ctx:
-                    work.append((getattr(expr, "x", None), True))
+            elif op == ctype.memref and addr_ctx:
+                work.append((getattr(expr, "x", None), True))
         return False
 
     def _check_call(self, cexpr: ida_hexrays.cexpr_t):
@@ -513,6 +513,59 @@ class RecursiveDownwardsObjectVisitor(RecursiveObjectVisitor, DownwardsObjectVis
             if not self._rescan_current_function:
                 break
 
+    _VISIT_DEFERRED = object()
+
+    def _execute_visit(self, func_ea: int, arg_idx: int, acc_offset: int):
+        """Scan one caller-argument visit; spool discovered children.
+
+        Returns:
+          - a list of ``(ea, arg_idx, acc_offset)`` child visits to queue,
+          - ``_VISIT_DEFERRED`` when the callee cannot accept the argument yet
+            (argidx unknown mid-analysis) and the visit must be retried,
+          - ``None`` when the visit is dropped (decompilation failure).
+        """
+        cfunc = decompile(func_ea)
+        if cfunc is None:
+            return None
+        cfunc = self._refresh_decompilation_tree(cfunc)
+        if cfunc is None:
+            return None
+
+        argidx = getattr(cfunc, "argidx", ())
+        if arg_idx is None or arg_idx < 0 or arg_idx >= len(argidx):
+            return self._VISIT_DEFERRED
+
+        arg, lvar_idx = get_argument(cfunc, arg_idx)
+        obj = VariableObject(arg, lvar_idx)
+
+        saved_cfunc = self._cfunc
+        saved_arg_index = getattr(self, "_arg_index", None)
+        saved_objects = list(getattr(self, "_objects", []))
+        saved_skip = getattr(self, "_skip", False)
+        saved_init_obj = getattr(self, "_init_obj", None)
+
+        saved_base_offset = self._callee_base_offset
+        self._callee_base_offset = acc_offset
+        self.prepare_new_scan(cfunc, lvar_idx, obj)
+        self._scan_single_function()
+        self._callee_base_offset = saved_base_offset
+
+        children: list[tuple[int, int, int]] = []
+        for child_ea, child_idx in self._new_for_visit:
+            child_offset = acc_offset + self._visit_base_offsets.get(
+                (child_ea, child_idx), 0
+            )
+            children.append((child_ea, child_idx, child_offset))
+        self._new_for_visit.clear()
+
+        self._cfunc = saved_cfunc
+        self._arg_index = saved_arg_index
+        self._objects = saved_objects
+        self._skip = saved_skip
+        self._init_obj = saved_init_obj
+
+        return children
+
     def _recursive_process(self):
         self._scan_single_function()
 
@@ -526,46 +579,12 @@ class RecursiveDownwardsObjectVisitor(RecursiveObjectVisitor, DownwardsObjectVis
         while pending_visits:
             func_ea, arg_idx, acc_offset = pending_visits.pop()
 
-            cfunc = decompile(func_ea)
-            if cfunc is None:
-                continue
-            cfunc = self._refresh_decompilation_tree(cfunc)
-            if cfunc is None:
-                continue
-
-            argidx = getattr(cfunc, "argidx", ())
-            if arg_idx is None or arg_idx < 0 or arg_idx >= len(argidx):
+            outcome = self._execute_visit(func_ea, arg_idx, acc_offset)
+            if outcome is self._VISIT_DEFERRED:
                 deferred_visits.append((func_ea, arg_idx, acc_offset))
                 continue
-
-            arg, lvar_idx = get_argument(cfunc, arg_idx)
-            obj = VariableObject(arg, lvar_idx)
-
-            saved_cfunc = self._cfunc
-            saved_arg_index = getattr(self, "_arg_index", None)
-            saved_objects = list(getattr(self, "_objects", []))
-            saved_skip = getattr(self, "_skip", False)
-            saved_init_obj = getattr(self, "_init_obj", None)
-
-            saved_base_offset = self._callee_base_offset
-            self._callee_base_offset = acc_offset
-            self.prepare_new_scan(cfunc, lvar_idx, obj)
-            self._scan_single_function()
-            self._callee_base_offset = saved_base_offset
-
-            if self._new_for_visit:
-                for child_ea, child_idx in self._new_for_visit:
-                    child_offset = acc_offset + self._visit_base_offsets.get(
-                        (child_ea, child_idx), 0
-                    )
-                    pending_visits.append((child_ea, child_idx, child_offset))
-                self._new_for_visit.clear()
-
-            self._cfunc = saved_cfunc
-            self._arg_index = saved_arg_index
-            self._objects = saved_objects
-            self._skip = saved_skip
-            self._init_obj = saved_init_obj
+            if outcome:
+                pending_visits.extend(outcome)
 
             if not pending_visits and deferred_visits:
                 pending_visits = deferred_visits
@@ -575,47 +594,16 @@ class RecursiveDownwardsObjectVisitor(RecursiveObjectVisitor, DownwardsObjectVis
             next_round: list[tuple[int, int, int]] = []
             progressed = False
             for func_ea, arg_idx, acc_offset in deferred_visits:
-                cfunc = decompile(func_ea)
-                if cfunc is None:
-                    continue
-                cfunc = self._refresh_decompilation_tree(cfunc)
-                if cfunc is None:
-                    continue
-
-                argidx = getattr(cfunc, "argidx", ())
-                if arg_idx is None or arg_idx < 0 or arg_idx >= len(argidx):
+                outcome = self._execute_visit(func_ea, arg_idx, acc_offset)
+                if outcome is self._VISIT_DEFERRED:
                     next_round.append((func_ea, arg_idx, acc_offset))
                     continue
-
-                arg, lvar_idx = get_argument(cfunc, arg_idx)
-                obj = VariableObject(arg, lvar_idx)
-
-                saved_cfunc = self._cfunc
-                saved_arg_index = getattr(self, "_arg_index", None)
-                saved_objects = list(getattr(self, "_objects", []))
-                saved_skip = getattr(self, "_skip", False)
-                saved_init_obj = getattr(self, "_init_obj", None)
-
-                saved_base_offset = self._callee_base_offset
-                self._callee_base_offset = acc_offset
-                self.prepare_new_scan(cfunc, lvar_idx, obj)
-                self._scan_single_function()
-                self._callee_base_offset = saved_base_offset
-
-                if self._new_for_visit:
-                    for child_ea, child_idx in self._new_for_visit:
-                        child_offset = acc_offset + self._visit_base_offsets.get(
-                            (child_ea, child_idx), 0
-                        )
-                        pending_visits.append((child_ea, child_idx, child_offset))
-                    self._new_for_visit.clear()
-
-                self._cfunc = saved_cfunc
-                self._arg_index = saved_arg_index
-                self._objects = saved_objects
-                self._skip = saved_skip
-                self._init_obj = saved_init_obj
-
+                if outcome is None:
+                    # Decompilation failed: the visit is dropped and counts
+                    # as no progress (matches the original loop semantics).
+                    continue
+                if outcome:
+                    pending_visits.extend(outcome)
                 progressed = True
 
             if pending_visits:
@@ -711,9 +699,11 @@ class FunctionTouchVisitor(ida_hexrays.ctree_parentee_t):
     def process(self):
         if self._cfunc.entry_ea not in self._visited:
             self._visited.add(self._cfunc.entry_ea)
+            # apply_to walks the whole tree and collects every `call` node
+            # into self._functions. Do NOT reset between collection and use:
+            # the old `self._functions = set()` here dropped the nested calls
+            # and left process() touching nothing below the top level.
             self.apply_to(self._cfunc.body, None)
-            self._functions = set()  # Reset the set of functions to visit
-            self.visit_expr(self._cfunc.body)
             self.touch_all_iterative()
             decompile(self._cfunc.entry_ea)
             return True

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import shutil
 import sys
 import tempfile
@@ -7,6 +8,7 @@ import types
 from pathlib import Path
 
 import pytest
+
 ROOT = Path(__file__).resolve().parents[1]
 SRC = ROOT / "src"
 UTIL = ROOT / "util"
@@ -73,7 +75,7 @@ class _DummyTInfo:
         return True
 
     def get_named_type(self, *args, **kwargs):
-        return False
+        return True
 
     def dstr(self):
         return self._name
@@ -134,12 +136,16 @@ _stub_module(
     udt_member_t=_DummyUDTMember,
     udt_type_data_t=_DummyUDTTypeData,
     BTF_STRUCT=0,
+    BTF_UINT16=0,
+    BTF_UINT32=0,
+    BTF_UINT64=0,
     get_idati=lambda: object(),
     parse_decl=lambda *args, **kwargs: False,
     import_type=lambda *args, **kwargs: 0,
     PT_TYP=0,
     PT_SIL=0,
     BADSIZE=-1,
+    NTF_TYPE=0,
     STRMEM_OFFSET=0,
     cvar=types.SimpleNamespace(idati=object()),
 )
@@ -192,6 +198,7 @@ _stub_module(
     cfunc_type=lambda *args, **kwargs: object(),
     Hexrays_Hooks=_DummyHexraysHooks,
     ctree_item_t=type("ctree_item_t", (), {}),
+    ctree_parentee_t=type("ctree_parentee_t", (), {}),
     cfunc_t=type("cfunc_t", (), {}),
     cexpr_t=type("cexpr_t", (), {}),
     lvar_t=type("lvar_t", (), {}),
@@ -287,8 +294,18 @@ def _qt_item_flags(*flags):
     for flag in flags:
         if flag is None:
             continue
-        combined |= flag
+        value = getattr(flag, "value", flag)
+        try:
+            combined |= int(value)
+        except (TypeError, ValueError):
+            continue
     return combined
+
+
+def _qt_flag_value(flag):
+    if flag is None:
+        return 0
+    return int(getattr(flag, "value", flag))
 
 
 _stub_module(
@@ -301,7 +318,56 @@ _stub_module(
     if hasattr(widget, "exec")
     else widget.exec_(*args, **kwargs),
     qt_item_flags=_qt_item_flags,
+    qt_flag_value=_qt_flag_value,
 )
+def _collect_ctree_items_near_ea(cfunc, ea: int, *, exhaustive: bool = False):
+    """Faithful behavioral double of hexrays.collect_ctree_items_near_ea.
+
+    The structure-builder tests exercise the child-scan inference engine with
+    fake cfuncs (SimpleNamespace treeitems/eamap/body), so the stub must run
+    the same chain — a lambda returning [] would silently drop candidates.
+    """
+    candidates = []
+    if cfunc is None or ea == -1:
+        return []
+
+    for item in getattr(cfunc, "treeitems", []) or []:
+        if getattr(item, "ea", -1) == ea:
+            candidates.append(item)
+
+    eamap = getattr(cfunc, "eamap", None)
+    if (exhaustive or not candidates) and eamap is not None:
+        with contextlib.suppress(Exception):
+            candidates.extend(list(eamap.get(ea, [])))
+
+    body = getattr(cfunc, "body", None)
+    if (
+        (exhaustive or not candidates)
+        and body is not None
+        and hasattr(body, "find_closest_addr")
+    ):
+        try:
+            closest_item = body.find_closest_addr(ea)
+        except Exception:  # noqa: BLE001 — stub doubles may raise anything
+            closest_item = None
+        if closest_item is not None:
+            candidates.append(closest_item)
+
+    if exhaustive:
+        seen = set()
+        deduped = []
+        for item in candidates:
+            if item is None:
+                continue
+            marker = id(item)
+            if marker in seen:
+                continue
+            seen.add(marker)
+            deduped.append(item)
+        return deduped
+    return candidates
+
+
 _stub_module(
     "forge.api.hexrays",
     ctype=types.SimpleNamespace(
@@ -319,11 +385,20 @@ _stub_module(
         num=12,
     ),
     get_member_name=lambda *_args, **_kwargs: "member_name",
-    get_ptr=lambda *args, **kwargs: 0,
+    read_pointer=lambda *args, **kwargs: 0,
     is_code=lambda *args, **kwargs: False,
     is_imported=lambda *args, **kwargs: False,
     decompile=lambda *args, **kwargs: None,
+    get_line=lambda *args, **kwargs: "",
+    find_expr_address=lambda *args, **kwargs: 0,
+    print_expr_address=lambda *args, **kwargs: "0x0",
+    get_func_argument_info=lambda *args, **kwargs: (0, None),
+    get_argument=lambda *args, **kwargs: (None, 0),
+    get_argument_index=lambda *args, **kwargs: 0,
+    get_funcs_calling_address=lambda *args, **kwargs: set(),
+    to_hex=lambda value: hex(value),
     create_udt_padding_member=lambda *args, **kwargs: None,
+    collect_ctree_items_near_ea=_collect_ctree_items_near_ea,
     to_function_offset_str=lambda ea: f"sub_{ea:x}+0x0",
 )
 _stub_module("forge.api.types", types=types.SimpleNamespace(width=8), import_type=lambda *args, **kwargs: 0)

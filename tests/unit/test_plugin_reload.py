@@ -2,12 +2,8 @@ from __future__ import annotations
 
 import importlib
 import importlib.util
-import sys
-import types
 from pathlib import Path
-
-import ida_idaapi
-
+from typing import ClassVar
 
 _PLUG_ENTRY = Path(__file__).resolve().parents[2] / "src" / "ida_forge_plugin.py"
 _SPEC = importlib.util.spec_from_file_location("forge_plugin_entry", _PLUG_ENTRY)
@@ -28,7 +24,7 @@ class _OldCore:
 
 
 class _NewCore:
-    instances = []
+    instances: ClassVar[list] = []
 
     def __init__(self):
         self.loaded = False
@@ -112,3 +108,28 @@ def test_plugmod_teardown_unloads_core_and_unhooks(monkeypatch):
     assert unload_calls == [False]
     assert plugin._core is None
     assert plugin._ready_hook is None
+
+
+def test_reload_inner_resets_structure_form_models(monkeypatch):
+    """T4.4: the reload path clears pre-reload in-memory structure models."""
+    import forge.features.structure_builder.form as form_module
+
+    resets = []
+    monkeypatch.setattr(form_module.structure_form, "reset", lambda: resets.append(True))
+
+    plugin = _make_plugin(monkeypatch, core=_OldCore([]))
+    monkeypatch.setattr(plugmod_module, "recursive_reload", lambda module, exclude_prefixes=(): None)
+    monkeypatch.setattr(forge_core_module, "ForgeCore", _NewCore)
+
+    real_ready_hook = plugmod_module._ReadyHook
+
+    def _fake_hook_init(self, owner):
+        self._owner = owner
+
+    monkeypatch.setattr(real_ready_hook, "__init__", _fake_hook_init)
+    monkeypatch.setattr(real_ready_hook, "hook", lambda self: None)
+    monkeypatch.setattr(real_ready_hook, "unhook", lambda self: None)
+
+    plugin._reload_inner()
+
+    assert resets == [True]

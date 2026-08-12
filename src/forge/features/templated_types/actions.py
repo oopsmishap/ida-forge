@@ -1,8 +1,8 @@
-import ida_hexrays
+
+from forge.api.ui_actions import UIMenuAction, register_action
 
 from .config import config
 from .form import templated_types_form
-from forge.api.ui_actions import register_action, UIMenuAction
 
 
 @register_action

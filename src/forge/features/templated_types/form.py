@@ -3,12 +3,11 @@ import re
 import ida_diskio
 import ida_kernwin
 
+from forge.util.logging import log_info, log_warning
 from forge.util.qt import QtGui, QtWidgets
 
 from .templated_types import TemplatedTypes
 from .ui_form import Ui_templated_types_form
-
-from forge.util.logging import log_info, log_warning
 
 QFontDatabase = QtGui.QFontDatabase
 
@@ -89,8 +88,8 @@ class TemplatedTypesForm(ida_kernwin.PluginForm):
             btn_set_type.clicked.connect(lambda: self.create_stl_type(key))
 
             self.reload_stl_struct(key)
-        except Exception:
-            pass
+        except Exception as e:  # noqa: BLE001 — Qt widget tree may be torn down
+            log_warning(f"Failed to rebuild the templated-types form: {e}")
 
     def reload_stl_list(self):
         if self.ui is None:
@@ -113,8 +112,8 @@ class TemplatedTypesForm(ida_kernwin.PluginForm):
             args = self.get_stl_args(key)
             self.ui.stl_struct_view.setPlainText(struct.format(*args))
             self.ui.stl_title_struct.setText(base_name.format(*args))
-        except Exception:
-            pass
+        except Exception as e:  # noqa: BLE001 — user edits can produce unparsable args
+            log_warning(f"Failed to render STL struct preview for {key}: {e}")
 
     def get_stl_args(self, key):
         args = ()
@@ -122,7 +121,7 @@ class TemplatedTypesForm(ida_kernwin.PluginForm):
             arg = w.text()
             if arg == "":
                 arg = "$void$"
-            args = args + (arg,)
+            args = (*args, arg)
         return args
 
     def create_stl_type(self, key):
@@ -132,10 +131,9 @@ class TemplatedTypesForm(ida_kernwin.PluginForm):
             if not re.match(r"^[a-zA-Z_]([\w_](::){0,2})+(?<!:)\**$", args[i]):
                 log_warning(f"Type name {args[i]} is an invalid type name", True)
                 return
-            else:
-                if not re.match(r"^\w+$", args[i]):
-                    log_warning(f"Type name {args[i]} is an invalid name", True)
-                    return
+            if not re.match(r"^\w+$", args[i]):
+                log_warning(f"Type name {args[i]} is an invalid name", True)
+                return
 
         self.template_types.set_type(key, args)
         self.reload_stl_struct(key)

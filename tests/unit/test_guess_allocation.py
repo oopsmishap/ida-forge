@@ -4,9 +4,8 @@ import sys
 from importlib import import_module
 from types import ModuleType, SimpleNamespace
 
-import pytest
-
 import ida_hexrays
+import pytest
 
 if not hasattr(ida_hexrays, "ctree_parentee_t"):
     ida_hexrays.ctree_parentee_t = type("ctree_parentee_t", (), {})
@@ -14,11 +13,12 @@ if not hasattr(ida_hexrays, "ctree_parentee_t"):
 if "ida_idaapi" not in sys.modules:
     sys.modules["ida_idaapi"] = ModuleType("ida_idaapi")
 import ida_idaapi
+
 ida_idaapi.BADADDR = -1
 
 hexrays_api = import_module("forge.api.hexrays")
 if not hasattr(hexrays_api, "find_expr_address"):
-    setattr(hexrays_api, "find_expr_address", lambda *_args, **_kwargs: 0)
+    hexrays_api.find_expr_address = lambda *_args, **_kwargs: 0
 
 visitor_api = import_module("forge.api.visitor")
 

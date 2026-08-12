@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from typing import Optional
-
 import ida_typeinf
 
 
@@ -11,13 +9,13 @@ def _call_tinfo_method(tinfo, name: str, default=None):
         return default
     try:
         return method()
-    except Exception:
+    except Exception:  # noqa: BLE001 — version-tolerant probe of tinfo methods
         return default
 
 
 
 def is_incomplete_tinfo(
-    tinfo: Optional[ida_typeinf.tinfo_t], _seen: Optional[set[int]] = None
+    tinfo: ida_typeinf.tinfo_t | None, _seen: set[int] | None = None
 ) -> bool:
     """Return True when a tinfo is missing or structurally incomplete."""
     if tinfo is None:

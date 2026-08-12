@@ -70,13 +70,10 @@ def check_identifier(ident):
         return False
 
     for c in ident:
-        if not c.isalnum() and not c == "_":
+        if not c.isalnum() and c != "_":
             return False
 
-    if ident[0].isdigit():
-        return False
-
-    return True
+    return not ident[0].isdigit()
 
 
 def brace_split(txt, char=" ", remove_empty=True):
@@ -88,31 +85,30 @@ def brace_split(txt, char=" ", remove_empty=True):
     curr_seg = ""
 
     for c in txt:
-        if len(brace_stack):
-            if c == brace_stack[-1]:
-                brace_stack.pop()
+        if brace_stack and c == brace_stack[-1]:
+            brace_stack.pop()
 
-        if c in braces.keys():
+        if c in braces:
             brace_stack.append(braces[c])
 
-        if not len(brace_stack) and c == char:
+        if not brace_stack and c == char:
             if not remove_empty or curr_seg:
                 segs.append(curr_seg)
                 curr_seg = ""
         else:
             curr_seg += c
 
-    if curr_seg or (not remove_empty and len(segs)):
+    if curr_seg or (not remove_empty and segs):
         segs.append(curr_seg)
 
-    if len(brace_stack):
+    if brace_stack:
         raise ValueError("Mismatched braces")
 
     return segs
 
 
 def len_encode(ident):
-    return "%u%s" % (len(ident), ident)
+    return f"{len(ident)}{ident}"
 
 
 def apply_typedefs(segs, typedefs):
@@ -130,17 +126,17 @@ def apply_typedefs(segs, typedefs):
 
 
 def fix_multi_seg_types(segments):
-    for l in range(len(segments)):
+    for start in range(len(segments)):
         for mst in MULTI_SEGMENT_TYPES:
-            r = l + len(mst)
-            if mst == segments[l:r]:
-                del segments[l:r]
-                segments.insert(l, "_".join(mst))
+            r = start + len(mst)
+            if mst == segments[start:r]:
+                del segments[start:r]
+                segments.insert(start, "_".join(mst))
                 break
 
 
 def mangle_type(txt, pre_and_postfix=True):
-    if txt in BUILTIN_TYPES.keys():
+    if txt in BUILTIN_TYPES:
         return BUILTIN_TYPES[txt]
 
     segments = txt.split("::")
@@ -159,7 +155,7 @@ def mangle_type(txt, pre_and_postfix=True):
 
 def add_to_subs(subs, sub):
     if sub in subs:
-        raise ValueError('Substitution "%s" is already registered' % sub)
+        raise ValueError(f'Substitution "{sub}" is already registered')
     subs[sub] = encode_seqid(len(subs))
 
 
@@ -178,7 +174,7 @@ def mangle_decorated_type(txt_decors, type_txt, subs=None):
         try:
             decors.append(DECORATORS[d])
         except KeyError:
-            raise ValueError('Invalid decor "%s"' % d)
+            raise ValueError(f'Invalid decor "{d}"') from None
     decors.reverse()
 
     if type_segments[-1] in BUILTIN_TYPES:
@@ -202,7 +198,7 @@ def mangle_decorated_type(txt_decors, type_txt, subs=None):
                     ret = decors[i - 1] + ret
                     curr_mangled_nosubs = decors[i - 1] + curr_mangled_nosubs
                     add_to_subs(subs, curr_mangled_nosubs)
-                    i -= 1
+                    i -= 1  # noqa: PLW2901 — deliberately mutates the loop index inside the backtracking walk
                 break
 
         return ret
@@ -211,7 +207,7 @@ def mangle_decorated_type(txt_decors, type_txt, subs=None):
 
     if type_mangled_stripped in subs:
         ret = None
-        for i in range(len(decors) + 1):
+        for i in range(len(decors) + 1):  
             curr_mangled = "".join(decors[i:]) + type_mangled_stripped
             if curr_mangled in subs:
                 ret = subs[curr_mangled]
@@ -219,7 +215,7 @@ def mangle_decorated_type(txt_decors, type_txt, subs=None):
                     ret = decors[i - 1] + ret
                     curr_mangled = decors[i - 1] + curr_mangled
                     add_to_subs(subs, curr_mangled)
-                    i -= 1
+                    i -= 1  # noqa: PLW2901 — deliberately mutates the loop index inside the backtracking walk
                 break
         return ret
 
@@ -228,24 +224,20 @@ def mangle_decorated_type(txt_decors, type_txt, subs=None):
 
     # Newly found names are added to substitution from the left
     for i in reversed(range(len(type_segments) + 1)):
+
+
         curr_mangled_nosubs = "".join(len_encode(ts) for ts in type_segments[:i])
 
         if not curr_mangled_nosubs or curr_mangled_nosubs in subs:
-            if curr_mangled_nosubs:
-                curr_mangled = subs[curr_mangled_nosubs]
-            else:
-                curr_mangled = ""
+            curr_mangled = subs[curr_mangled_nosubs] if curr_mangled_nosubs else ""
             while i < len(type_segments):
                 curr_mangled += len_encode(type_segments[i])
                 curr_mangled_nosubs += len_encode(type_segments[i])
                 add_to_subs(subs, curr_mangled_nosubs)
-                i += 1
+                i += 1  # noqa: PLW2901 — deliberately mutates the loop index inside the backtracking walk
             break
 
-    if len(type_segments) == 1:
-        ret = curr_mangled
-    else:
-        ret = "N" + curr_mangled + "E"
+    ret = curr_mangled if len(type_segments) == 1 else "N" + curr_mangled + "E"
 
     for d in reversed(decors):
         ret = d + ret
@@ -300,13 +292,12 @@ def mangle_argument(txt, typedefs=None, subs=None):
     # Current segment layout: t, decors, optional label
 
     # Filter out label
-    if len(segs) >= 2:
-        if not segs[-1] in DECORATORS.keys():  # Already no label?
-            if not check_identifier(segs[-1]):
-                raise ValueError('Invalid identifier "%s"' % segs[-1])
-            if segs[-1] in BUILTIN_TYPES:
-                raise ValueError('Invalid identifier "%s"' % segs[-1])
-            del segs[-1]
+    if len(segs) >= 2 and segs[-1] not in DECORATORS:  # Already no label?
+        if not check_identifier(segs[-1]):
+            raise ValueError(f'Invalid identifier "{segs[-1]}"')
+        if segs[-1] in BUILTIN_TYPES:
+            raise ValueError(f'Invalid identifier "{segs[-1]}"')
+        del segs[-1]
 
     # Check decors
     decors = segs[1:]
@@ -333,7 +324,7 @@ def mangle_arguments(txt, typedefs=None, subs=None):
     args = [a.strip() for a in args]
 
     # Detect void arguments
-    if not len(args) or (len(args) == 1 and (not args[0] or args[0] == "void")):
+    if not args or (len(args) == 1 and (not args[0] or args[0] == "void")):
         return "v"
 
     ret = ""
@@ -379,17 +370,17 @@ def mangle_function(txt: str, typedefs=None, ctor_type=None, dtor_type=None):
         if identifier_segments[-1] == identifier_segments[-2]:  # ctor
             if ctor_type not in [1, 2, 3]:
                 raise ValueError("No or invalid ctor t given")
-            identifier_segments[-1] = "C%u" % ctor_type
+            identifier_segments[-1] = f"C{ctor_type}"
             is_cdtor = True
         elif identifier_segments[-1] == ("~" + identifier_segments[-2]):  # dtor
             if dtor_type not in [0, 1, 2]:
                 raise ValueError("No or invalid dtor t given")
-            identifier_segments[-1] = "D%u" % dtor_type
+            identifier_segments[-1] = f"D{dtor_type}"
             is_cdtor = True
 
     for s in identifier_segments:
         if not check_identifier(s):
-            raise ValueError('Invalid identifier "%s"' % s)
+            raise ValueError(f'Invalid identifier "{s}"')
 
     mangled_type = "".join(
         len_encode(ts) for ts in identifier_segments[: len(identifier_segments) - 1]

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import ClassVar
+
 import ida_kernwin
 
 from forge.util.qt import QtCore, QtWidgets, Signal
@@ -11,7 +13,7 @@ class Choose(ida_kernwin.Choose):
     """Minimal configurable wrapper around `ida_kernwin.Choose`."""
 
     title = ""
-    cols = []
+    cols: ClassVar[list] = []
     icon = -1
     flags = ida_kernwin.Choose.CH_MODAL
 

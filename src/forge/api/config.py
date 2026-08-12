@@ -2,13 +2,32 @@ from __future__ import annotations
 
 from copy import deepcopy
 from pathlib import Path
-from typing import Any
+from typing import Any, ClassVar
 
-import toml
 import ida_diskio
+import toml  # still needed for writing; tomllib is read-only
+
+try:  # stdlib tomllib on Python 3.11+ (IDA 9.x ships 3.12)
+    import tomllib
+except ImportError:  # Python 3.9/3.10 read via the `toml` package
+    tomllib = None
 
 from forge.util.logging import log_debug, log_error
 
+
+def _load_toml_file(path: Path) -> dict:
+    """Read a TOML file via :mod:`tomllib` (stdlib) or the ``toml`` fallback."""
+    if tomllib is not None:
+        with path.open("rb") as f:  # tomllib requires binary mode
+            return tomllib.load(f)
+    with path.open("r", encoding="utf-8") as f:
+        return toml.load(f)
+
+
+def _dump_toml_file(path: Path, data: dict) -> None:
+    """Persist a dict to a TOML file via the ``toml`` package (no stdlib dumper)."""
+    with path.open("w", encoding="utf-8") as f:
+        toml.dump(data, f)
 
 ConfigDict = dict[str, Any]
 
@@ -17,7 +36,7 @@ class ConfigBase:
     """Base class for TOML-backed configuration management."""
 
     name: str | None = None
-    default_config: ConfigDict = {}
+    default_config: ClassVar[ConfigDict] = {}
 
     def __init__(self, config_name: str):
         if not self.name:
@@ -30,16 +49,15 @@ class ConfigBase:
     def _load_config(self) -> ConfigDict:
         """Load the full configuration file."""
         try:
-            with self._config_path.open("r", encoding="utf-8") as f:
-                config = toml.load(f)
-                log_debug(
-                    f"Loaded {self._config_name} config file at {self._config_path}"
-                )
-                return config if isinstance(config, dict) else {}
+            config = _load_toml_file(self._config_path)
+            log_debug(
+                f"Loaded {self._config_name} config file at {self._config_path}"
+            )
+            return config if isinstance(config, dict) else {}
         except FileNotFoundError:
             log_debug(f"Config file not found {self._config_path}. Using default.")
             return {}
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001 — corrupt/missing files degrade to defaults
             log_error(
                 f"Failed to load {self._config_name} config file at {self._config_path}: {e}"
             )
@@ -49,21 +67,20 @@ class ConfigBase:
         """Persist the full configuration file."""
         try:
             self._config_path.parent.mkdir(parents=True, exist_ok=True)
-            with self._config_path.open("w", encoding="utf-8") as f:
-                toml.dump(self._config, f)
+            _dump_toml_file(self._config_path, self._config)
             log_debug(f"Saved {self._config_name} config file at {self._config_path}")
-        except Exception as e:
+        except Exception as e:  # persistence failures surface in the log, then re-raise
             log_error(
                 f"Failed to save {self._config_name} config file at {self._config_path}: {e}"
             )
             raise
 
     @staticmethod
-    def _default_config_for(cls: type["ConfigBase"]) -> ConfigDict:
+    def _default_config_for(config_cls: type[ConfigBase]) -> ConfigDict:
         """Return a detached copy of a class's default configuration."""
-        return deepcopy(getattr(cls, "default_config", {}))
+        return deepcopy(getattr(config_cls, "default_config", {}))
 
-    def get_class_config(self, cls: type["ConfigBase"]) -> ConfigDict:
+    def get_class_config(self, cls: type[ConfigBase]) -> ConfigDict:
         """Get the configuration block for a specific config subclass."""
         if cls.name not in self._config:
             default_config = self._default_config_for(cls)
@@ -98,12 +115,12 @@ class ConfigBase:
                     changed = True
         return changed
 
-    def set_class_config(self, cls: type["ConfigBase"], config: ConfigDict) -> None:
+    def set_class_config(self, cls: type[ConfigBase], config: ConfigDict) -> None:
         """Set the configuration block for a specific config subclass."""
         self._config[cls.name] = config
         self._save_config()
 
-    def get_option(self, cls: type["ConfigBase"], option_name: str) -> Any:
+    def get_option(self, cls: type[ConfigBase], option_name: str) -> Any:
         """Get a specific option from a config subclass block."""
         config = self.get_class_config(cls)
         if option_name not in config:
@@ -112,7 +129,7 @@ class ConfigBase:
             )
         return config[option_name]
 
-    def set_option(self, cls: type["ConfigBase"], option_name: str, option_value: Any) -> None:
+    def set_option(self, cls: type[ConfigBase], option_name: str, option_value: Any) -> None:
         """Set a specific option in a config subclass block."""
         config = deepcopy(self.get_class_config(cls))
         config[option_name] = option_value
@@ -135,7 +152,9 @@ class ConfigBase:
 class ForgeConfig(ConfigBase):
     """Root config namespace stored in `forge.toml`."""
     name = "forge"
-    default_config: ConfigDict = {}
+    default_config: ClassVar[ConfigDict] = {
+        "log_level": "INFO",
+    }
 
     def __init__(self):
         super().__init__("forge")

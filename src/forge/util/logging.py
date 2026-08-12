@@ -6,9 +6,29 @@ import ida_kernwin
 
 from forge.plugin import PLUGIN_NAME
 
-
 _logger = logging.getLogger("forge")
 _logger.setLevel(logging.INFO)
+
+#: string name -> stdlib level; accepted by :func:`set_log_level`
+LOG_LEVELS = {
+    "TRACE": 5,
+    "DEBUG": logging.DEBUG,
+    "INFO": logging.INFO,
+    "WARNING": logging.WARNING,
+    "ERROR": logging.ERROR,
+    "CRITICAL": logging.CRITICAL,
+}
+
+
+def set_log_level(level: str | int) -> None:
+    """Set the Forge logger level (case-insensitive name or stdlib constant)."""
+    if isinstance(level, str):
+        resolved = LOG_LEVELS.get(level.strip().upper())
+        if resolved is None:
+            raise ValueError(f"Unknown log level: {level}")
+        _logger.setLevel(resolved)
+        return
+    _logger.setLevel(level)
 
 
 class _IDAMsgHandler(logging.Handler):
@@ -54,6 +74,11 @@ _logger.addHandler(_handler)
 def _format(message: str | None) -> str:
     return message or ""
 
+
+
+def log_trace(message: str | None = None) -> None:
+    """Log at ``TRACE`` (5), below DEBUG, for per-expression walk noise."""
+    _logger.log(5, _format(message))
 
 
 def log_debug(message: str | None = None) -> None:

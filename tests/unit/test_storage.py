@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import zlib
 
 import pytest
@@ -153,7 +152,7 @@ def test_large_values_use_blob_storage(storage):
 def test_overwriting_large_value_cleans_old_blob(storage):
     store, nodes = storage
     first = make_large_payload()
-    second = make_large_payload() + ["tail_marker"]
+    second = [*make_large_payload(), "tail_marker"]
 
     assert len(Storage._compress(Storage._encode(first))) > BLOB_SIZE
     assert len(Storage._compress(Storage._encode(second))) > BLOB_SIZE

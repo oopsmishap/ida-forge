@@ -2,9 +2,9 @@ from __future__ import annotations
 
 import importlib
 import sys
+from collections.abc import Iterator
 from pathlib import Path
 from types import ModuleType
-from typing import Iterator
 
 from forge.util.logging import log_debug
 

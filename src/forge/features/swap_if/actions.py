@@ -5,9 +5,10 @@ import ida_nalt
 from forge.api.hooks import HexRaysHook, register_hook
 from forge.api.ui_actions import HexRaysPopupAction, register_action
 from forge.util.logging import log_debug
+
 from .helper import inverse_if
-from .storage import set_inverted, has_inverted, get_inverted
-from .visitor import SwapThenElseVisitor, SpaghettiVisitor
+from .storage import get_inverted, has_inverted, set_inverted
+from .visitor import SpaghettiVisitor, SwapThenElseVisitor
 
 
 @register_action

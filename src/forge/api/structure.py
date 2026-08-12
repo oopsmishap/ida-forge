@@ -3,18 +3,48 @@ from __future__ import annotations
 import bisect
 import itertools
 import re
+from collections.abc import Iterator, Mapping, Sequence
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass, replace
-from typing import Iterator, Mapping, Sequence
 
 import ida_kernwin
 import ida_typeinf
 
-from forge.util.qt import QtWidgets
+try:  # plugin runs under standalone unit tests without the IDA undo module
+    import ida_undo
+except ImportError:
+    ida_undo = None  # type: ignore[assignment]
 
 import forge.api.types as forge_types
 from forge.api.hexrays import create_udt_padding_member
 from forge.api.members import AbstractMember, VirtualTable, materialize_linked_child_member_type
 from forge.util.logging import log_debug, log_error, log_warning
+from forge.util.qt import QtWidgets
+
+
+@contextmanager
+def _type_write_undo(action: str):
+    """Run a destructive type write inside an IDA undo snapshot.
+
+    ``ida_undo`` is not available under the unit-test environment, so the
+    guard keeps the module importable everywhere; the snapshot means a bad
+    ``auto_resolve``/``set_cdecl`` result can be reverted with a single
+    IDA ``undo`` (everything from the begin to the end point).
+    """
+    if ida_undo is None:
+        yield
+        return
+    try:
+        ida_undo.begin_undo_action(action)
+    except Exception:  # noqa: BLE001 — undo may be unsupported mid-transaction
+        yield
+        return
+    try:
+        yield
+    finally:
+        # best-effort undo bookkeeping
+        with suppress(Exception):
+            ida_undo.end_undo_action()
 
 
 @dataclass(frozen=True)
@@ -133,7 +163,7 @@ class Structure:
         self.parent_relationships.append(relationship)
 
     def refresh_linked_member_types(
-        self, structures_by_name: Mapping[str, "Structure"]
+        self, structures_by_name: Mapping[str, Structure]
     ) -> bool:
         for relationship in self.child_relationships:
             child = structures_by_name.get(relationship.child_structure_name)
@@ -231,7 +261,7 @@ class Structure:
 
     def get_unresolved_child_names(
         self,
-        structures_by_name: Mapping[str, "Structure"],
+        structures_by_name: Mapping[str, Structure],
     ) -> list[str]:
         return sorted(
             {
@@ -259,8 +289,8 @@ class Structure:
 
     def iter_child_structures(
         self,
-        structures_by_name: Mapping[str, "Structure"],
-    ) -> Iterator["Structure"]:
+        structures_by_name: Mapping[str, Structure],
+    ) -> Iterator[Structure]:
         seen_child_names: set[str] = set()
         for relationship in self._iter_child_relationships():
             child = structures_by_name.get(relationship.child_structure_name)
@@ -271,13 +301,13 @@ class Structure:
 
     def can_create_type(
         self,
-        structures_by_name: Mapping[str, "Structure"],
+        structures_by_name: Mapping[str, Structure],
     ) -> bool:
         return not self.get_unresolved_child_names(structures_by_name)
 
     def create_type_if_ready(
         self,
-        structures_by_name: Mapping[str, "Structure"],
+        structures_by_name: Mapping[str, Structure],
         *,
         start: int | None = None,
         end: int | None = None,
@@ -296,19 +326,19 @@ class Structure:
 
     def create_subtree_types_postorder(
         self,
-        structures_by_name: Mapping[str, "Structure"],
+        structures_by_name: Mapping[str, Structure],
         *,
         visited: set[str] | None = None,
     ) -> bool:
         completed = visited if visited is not None else set()
         stack: list[str] = []
 
-        def _walk(structure: "Structure") -> bool:
+        def _walk(structure: Structure) -> bool:
             if structure.name in completed:
                 return True
             if structure.name in stack:
                 cycle_start = stack.index(structure.name)
-                cycle_path = " -> ".join(stack[cycle_start:] + [structure.name])
+                cycle_path = " -> ".join([*stack[cycle_start:], structure.name])
                 log_warning(
                     f"Cycle detected while creating type subtree: {cycle_path}",
                     True,
@@ -482,25 +512,39 @@ class Structure:
                     self.main_offset = self.members[0].offset if self.members else 0
         self.refresh_collisions()
 
-    def auto_resolve(self) -> None:
+    def auto_resolve_preview(self) -> list[AbstractMember]:
+        """Return the members :meth:`auto_resolve` would disable.
+
+        Pure read-only walk of the collision-resolution heuristic, so the UI
+        can confirm the change before the destructive disable happens.
+        """
+        disabled: list[AbstractMember] = []
         current_member = None
         for member in self.members:
             if not member.enabled:
                 continue
-
             if current_member is None:
                 current_member = member
                 continue
-
             if current_member.has_collision(member):
                 if member.score <= current_member.score:
-                    member.set_enabled(False)
+                    disabled.append(member)
                     continue
-                current_member.set_enabled(False)
-
+                disabled.append(current_member)
             current_member = member
+        return disabled
 
+    def auto_resolve(self) -> list[AbstractMember]:
+        """Resolve overlapping members by score, disabling the colliding half.
+
+        Returns the members that were disabled so callers can preview the
+        change before committing it.
+        """
+        disabled = self.auto_resolve_preview()
+        for member in disabled:
+            member.set_enabled(False)
         self.refresh_collisions()
+        return disabled
 
     def iter_packable_members(
         self, start: int | None = None
@@ -597,6 +641,28 @@ class Structure:
         return None
 
     @staticmethod
+    def _declaration_parses(cdecl: str) -> bool:
+        """True when ``cdecl`` parses as a C type declaration.
+
+        Used to gate the destructive overwrite path in :meth:`set_cdecl`.
+        ``parse_decl`` returns the declared name on success and ``None`` on
+        failure (``PT_SIL`` keeps IDA quiet about malformed edits).
+        """
+        if not cdecl:
+            return False
+        try:
+            out_tif = ida_typeinf.tinfo_t()
+            parsed_name = ida_typeinf.parse_decl(
+                out_tif,
+                ida_typeinf.get_idati(),
+                cdecl,
+                ida_typeinf.PT_TYP | ida_typeinf.PT_SIL,
+            )
+        except Exception:  # noqa: BLE001 — version/format tolerance
+            return False
+        return parsed_name is not None
+
+    @staticmethod
     def _load_named_type(name: str) -> ida_typeinf.tinfo_t | None:
         tinfo = ida_typeinf.tinfo_t()
         if tinfo.get_named_type(ida_typeinf.get_idati(), name):
@@ -631,7 +697,12 @@ class Structure:
         if not structure_name:
             log_warning("Failed to determine type name from the declaration.", True)
             return None
+        with _type_write_undo(f"forge: set type {structure_name}"):
+            return self._set_cdecl_impl(cdecl, structure_name, origin)
 
+    def _set_cdecl_impl(
+        self, cdecl: str, structure_name: str, origin: int = 0
+    ) -> ida_typeinf.tinfo_t | None:
         if forge_types.create_type(structure_name, cdecl):
             self.created_type_name = structure_name
             log_debug(f"Created type {structure_name}")
@@ -646,6 +717,18 @@ class Structure:
         if reply != QtWidgets.QMessageBox.Yes:
             log_error(
                 f"Structure {structure_name} probably already exists. Please check manually.",
+                True,
+            )
+            return None
+
+        # The overwrite flow deletes the old type before creating the new
+        # one. Validate the edited declaration first so a malformed edit
+        # cannot destroy the existing type (the DB would end up with no
+        # type at all — which silently breaks child scans on the parent).
+        if not self._declaration_parses(cdecl):
+            log_error(
+                "The edited declaration could not be parsed; "
+                f"the existing type {structure_name} was kept.",
                 True,
             )
             return None

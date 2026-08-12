@@ -5,10 +5,11 @@ from dataclasses import dataclass
 from types import SimpleNamespace
 
 import ida_hexrays
+import ida_typeinf
 import idaapi
 
 from forge.api import hexrays as hexrays_api
-from forge.api.hexrays import ctype, decompile, is_legal_type
+from forge.api.hexrays import collect_ctree_items_near_ea, ctype, decompile, is_legal_type
 from forge.api.members import AbstractMember, materialize_linked_child_member_type
 from forge.api.scan_object import (
     ObjectType,
@@ -17,17 +18,12 @@ from forge.api.scan_object import (
     StructureReferenceObject,
     _extract_offset_expression,
     _make_offset_scan_object,
- )
+)
 from forge.api.scanner import NewDeepScanVisitor
 from forge.api.structure import Structure
 from forge.util.logging import log_debug, log_info, log_warning
 
-
-
-
-
 from .dialogs import ScannedVariableChooser
-
 
 
 def _form_module():
@@ -93,6 +89,23 @@ def _get_funcs_calling_address(ea: int) -> set[int]:
 
 class ChildScanMixin:
     @staticmethod
+    def _parent_type_exists_in_idb(parent_struct_name: str) -> bool:
+        """True when ``parent_struct_name`` resolves in the IDB type table.
+
+        Child scanning matches ``memptr``/``memref`` nodes, which the
+        decompiler only emits for structures defined in the IDB. Checking up
+        front turns the silent "no results" case into an actionable warning.
+        """
+        if not parent_struct_name:
+            return False
+        try:
+            tinfo = ida_typeinf.tinfo_t()
+            return tinfo.get_named_type(
+                ida_typeinf.get_idati(), parent_struct_name, ida_typeinf.NTF_TYPE
+            )
+        except Exception:  # noqa: BLE001 — wait for the IDB to be fully loaded
+            return False
+    @staticmethod
     def _warn_unimplemented(action_name: str) -> None:
         log_warning(f"{action_name} is not implemented yet.", True)
 
@@ -119,29 +132,7 @@ class ChildScanMixin:
         if target_ea == idaapi.BADADDR:
             return None
 
-        candidates = []
-        for item in getattr(cfunc, "treeitems", []):
-            if getattr(item, "ea", idaapi.BADADDR) == target_ea:
-                candidates.append(item)
-
-        eamap = getattr(cfunc, "eamap", None)
-        if not candidates and eamap is not None:
-            try:
-                candidates.extend(list(eamap.get(target_ea, [])))
-            except Exception:
-                pass
-
-        if not candidates:
-            body = getattr(cfunc, "body", None)
-            if body is not None and hasattr(body, "find_closest_addr"):
-                try:
-                    closest_item = body.find_closest_addr(target_ea)
-                except Exception:
-                    closest_item = None
-                if closest_item is not None:
-                    candidates.append(closest_item)
-
-        for item in candidates:
+        for item in collect_ctree_items_near_ea(cfunc, target_ea):
             resolved = ScanObject.create(cfunc, item)
             if resolved is not None:
                 return resolved
@@ -195,7 +186,7 @@ class ChildScanMixin:
     ) -> ScanObject | None:
         evidence_ea = getattr(evidence, "ea", idaapi.BADADDR)
         evidence_func_ea = getattr(evidence, "func_ea", idaapi.BADADDR)
-        if evidence_ea == idaapi.BADADDR or evidence_func_ea == idaapi.BADADDR:
+        if idaapi.BADADDR in (evidence_ea, evidence_func_ea):
             return None
 
         seeded = copy.copy(scan_object)
@@ -243,39 +234,7 @@ class ChildScanMixin:
     def _iter_items_near_ea(cls, cfunc: ida_hexrays.cfunc_t, target_ea: int) -> tuple[object, ...]:
         if target_ea == idaapi.BADADDR:
             return ()
-
-        items: list[object] = []
-        seen: set[int] = set()
-
-        def add(item) -> None:
-            if item is None:
-                return
-            item_id = id(item)
-            if item_id in seen:
-                return
-            seen.add(item_id)
-            items.append(item)
-
-        for item in getattr(cfunc, "treeitems", []):
-            if getattr(item, "ea", idaapi.BADADDR) == target_ea:
-                add(item)
-
-        eamap = getattr(cfunc, "eamap", None)
-        if eamap is not None:
-            try:
-                for item in eamap.get(target_ea, []):
-                    add(item)
-            except Exception:
-                pass
-
-        body = getattr(cfunc, "body", None)
-        if body is not None and hasattr(body, "find_closest_addr"):
-            try:
-                add(body.find_closest_addr(target_ea))
-            except Exception:
-                pass
-
-        return tuple(items)
+        return tuple(collect_ctree_items_near_ea(cfunc, target_ea, exhaustive=True))
 
     @staticmethod
     def _expression_ea(cfunc: ida_hexrays.cfunc_t, expr) -> int:
@@ -288,7 +247,8 @@ class ChildScanMixin:
 
         try:
             return ScanObject.get_expression_address(cfunc, expr)
-        except Exception:
+        except Exception:  # noqa: BLE001 — stale expr after IDB changes
+            log_debug(f"No expression address for {getattr(expr, 'op', '?')}")
             return idaapi.BADADDR
 
     @classmethod
@@ -327,8 +287,8 @@ class ChildScanMixin:
             try:
                 if matcher(expr):
                     return True
-            except Exception:
-                pass
+            except Exception:  # noqa: BLE001 — matcher runs against live ctree objects
+                log_debug("is_target matcher raised; falling back to offset parse")
 
         parsed_target = cls._parse_member_assignment_target(expr)
         if parsed_target is None:
@@ -373,7 +333,8 @@ class ChildScanMixin:
             specific = getattr(current, "to_specific_type", current)
             try:
                 parent_item = body.find_parent_of(specific)
-            except Exception:
+            except Exception:  # noqa: BLE001 — stale cfunc mid-traversal
+                log_debug("find_parent_of failed; stopping parent walk")
                 break
             parent_expr = cls._coerce_ctree_expr(parent_item)
             if parent_expr is None or parent_expr is current or id(parent_expr) in seen:
@@ -480,7 +441,7 @@ class ChildScanMixin:
                 return None
             scan_object = _make_offset_scan_object(base_object, offset)
 
-        setattr(scan_object, "func_ea", getattr(cfunc, "entry_ea", idaapi.BADADDR))
+        scan_object.func_ea = getattr(cfunc, "entry_ea", idaapi.BADADDR)
         return scan_object
 
     @staticmethod
@@ -489,12 +450,13 @@ class ChildScanMixin:
         if callable(matcher):
             try:
                 return bool(matcher(expr))
-            except Exception:
+            except Exception:  # noqa: BLE001 — matcher against live ctree objects
+                log_debug("is_target matcher raised; treating as no match")
                 return False
 
         obj_ea = getattr(scan_object, "ea", idaapi.BADADDR)
         expr_ea = getattr(expr, "ea", idaapi.BADADDR)
-        return obj_ea != idaapi.BADADDR and expr_ea != idaapi.BADADDR and obj_ea == expr_ea
+        return idaapi.BADADDR not in (obj_ea, expr_ea) and obj_ea == expr_ea
 
     @staticmethod
     def _resolve_parent_argument_index(
@@ -631,7 +593,7 @@ class ChildScanMixin:
                     seed.scan_object,
                     parent_expr=parent_expr,
                     evidence_ea=self._expression_ea(caller_cfunc, parent_expr),
-                    caller_path=seed.caller_path + (seed.function_ea,),
+                    caller_path=(*seed.caller_path, seed.function_ea),
                 )
                 if caller_seed is not None:
                     log_debug(
@@ -731,6 +693,39 @@ class ChildScanMixin:
 
 
 
+    @staticmethod
+    def _sorted_scan_evidence(member: AbstractMember | None) -> list[ScanObject]:
+        """Deduplicate and order a member's scan evidence deterministically."""
+        return sorted(
+            Structure.dedupe_scanned_variables(
+                getattr(member, "scanned_variables", set())
+            ),
+            key=lambda scan_variable: (
+                getattr(scan_variable, "func_ea", idaapi.BADADDR),
+                getattr(scan_variable, "ea", idaapi.BADADDR),
+                str(getattr(scan_variable, "name", "")),
+            ),
+        )
+
+    @staticmethod
+    def _member_scan_tinfo(
+        member: AbstractMember | None, warn
+    ):
+        """Return the member's tinfo when it is usable for child scanning."""
+        tinfo = getattr(member, "tinfo", None)
+        if tinfo is None:
+            warn("The selected row does not have enough type information to scan a child structure.")
+            return None
+
+        try:
+            legal_type = is_legal_type(tinfo)
+        except Exception:  # noqa: BLE001 — corrupt member tinfo rejects the scan
+            legal_type = False
+        if not legal_type:
+            warn("The selected row uses a type that cannot be scanned as a child structure.")
+            return None
+        return tinfo
+
     def _build_child_scan_plan(
         self,
         member: AbstractMember | None,
@@ -744,16 +739,7 @@ class ChildScanMixin:
             if show_warnings:
                 log_warning(message, True)
 
-        scanned_variables = sorted(
-            Structure.dedupe_scanned_variables(
-                getattr(member, "scanned_variables", set())
-            ),
-            key=lambda scan_variable: (
-                getattr(scan_variable, "func_ea", idaapi.BADADDR),
-                getattr(scan_variable, "ea", idaapi.BADADDR),
-                str(getattr(scan_variable, "name", "")),
-            ),
-        )
+        scanned_variables = self._sorted_scan_evidence(member)
         if not scanned_variables:
             warn("The selected row does not have scan evidence for child scanning yet.")
             return None
@@ -763,17 +749,8 @@ class ChildScanMixin:
             for scan_variable in scanned_variables
         )
 
-        tinfo = getattr(member, "tinfo", None)
+        tinfo = self._member_scan_tinfo(member, warn)
         if tinfo is None:
-            warn("The selected row does not have enough type information to scan a child structure.")
-            return None
-
-        try:
-            legal_type = is_legal_type(tinfo)
-        except Exception:
-            legal_type = False
-        if not legal_type:
-            warn("The selected row uses a type that cannot be scanned as a child structure.")
             return None
 
         if hasattr(tinfo, "is_ptr") and tinfo.is_ptr():
@@ -808,6 +785,21 @@ class ChildScanMixin:
                 return None
             parent_struct_name = parent_struct_names[0]
             scan_object = type(scan_object)(parent_struct_name, member.offset)
+
+        # The child scan matches member-access (memptr) nodes in the
+        # decompilation, which only exist when the parent structure is defined
+        # in the IDB type table. A form-only structure (e.g. after the IDA type
+        # was deleted) decompiles to raw integer arithmetic that no matcher can
+        # recover — fail fast with an actionable reason instead of silently
+        # producing "Unable to derive child structure scan results".
+        if not self._parent_type_exists_in_idb(parent_struct_name):
+            warn(
+                "The parent structure type "
+                f"'{parent_struct_name}' is not defined in the IDB. "
+                "Create the type first (Create Type on the parent), "
+                "then retry the child scan.",
+            )
+            return None
 
         function_eas = tuple(
             sorted(
@@ -867,13 +859,7 @@ class ChildScanMixin:
     ) -> bool:
         scanned_any = False
         visitor_cls = getattr(_form_module(), "NewDeepScanVisitor", NewDeepScanVisitor)
-        evidence_by_function: dict[int, list[ScanObject]] = {}
-        for scan_variable in getattr(plan, "scan_variables", ()) or ():
-            normalized = self._normalize_scan_variable(scan_variable)
-            func_ea = getattr(normalized, "func_ea", idaapi.BADADDR)
-            if func_ea == idaapi.BADADDR:
-                continue
-            evidence_by_function.setdefault(func_ea, []).append(normalized)
+        evidence_by_function = self._collect_evidence_by_function(plan)
 
         for func_ea in plan.function_eas:
             cfunc = self._prepare_scan_cfunc(func_ea)
@@ -881,45 +867,75 @@ class ChildScanMixin:
                 continue
 
             scan_variables = evidence_by_function.get(func_ea) or [plan.scan_object]
-            for scan_variable in scan_variables:
-                seeded_scan_object = self._seed_scan_object_from_evidence(
-                    plan.scan_object, scan_variable
+            if self._scan_evidence_in_function(
+                child_structure, cfunc, scan_variables, plan, visitor_cls
+            ):
+                scanned_any = True
+
+        return scanned_any
+
+    @staticmethod
+    def _collect_evidence_by_function(plan: ChildScanPlan) -> dict[int, list[ScanObject]]:
+        """Group the plan's scan variables by their evidence function."""
+        evidence_by_function: dict[int, list[ScanObject]] = {}
+        for scan_variable in getattr(plan, "scan_variables", ()) or ():
+            normalized = ChildScanMixin._normalize_scan_variable(scan_variable)
+            func_ea = getattr(normalized, "func_ea", idaapi.BADADDR)
+            if func_ea == idaapi.BADADDR:
+                continue
+            evidence_by_function.setdefault(func_ea, []).append(normalized)
+        return evidence_by_function
+
+    def _scan_evidence_in_function(
+        self,
+        child_structure: Structure,
+        cfunc: ida_hexrays.cfunc_t,
+        scan_variables,
+        plan: ChildScanPlan,
+        visitor_cls,
+    ) -> bool:
+        """Run the deep scan for one evidence function; True if any visitor ran."""
+        scanned_any = False
+        for scan_variable in scan_variables:
+            seeded_scan_object = self._seed_scan_object_from_evidence(
+                plan.scan_object, scan_variable
+            )
+            if seeded_scan_object is None:
+                log_warning(
+                    f"Skipping child scan evidence without a usable location in {hex(cfunc.entry_ea)}",
+                    True,
                 )
-                if seeded_scan_object is None:
-                    log_warning(
-                        f"Skipping child scan evidence without a usable location in {hex(func_ea)}",
-                        True,
-                    )
-                    continue
+                continue
 
-                inferred_roots = self._infer_child_scan_roots(cfunc, seeded_scan_object)
-                if inferred_roots:
-                    log_info(
-                        "Child scan inferred "
-                        f"{len(inferred_roots)} assignment root(s) for "
-                        f"{getattr(seeded_scan_object, 'name', '<unnamed>')} in {hex(func_ea)}"
-                    )
-                    roots = inferred_roots
-                else:
-                    log_warning(
-                        "Child scan fell back to seeded member evidence for "
-                        f"{getattr(seeded_scan_object, 'name', '<unnamed>')} in {hex(func_ea)}"
-                    )
-                    roots = (seeded_scan_object,)
+            inferred_roots = self._infer_child_scan_roots(cfunc, seeded_scan_object)
+            if inferred_roots:
+                log_info(
+                    "Child scan inferred "
+                    f"{len(inferred_roots)} assignment root(s) for "
+                    f"{getattr(seeded_scan_object, 'name', '<unnamed>')} in {hex(cfunc.entry_ea)}"
+                )
+                roots = inferred_roots
+            else:
+                log_warning(
+                    "Child scan fell back to seeded member evidence for "
+                    f"{getattr(seeded_scan_object, 'name', '<unnamed>')} in {hex(cfunc.entry_ea)}"
+                )
+                roots = (seeded_scan_object,)
 
-                for root in roots:
-                    root_cfunc = self._prepare_scan_cfunc(
-                        getattr(root, "func_ea", idaapi.BADADDR)
-                    ) or cfunc
-                    visitor = visitor_cls(
-                        root_cfunc,
-                        child_structure.main_offset,
-                        root,
-                        child_structure,
-                        recurse_calls=True,
-                    )
-                    visitor.process()
-                    scanned_any = True
+            for root in roots:
+                root_cfunc = self._prepare_scan_cfunc(
+                    getattr(root, "func_ea", idaapi.BADADDR)
+                ) or cfunc
+                visitor = visitor_cls(
+                    root_cfunc,
+                    child_structure.main_offset,
+                    root,
+                    child_structure,
+                    recurse_calls=True,
+                    skip_until_object=False,
+                )
+                visitor.process()
+                scanned_any = True
 
         return scanned_any
 

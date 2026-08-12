@@ -16,7 +16,7 @@ def get_inverted(func_ea):
     log_debug(
         f"Getting inverted for {func_ea}, keys: {swap_if_storage.keys()}, key_keys: {list(swap_if_storage[func_rva].values())}"
     )
-    return sorted(list(swap_if_storage[func_rva].values()))
+    return sorted(swap_if_storage[func_rva].values())
 
 
 def set_inverted(func_ea, if_ea):

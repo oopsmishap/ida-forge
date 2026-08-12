@@ -3,17 +3,33 @@ from __future__ import annotations
 import copy
 import csv
 import io
-from dataclasses import dataclass
+from collections.abc import Iterator
 from enum import IntEnum
-from typing import Dict, Optional
 
+import ida_funcs
 import ida_hexrays
 import ida_kernwin
 import ida_lines
-import ida_funcs
 import idaapi
 
-from forge.util.qt import QtCore, QtGui, QtWidgets, qt_exec, qt_item_flags
+from forge.api.hexrays import (
+    collect_ctree_items_near_ea,
+    decompile,
+)
+from forge.api.members import AbstractMember, Member, VirtualTable, parse_user_tinfo
+from forge.api.scan_object import ScanObject
+from forge.api.structure import Structure, StructureRelationship
+from forge.api.ui import set_row_background_color, set_row_foreground_color
+from forge.features.structure_builder.child_scan import ChildScanMixin
+from forge.features.structure_builder.dialogs import (
+    BulkMemberEditorDialog,
+    MemberEditorDialog,
+    MemberEditorValues,
+)
+from forge.util.logging import log_debug, log_warning
+from forge.util.qt import QtCore, QtGui, QtWidgets, qt_exec, qt_flag_value, qt_item_flags
+
+from .config import config
 from .ui_form import Ui_view_form
 
 QSignalBlocker = QtCore.QSignalBlocker
@@ -23,22 +39,6 @@ QTreeWidgetItem = QtWidgets.QTreeWidgetItem
 QMenu = QtWidgets.QMenu
 QTableWidgetItem = QtWidgets.QTableWidgetItem
 QWidget = QtWidgets.QWidget
-
-from forge.api.hexrays import decompile, is_legal_type
-from forge.api.members import AbstractMember, Member, VirtualTable, parse_user_tinfo
-from forge.api.scan_object import ScanObject
-from forge.api.scanner import NewDeepScanVisitor
-from forge.api.structure import Structure, StructureRelationship
-from forge.api.ui import set_row_background_color, set_row_foreground_color
-from forge.features.structure_builder.child_scan import ChildScanMixin, ChildScanPlan
-from forge.features.structure_builder.dialogs import (
-    BulkMemberEditorDialog,
-    MemberEditorDialog,
-    MemberEditorValues,
-)
-from forge.util.logging import log_debug, log_warning
-from .config import config
-
 
 class Column(IntEnum):
     offset = 0
@@ -61,7 +61,7 @@ class StructureBuilderForm(ChildScanMixin, ida_kernwin.PluginForm):
         super().__init__()
         self.parent = None
         self.ui = None
-        self.structures: Dict[str, Structure] = {}
+        self.structures: dict[str, Structure] = {}
         self.current_structure: Structure | None = None
         self.layout = None
         self._shortcut_actions: list[QtGui.QAction] = []
@@ -85,6 +85,16 @@ class StructureBuilderForm(ChildScanMixin, ida_kernwin.PluginForm):
         self.update_structure_fields()
 
     def OnClose(self, _form):
+        self.reset()
+
+    def reset(self) -> None:
+        """Drop the in-memory scan models and cached UI state.
+
+        Stale structures from a previous DB session must not survive a close
+        or plugin reload — the relaunched form starts from an empty scanner.
+        """
+        self.structures.clear()
+        self.current_structure = None
         self._reset_ui_state()
 
     def _reset_ui_state(self) -> None:
@@ -251,9 +261,11 @@ class StructureBuilderForm(ChildScanMixin, ida_kernwin.PluginForm):
         self.ui.tbl_structure.setSelectionMode(
             QtWidgets.QAbstractItemView.ExtendedSelection
         )
+        # qt_flag_value: bitwise OR on PySide6's EditTrigger enums would trip
+        # the PyQt5-shim RuntimeWarning; combine the int values instead.
         self.ui.tbl_structure.setEditTriggers(
-            QtWidgets.QAbstractItemView.DoubleClicked
-            | QtWidgets.QAbstractItemView.EditKeyPressed
+            qt_flag_value(QtWidgets.QAbstractItemView.DoubleClicked)
+            | qt_flag_value(QtWidgets.QAbstractItemView.EditKeyPressed)
         )
         # Per-state row colors (origin / disabled / collision) carry
         # the visual structure. The Qt default alternating-row painter
@@ -596,7 +608,7 @@ class StructureBuilderForm(ChildScanMixin, ida_kernwin.PluginForm):
                     child,
                     parent=item,
                     relationship=child_relationship,
-                    path=path + (structure.name,),
+                    path=(*path, structure.name),
                 )
 
         roots = [
@@ -764,7 +776,7 @@ class StructureBuilderForm(ChildScanMixin, ida_kernwin.PluginForm):
 
         self._normalize_member_child_links(duplicate)
 
-    def create_structure(self, name: Optional[str]):
+    def create_structure(self, name: str | None):
         if name is None:
             return None
 
@@ -1467,6 +1479,12 @@ class StructureBuilderForm(ChildScanMixin, ida_kernwin.PluginForm):
             log_warning("Cannot move rows to a negative offset.", True)
             return
 
+        moved = {id(member) for member in members}
+        original_offsets = {
+            id(member): member.offset for member in self.current_structure.members
+        }
+        original_main_offset = self.current_structure.main_offset
+
         for member in members:
             old_offset = member.offset
             member.offset += delta
@@ -1476,6 +1494,25 @@ class StructureBuilderForm(ChildScanMixin, ida_kernwin.PluginForm):
 
         self.current_structure.members.sort()
         self.current_structure.refresh_collisions()
+
+        # Reject a nudge that overlaps a member the user did not move — the
+        # offset table must stay a valid, non-overlapping sequence.
+        collides_outside_selection = any(
+            self.current_structure.has_collision(index)
+            and id(member) not in moved
+            for index, member in enumerate(self.current_structure.members)
+        )
+        if collides_outside_selection:
+            for member in self.current_structure.members:
+                member.offset = original_offsets[id(member)]
+            self.current_structure.set_main_offset(original_main_offset)
+            self.current_structure.members.sort()
+            self.current_structure.refresh_collisions()
+            log_warning(
+                "Cannot move rows: would overlap a non-selected member.", True
+            )
+            return
+
         self.update_structure_fields()
         if self.ui is not None:
             self.ui.tbl_structure.clearSelection()
@@ -1750,34 +1787,15 @@ class StructureBuilderForm(ChildScanMixin, ida_kernwin.PluginForm):
         def _line_for_item(item) -> str | None:
             try:
                 line_no, _column = cfunc.find_item_coords(item)
-            except Exception:
+            except Exception:  # noqa: BLE001 — stale item after re-decompilation
+                log_debug("find_item_coords failed for a candidate item")
                 return None
             if 1 <= line_no <= len(pseudocode):
                 return _pseudocode_line_text(pseudocode[line_no - 1])
             return None
 
 
-        candidates = []
-        for item in getattr(cfunc, "treeitems", []):
-            if getattr(item, "ea", idaapi.BADADDR) == target_ea:
-                candidates.append(item)
-
-        eamap = getattr(cfunc, "eamap", None)
-        if not candidates and eamap is not None:
-            try:
-                candidates.extend(list(eamap.get(target_ea, [])))
-            except Exception:
-                pass
-
-        if not candidates:
-            body = getattr(cfunc, "body", None)
-            if body is not None and hasattr(body, "find_closest_addr"):
-                try:
-                    closest_item = body.find_closest_addr(target_ea)
-                except Exception:
-                    closest_item = None
-                if closest_item is not None:
-                    candidates.append(closest_item)
+        candidates = collect_ctree_items_near_ea(cfunc, target_ea)
 
         lines = []
         for item in candidates:
@@ -1804,7 +1822,7 @@ class StructureBuilderForm(ChildScanMixin, ida_kernwin.PluginForm):
             if root
             else getattr(scan_object, "function_name", "")
         ) or (ida_funcs.get_func_name(func_ea) if func_ea != idaapi.BADADDR else "")
-        if func_ea == idaapi.BADADDR or target_ea == idaapi.BADADDR:
+        if idaapi.BADADDR in (func_ea, target_ea):
             return function_name or ""
         return f"{function_name}@{hex(target_ea)}"
 
@@ -1963,6 +1981,17 @@ class StructureBuilderForm(ChildScanMixin, ida_kernwin.PluginForm):
     def structure_table_resolve(self):
         if self.current_structure is None:
             return
+
+        disabled = self.current_structure.auto_resolve_preview()
+        if disabled:
+            reply = ida_kernwin.ask_yn(
+                ida_kernwin.ASKBTN_NO,
+                "HIDECANCEL\n"
+                f"{len(disabled)} overlapping member(s) would be disabled "
+                "(collisions are resolved by scan score). Continue?",
+            )
+            if reply != ida_kernwin.ASKBTN_YES:
+                return
 
         self.current_structure.auto_resolve()
         self.update_structure_fields()

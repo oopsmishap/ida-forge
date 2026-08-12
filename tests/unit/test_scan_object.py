@@ -552,6 +552,7 @@ def test_memory_allocation_object_create_handles_missing_size_argument(monkeypat
 def test_get_argument_index_resolves_formal_argument_ordinals():
     import importlib.util
     from pathlib import Path
+
     import ida_hexrays
     if not hasattr(ida_hexrays, "ctree_parentee_t"):
         ida_hexrays.ctree_parentee_t = type("ctree_parentee_t", (), {})

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from importlib import import_module
 from types import SimpleNamespace
+from typing import ClassVar
 
 import pytest
 
@@ -9,16 +10,16 @@ from forge.api.structure import Structure
 
 hexrays_api = import_module("forge.api.hexrays")
 scanner_api = import_module("forge.api.scanner")
-setattr(hexrays_api, "decompile", lambda *_args, **_kwargs: None)
-setattr(hexrays_api, "get_funcs_referencing_address", lambda *_args, **_kwargs: [])
-setattr(hexrays_api, "is_legal_type", lambda *_args, **_kwargs: True)
-setattr(scanner_api, "NewShallowScanVisitor", type("NewShallowScanVisitor", (), {}))
+hexrays_api.decompile = lambda *_args, **_kwargs: None
+hexrays_api.get_funcs_referencing_address = lambda *_args, **_kwargs: []
+hexrays_api.is_legal_type = lambda *_args, **_kwargs: True
+scanner_api.NewShallowScanVisitor = type("NewShallowScanVisitor", (), {})
 
 actions_module = import_module("forge.features.structure_builder.actions")
 
 
 class _FakeVisitor:
-    calls = []
+    calls: ClassVar[list] = []
 
     def __init__(self, *args, **kwargs):
         self.args = args
@@ -181,3 +182,96 @@ def test_root_scan_does_not_overwrite_existing_non_manual_provenance(monkeypatch
 
     assert structure.provenance.kind == "child_scan"
     assert structure.provenance.root_object_name == "Parent.child_ptr"
+
+
+# ---------------------------------------------------------------------------
+# T3.5 G-gap tests (actions)
+# ---------------------------------------------------------------------------
+
+
+def test_ensure_structure_selected_no_selection_prompts_and_warns(monkeypatch):
+    """G19: no current structure -> show + prompt; declined prompt warns and
+    reports failure, accepted prompt succeeds."""
+    form = actions_module.structure_form
+    form.current_structure = None
+    warnings = []
+    monkeypatch.setattr(actions_module, "log_warning", lambda m, *a, **k: warnings.append(m), raising=False)
+
+    created = []
+
+    def prompt():
+        structure = form.create_structure("Prompted")
+        created.append(structure)
+        return structure
+
+    monkeypatch.setattr(form, "prompt_create_structure", prompt)
+    assert actions_module.StructureBuilderAction._ensure_structure_selected() is True
+    assert created and form.current_structure is created[0]
+
+    form.current_structure = None
+    monkeypatch.setattr(form, "prompt_create_structure", lambda: None)
+    assert actions_module.StructureBuilderAction._ensure_structure_selected() is False
+    assert any("No structure selected" in w for w in warnings)
+
+
+def test_scan_global_references_empty_xref_set_warns(monkeypatch):
+    """G16: a global with no referencing functions warns and does nothing."""
+    calls = {"warned": [], "visited": []}
+
+    class _Obj:
+        object_ea = 0x140001000
+        name = "g_obj"
+        tinfo = None
+        id = 1
+
+    monkeypatch.setattr(actions_module, "get_funcs_referencing_address", lambda ea: [])
+    monkeypatch.setattr(
+        actions_module, "log_warning",
+        lambda m, *a, **k: calls["warned"].append(m), raising=False,
+    )
+    monkeypatch.setattr(
+        actions_module, "NewDeepScanVisitor",
+        lambda *a, **k: calls["visited"].append(a) or SimpleNamespace(process=lambda: None),
+        raising=False,
+    )
+
+    action = actions_module.DeepScanAction()
+    action._scan_global_references(_Obj(), origin=0, max_depth=0)
+
+    assert any("No function references" in w for w in calls["warned"])
+    assert calls["visited"] == []
+
+
+def test_prompt_scan_depth_parses_input(monkeypatch):
+    """G17: None cancels; empty means unlimited; garbage falls back to the
+    configured default; valid integers parse."""
+    import ida_kernwin
+
+    monkeypatch.setattr(ida_kernwin, "HIST_TYPE", 1, raising=False)
+    action = actions_module.DeepScanAction()
+
+    monkeypatch.setattr(ida_kernwin, "ask_str", lambda dflt, hist, title: None)
+    assert action._prompt_scan_depth() is None
+
+    monkeypatch.setattr(ida_kernwin, "ask_str", lambda dflt, hist, title: "   ")
+    assert action._prompt_scan_depth() == 0
+
+    monkeypatch.setattr(ida_kernwin, "ask_str", lambda dflt, hist, title: "not-a-number")
+    assert action._prompt_scan_depth() == 3  # falls back to the configured default
+
+    monkeypatch.setattr(ida_kernwin, "ask_str", lambda dflt, hist, title: "7")
+    assert action._prompt_scan_depth() == 7
+
+
+def test_provenance_kind_for_object_mapping():
+    """G18: provenance kinds follow the scan-object id."""
+    class _Obj:
+        def __init__(self, id_):
+            self.id = id_
+
+    from forge.api.scan_object import ObjectType
+
+    assert actions_module.StructureBuilderAction._provenance_kind_for_object(_Obj(ObjectType.global_object)) == "global_root"
+    assert actions_module.StructureBuilderAction._provenance_kind_for_object(_Obj(ObjectType.structure_pointer)) == "upward_resolved_root"
+    assert actions_module.StructureBuilderAction._provenance_kind_for_object(_Obj(ObjectType.structure_reference)) == "upward_resolved_root"
+    assert actions_module.StructureBuilderAction._provenance_kind_for_object(_Obj(ObjectType.local_variable)) == "confirmed_root"

@@ -10,7 +10,6 @@ from forge.plugin import PLUGIN_NAME
 from forge.util.logging import log_debug, log_warning
 from forge.util.singleton import Singleton
 
-
 TAction = TypeVar("TAction")
 
 
@@ -82,7 +81,7 @@ class UIActionManager:
         for menu_action in self._menu_actions:
             try:
                 ida_kernwin.detach_action_from_menu(menu_action.menu_path, menu_action.id)
-            except Exception as e:
+            except Exception as e:  # noqa: BLE001 — stale menu entries after reload
                 log_warning(f"Could not detach action {menu_action.id}: {e}")
 
         for action in self._actions:
@@ -125,7 +124,7 @@ class UIActionManager:
                 self._main_menu_name,
                 PLUGIN_NAME,
             )
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001 — menu host may be missing in batch mode
             log_warning(f"Could not create menu '{PLUGIN_NAME}': {e}")
             return False
 
@@ -146,7 +145,7 @@ class UIActionManager:
                 menu_action.id,
                 0,
             )
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001 — action may already be attached
             log_warning(f"Could not attach action {menu_action.id}: {e}")
             return
 
@@ -169,7 +168,7 @@ def register_action(action: type[TAction]) -> type[TAction]:
 class HexraysPopupRequestHandler(ida_hexrays.Hexrays_Hooks):
     """Attach a registered action to the Hex-Rays popup menu."""
 
-    def __init__(self, action: "HexRaysPopupAction"):
+    def __init__(self, action: HexRaysPopupAction):
         super().__init__()
         self._action = action
 

@@ -7,7 +7,6 @@ from types import SimpleNamespace
 import ida_typeinf
 
 
-
 def _load_hexrays_module():
     hexrays_path = Path(__file__).resolve().parents[2] / "src" / "forge" / "api" / "hexrays.py"
     spec = util.spec_from_file_location("forge.api.hexrays_test", hexrays_path)
@@ -140,3 +139,152 @@ def test_is_legal_type_rejects_incomplete_forward_decl_pointer():
     pointer = FakeType("Widget *", pointed=forward_decl, size=8)
 
     assert hexrays_module.is_legal_type(pointer) is False
+
+
+def _make_cfunc(hexrays_module, *, treeitems=None, eamap=None, closest=None):
+    if closest is not None:
+        body = SimpleNamespace(find_closest_addr=lambda ea: closest)
+    else:
+        body = SimpleNamespace(
+            find_closest_addr=lambda ea: (_ for _ in ()).throw(RuntimeError("stale"))
+        )
+    return SimpleNamespace(
+        treeitems=treeitems or [],
+        eamap=eamap,
+        body=body,
+    )
+
+
+def test_collect_ctree_items_near_ea_uses_treeitems_first():
+    hexrays_module = _load_hexrays_module()
+    item_a = SimpleNamespace(ea=0x401000)
+    item_b = SimpleNamespace(ea=0x401100)
+    cfunc = _make_cfunc(hexrays_module, treeitems=[item_a, item_b])
+
+    assert hexrays_module.collect_ctree_items_near_ea(cfunc, 0x401000) == [item_a]
+
+
+def test_collect_ctree_items_near_ea_short_circuits_on_candidates():
+    hexrays_module = _load_hexrays_module()
+    item = SimpleNamespace(ea=0x401000)
+    eamap_item = SimpleNamespace(ea=0x0)
+    cfunc = _make_cfunc(
+        hexrays_module,
+        treeitems=[item],
+        eamap={0x401000: [eamap_item]},
+        closest=SimpleNamespace(ea=0x0),
+    )
+
+    # Default (short-circuit) mode: treeitems hit wins, eamap/closest unused.
+    assert hexrays_module.collect_ctree_items_near_ea(cfunc, 0x401000) == [item]
+
+
+def test_collect_ctree_items_near_ea_exhaustive_merges_all_sources():
+    hexrays_module = _load_hexrays_module()
+    item = SimpleNamespace(ea=0x401000)
+    eamap_item = SimpleNamespace(ea=0x0)
+    closest_item = SimpleNamespace(ea=0x0)
+    cfunc = SimpleNamespace(
+        treeitems=[item],
+        eamap={0x401000: [eamap_item, item]},  # duplicate of the treeitem
+        body=SimpleNamespace(find_closest_addr=lambda ea: closest_item),
+    )
+
+    result = hexrays_module.collect_ctree_items_near_ea(
+        cfunc, 0x401000, exhaustive=True
+    )
+
+    # All sources contribute; duplicates by identity are dropped; None skipped.
+    assert [id(x) for x in result] == [id(item), id(eamap_item), id(closest_item)]
+
+
+def test_collect_ctree_items_near_ea_falls_back_when_eamap_raises():
+    hexrays_module = _load_hexrays_module()
+
+    class _RaisingMap(dict):
+        def get(self, key, default=None):
+            raise TypeError("simulated IDA API drift")
+
+    closest_item = SimpleNamespace(ea=0x0)
+    cfunc = SimpleNamespace(
+        treeitems=[],
+        eamap=_RaisingMap({0x401000: []}),
+        body=SimpleNamespace(find_closest_addr=lambda ea: closest_item),
+    )
+
+    assert hexrays_module.collect_ctree_items_near_ea(cfunc, 0x401000) == [
+        closest_item
+    ]
+
+
+def test_collect_ctree_items_near_ea_tolerates_stale_closest_lookup():
+    hexrays_module = _load_hexrays_module()
+    cfunc = _make_cfunc(hexrays_module, treeitems=[], eamap={})
+
+    # find_closest_addr raises (stale cfunc after IDB type changes) -> no items
+    assert hexrays_module.collect_ctree_items_near_ea(cfunc, 0x401000) == []
+
+
+def test_collect_ctree_items_near_ea_handles_badaddr_and_none_cfunc():
+    hexrays_module = _load_hexrays_module()
+
+    assert hexrays_module.collect_ctree_items_near_ea(None, 0x401000) == []
+    assert (
+        hexrays_module.collect_ctree_items_near_ea(SimpleNamespace(), -1) == []
+    )
+
+
+# ---------------------------------------------------------------------------
+# Tier 4: decompile guards (BADADDR / non-function EAs)
+# ---------------------------------------------------------------------------
+
+
+def _patch_decompile_deps(monkeypatch, hexrays_module):
+    calls = {"decompile": [], "warned": []}
+
+    monkeypatch.setattr(
+        hexrays_module.ida_hexrays, "decompile",
+        lambda ea: calls["decompile"].append(ea) or SimpleNamespace(),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        hexrays_module.ida_funcs, "get_func",
+        lambda ea: None, raising=False,
+    )
+    monkeypatch.setattr(
+        hexrays_module,
+        "log_warning",
+        lambda msg, *a, **k: calls["warned"].append(msg), raising=False,
+    )
+    return calls
+
+
+def test_decompile_rejects_badaddr(monkeypatch):
+    hexrays_module = _load_hexrays_module()
+    calls = _patch_decompile_deps(monkeypatch, hexrays_module)
+
+    assert hexrays_module.decompile(-1) is None
+    assert calls["decompile"] == []
+
+
+def test_decompile_rejects_non_function_ea(monkeypatch):
+    hexrays_module = _load_hexrays_module()
+    calls = _patch_decompile_deps(monkeypatch, hexrays_module)
+
+    assert hexrays_module.decompile(0x140000123) is None
+    assert calls["decompile"] == []
+    assert any("not a function" in msg for msg in calls["warned"])
+
+
+def test_decompile_delegates_to_real_function(monkeypatch):
+    hexrays_module = _load_hexrays_module()
+    calls = _patch_decompile_deps(monkeypatch, hexrays_module)
+    monkeypatch.setattr(
+        hexrays_module.ida_funcs, "get_func",
+        lambda ea: SimpleNamespace(start_ea=ea), raising=False,
+    )
+
+    result = hexrays_module.decompile(0x1400014F0)
+
+    assert calls["decompile"] == [0x1400014F0]
+    assert result is not None

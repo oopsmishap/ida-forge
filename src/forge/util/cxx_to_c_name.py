@@ -3,8 +3,12 @@ import re
 
 def _replace_cpp_operator_names(name):
     replacements = (
+        # longest-first so compound operators win over their prefixes
         ("<<=", "left_shift_assign_"),
         (">>=", "right_shift_assign_"),
+        ("<=>", "spaceship_"),
+        ("co_await", "co_await_"),
+        ("->*", "arrow_star_"),
         ("new[]", "new_array_"),
         ("delete[]", "delete_array_"),
         ("!=", "neq_"),

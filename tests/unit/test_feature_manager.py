@@ -74,5 +74,5 @@ def test_load_feature_propagates_import_errors(monkeypatch):
 
     monkeypatch.setattr(importlib, "import_module", fail_import)
 
-    with pytest.raises(ImportError, match="cannot import forge.features.broken"):
+    with pytest.raises(ImportError, match=r"cannot import forge\.features\.broken"):
         manager.load_feature("forge.features.broken")

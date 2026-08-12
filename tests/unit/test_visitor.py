@@ -14,6 +14,7 @@ if not hasattr(ida_hexrays, "ctree_parentee_t"):
 if "ida_idaapi" not in sys.modules:
     sys.modules["ida_idaapi"] = ModuleType("ida_idaapi")
 import ida_idaapi
+
 ida_idaapi.BADADDR = -1
 
 
@@ -37,7 +38,7 @@ def _stub_visitor_deps(monkeypatch):
 def test_recursive_downwards_object_visitor_skips_missing_parent(monkeypatch):
     visitor_module = _load_visitor_module()
     cfunc = SimpleNamespace(entry_ea=0x401000)
-    obj = SimpleNamespace(
+    SimpleNamespace(
         id=visitor_module.ObjectType.local_variable,
         ea=0x5000,
         name="arg0",
@@ -65,7 +66,7 @@ def test_recursive_downwards_object_visitor_skips_invalid_callee_ordinal(monkeyp
     monkeypatch.setattr(
         visitor_module,
         "decompile",
-        lambda _ea: SimpleNamespace(entry_ea=0x402000, argidx=[], get_lvars=lambda: []),
+        lambda _ea: SimpleNamespace(entry_ea=0x402000, argidx=[], get_lvars=list),
     )
     prepared_calls = []
     monkeypatch.setattr(visitor, "prepare_new_scan", lambda *args, **kwargs: prepared_calls.append(args), raising=False)

@@ -4,7 +4,6 @@ import sys
 
 import ida_kernwin
 
-
 MIN_PYTHON: tuple[int, int] = (3, 9)
 MIN_IDA: tuple[int, int] = (9, 0)
 
