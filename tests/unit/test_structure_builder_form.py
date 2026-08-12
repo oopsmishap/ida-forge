@@ -3214,3 +3214,47 @@ def test_on_close_clears_structure_models(monkeypatch):
 
     assert structure_form.structures == {}
     assert structure_form.current_structure is None
+
+
+def test_configure_table_edit_triggers_combine_int_values(monkeypatch):
+    """PySide6 regression: bitwise-ORing EditTrigger enums trips the
+    PyQt5-shim RuntimeWarning; _configure_table must combine int values."""
+    structure_form = _make_form(monkeypatch)
+    from types import SimpleNamespace as NS
+
+    class _Table:
+        def __init__(self):
+            self.edit_triggers = None
+
+        def setSelectionBehavior(self, value):
+            pass
+
+        def setSelectionMode(self, value):
+            pass
+
+        def setEditTriggers(self, value):
+            self.edit_triggers = value
+
+        def setAlternatingRowColors(self, value):
+            pass
+
+        def setSortingEnabled(self, value):
+            pass
+
+    table = _Table()
+    structure_form.ui = NS(tbl_structure=table)
+    monkeypatch.setattr(
+        form_module.QtWidgets,
+        "QAbstractItemView",
+        NS(
+            SelectRows=NS(value=1),
+            ExtendedSelection=NS(value=3),
+            DoubleClicked=NS(value=4),
+            EditKeyPressed=NS(value=8),
+        ),
+        raising=False,
+    )
+
+    structure_form._configure_table()
+
+    assert table.edit_triggers == 12  # 4 | 8, computed on plain ints

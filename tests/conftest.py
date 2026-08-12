@@ -294,8 +294,18 @@ def _qt_item_flags(*flags):
     for flag in flags:
         if flag is None:
             continue
-        combined |= flag
+        value = getattr(flag, "value", flag)
+        try:
+            combined |= int(value)
+        except (TypeError, ValueError):
+            continue
     return combined
+
+
+def _qt_flag_value(flag):
+    if flag is None:
+        return 0
+    return int(getattr(flag, "value", flag))
 
 
 _stub_module(
@@ -308,6 +318,7 @@ _stub_module(
     if hasattr(widget, "exec")
     else widget.exec_(*args, **kwargs),
     qt_item_flags=_qt_item_flags,
+    qt_flag_value=_qt_flag_value,
 )
 def _collect_ctree_items_near_ea(cfunc, ea: int, *, exhaustive: bool = False):
     """Faithful behavioral double of hexrays.collect_ctree_items_near_ea.

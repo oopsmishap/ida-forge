@@ -27,7 +27,7 @@ from forge.features.structure_builder.dialogs import (
     MemberEditorValues,
 )
 from forge.util.logging import log_debug, log_warning
-from forge.util.qt import QtCore, QtGui, QtWidgets, qt_exec, qt_item_flags
+from forge.util.qt import QtCore, QtGui, QtWidgets, qt_exec, qt_flag_value, qt_item_flags
 
 from .config import config
 from .ui_form import Ui_view_form
@@ -261,9 +261,11 @@ class StructureBuilderForm(ChildScanMixin, ida_kernwin.PluginForm):
         self.ui.tbl_structure.setSelectionMode(
             QtWidgets.QAbstractItemView.ExtendedSelection
         )
+        # qt_flag_value: bitwise OR on PySide6's EditTrigger enums would trip
+        # the PyQt5-shim RuntimeWarning; combine the int values instead.
         self.ui.tbl_structure.setEditTriggers(
-            QtWidgets.QAbstractItemView.DoubleClicked
-            | QtWidgets.QAbstractItemView.EditKeyPressed
+            qt_flag_value(QtWidgets.QAbstractItemView.DoubleClicked)
+            | qt_flag_value(QtWidgets.QAbstractItemView.EditKeyPressed)
         )
         # Per-state row colors (origin / disabled / collision) carry
         # the visual structure. The Qt default alternating-row painter
