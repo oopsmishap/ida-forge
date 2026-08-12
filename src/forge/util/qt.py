@@ -6,16 +6,82 @@ import importlib.util as _import_util
 
 QT_BINDING: str
 
-if _import_util.find_spec("PySide6"):
-    from PySide6 import QtCore, QtGui, QtWidgets  # noqa: F401 — importing QtGui/QtWidgets registers the submodules
 
-    QT_BINDING = "PySide6"
-    Signal = QtCore.Signal
-else:
-    from PyQt5 import QtCore
+class _DummyQtMeta(type):
+    """Metaclass so class-attribute lookups (``QMessageBox.Yes``) work."""
 
-    QT_BINDING = "PyQt5"
-    Signal = QtCore.pyqtSignal
+    def __getattr__(cls, _name):
+        return cls
+
+
+class _DummyQtClass(metaclass=_DummyQtMeta):
+    """Inert stand-in for any Qt class/enum used by GUI-only dialog paths.
+
+    Must be a real class (not an instance): GUI modules define subclasses of
+    Qt widgets at import time (``class ClickableQLabel(QtWidgets.QLabel)``),
+    which requires a class base.
+    """
+
+    def __init__(self, *args, **kwargs):
+        pass
+
+    def __call__(self, *args, **kwargs):
+        return self
+
+    def __getattr__(self, _name):
+        return self
+
+    def __and__(self, other):
+        return self
+
+    def __or__(self, other):
+        return self
+
+
+class _DummyQtNamespace:
+    """Returns dummy classes for any Qt attribute (QtCore/QtGui/QtWidgets)."""
+
+    def __getattr__(self, name):
+        return _DummyQtClass
+
+
+def _load_qt_binding():
+    """Import the active Qt binding, degrading to inert stubs when headless.
+
+    IDA ships PySide6 inside the install tree, but PySide6 refuses to load
+    unless running in the GUI build of IDA (idalib raises at its own
+    prerequisite check). Headless workers never reach the GUI dialog paths,
+    so a stub namespace keeps every module importable; it is the same
+    degradation the unit-test conftest applies. In GUI IDA or with PyQt5
+    present the real binding is used, so plugin behavior is unchanged.
+    """
+    if _import_util.find_spec("PySide6"):
+        try:
+            from PySide6 import (
+                QtCore,
+                QtGui,
+                QtWidgets,
+            )
+
+            return QtCore, QtGui, QtWidgets, QtCore.Signal, "PySide6"
+        except (ImportError, NotImplementedError):
+            pass
+
+    try:
+        from PyQt5 import QtCore
+
+        return QtCore, QtCore, QtCore, QtCore.pyqtSignal, "PyQt5"
+    except (ImportError, NotImplementedError):
+        namespace = _DummyQtNamespace()
+        return namespace, namespace, namespace, _dummy_signal, "stub"
+
+
+def _dummy_signal(*args, **kwargs):
+    """Stand-in for Qt's ``Signal`` factory used in widget class bodies."""
+    return _DummyQtClass()
+
+
+QtCore, QtGui, QtWidgets, Signal, QT_BINDING = _load_qt_binding()
 
 
 def qt_flag_value(flag):

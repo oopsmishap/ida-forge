@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from importlib import import_module
+from types import SimpleNamespace
 
 from forge.api import structure as structure_module
 from forge.api.structure import Structure
@@ -508,7 +509,12 @@ def _overwrite_setup(monkeypatch, structure_module):
         def question(*_a, **_k):
             return _QMessageBox.Yes
 
-    monkeypatch.setattr(structure_module.QtWidgets, "QMessageBox", _QMessageBox)
+    # set_cdecl imports QtWidgets lazily inside the overwrite branch; patch the
+    # source module attribute so that local import resolves to our fake.
+    qt_module = import_module("forge.util.qt")
+    monkeypatch.setattr(
+        qt_module, "QtWidgets", SimpleNamespace(QMessageBox=_QMessageBox)
+    )
     return recorded
 
 

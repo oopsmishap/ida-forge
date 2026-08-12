@@ -1,0 +1,1459 @@
+"""forge_api - a flat, self-describing, LLM-friendly API for ida-forge.
+
+Every user-visible forge capability is exposed as a single small function
+returning plain JSON-serializable data (dict/list/str/int/bool/None). There is
+no Qt, no hexrays widget, and no IDA dialog involved - ``import forge_api`` and
+``forge_api.help()`` work even outside an IDA Pro session; functions that need
+IDA raise a clear ``ForgeApiError`` when run without it.
+
+Browse the catalog::
+
+    import forge_api
+    forge_api.help()                 # full catalog (signatures, docs, examples)
+    forge_api.help("deep_scan")      # one entry
+
+The Structure Builder workflow is: ``create_structure`` -> ``deep_scan``/``add_member``
+(repeat / edit) -> ``finalize`` -> ``create_type`` (rebuilds the IDA type and
+applies it to every variable the scan recorded). See each function's docstring
+for the exact return shape; the ``example`` field in ``help()`` shows a concrete call.
+"""
+
+from __future__ import annotations
+
+import importlib
+import importlib.util
+import inspect
+import sys
+
+__version__ = "0.1.0"
+
+__all__ = [
+    "add_member",
+    "auto_resolve",
+    "clear_structures",
+    "create_child_types",
+    "create_field",
+    "create_structure",
+    "create_type",
+    "decompile",
+    "deep_scan",
+    "duplicate_structure",
+    "finalize",
+    "finalize_all",
+    "get_structure",
+    "guess_allocation",
+    "help",
+    "inverse_if",
+    "named_types",
+    "nudge_members",
+    "remove_members",
+    "remove_structure",
+    "rename_structure",
+    "scan_global",
+    "set_current",
+    "set_member",
+    "shallow_scan",
+    "structures",
+    "templated_apply",
+    "templated_decl",
+    "templated_keys",
+    "to_hex",
+    "to_usercall",
+    "to_vtable",
+    "type_of",
+]
+
+
+class ForgeApiError(RuntimeError):
+    """Raised for bad selections or an IDA-required function outside IDA."""
+
+
+def _ida_available() -> bool:
+    """True when an IDA Hex-Rays module is importable or already loaded.
+
+    ``find_spec`` covers fresh imports; the ``sys.modules`` fallback covers
+    conftest-stubbed environments (and a running IDA) where the module exists
+    but carries no ``__spec__``.
+    """
+    if "ida_hexrays" in sys.modules:
+        return True
+    return importlib.util.find_spec("ida_hexrays") is not None
+
+
+def _require_ida() -> None:
+    """Raise unless a real (or stubbed) IDA Hex-Rays module is importable."""
+    if not _ida_available():
+        raise ForgeApiError(
+            "forge_api.<function> requires an IDA Pro session with Hex-Rays"
+        )
+
+
+# --------------------------------------------------------------------------- #
+# self-describing catalog
+# --------------------------------------------------------------------------- #
+_API: dict[str, dict] = {}
+
+
+def api(*, group: str, returns: str, example: str):
+    def decorate(fn):
+        params = []
+        for name, param in inspect.signature(fn).parameters.items():
+            annotation = param.annotation
+            if annotation is inspect.Parameter.empty:
+                type_hint = ""
+            else:
+                type_hint = getattr(annotation, "__name__", str(annotation))
+            params.append(
+                {
+                    "name": name,
+                    "required": param.default is inspect.Parameter.empty,
+                    "type": type_hint,
+                }
+            )
+        _API[fn.__name__] = {
+            "group": group,
+            "doc": inspect.getdoc(fn) or "",
+            "signature": str(inspect.signature(fn)),
+            "params": params,
+            "returns": returns,
+            "example": example,
+        }
+        return fn
+
+    return decorate
+
+
+# --------------------------------------------------------------------------- #
+# headless structure store (mirrors structure_form.structures, isolated)
+# --------------------------------------------------------------------------- #
+class _State:
+    """Mutable holder for the headless store (functions never need `global`)."""
+
+    def __init__(self):
+        self.structures: dict = {}
+        self.current: str | None = None
+        self.templated = None
+
+
+_state = _State()
+_structures = _state.structures
+
+
+def _resolve_structure(structure_name: str | None = None, *, required: bool = True):
+    structure = None
+    if structure_name is not None:
+        structure = _structures.get(structure_name)
+    elif _state.current is not None:
+        structure = _structures.get(_state.current)
+    if required and structure is None:
+        if structure_name is not None:
+            raise ForgeApiError(f"no structure named {structure_name!r} in the forge_api store")
+        raise ForgeApiError(
+            "no structure selected; call forge_api.set_current(name) or pass structure=..."
+        )
+    return structure
+
+
+def _member_type_str(member):
+    tinfo = getattr(member, "tinfo", None)
+    dstr = getattr(tinfo, "dstr", None)
+    if callable(dstr):
+        try:
+            return dstr()
+        except Exception:  # noqa: BLE001 — stub tinfos may lack anything
+            return None
+    return None
+
+
+def _member_size(member):
+    tinfo = getattr(member, "tinfo", None)
+    get_size = getattr(tinfo, "get_size", None)
+    if callable(get_size):
+        try:
+            size = get_size()
+            if size >= 0:
+                return size
+        except Exception:  # noqa: BLE001 — stub tinfos may lack anything
+            return None
+    return None
+
+
+def _to_member_dict(member) -> dict:
+    score = None
+    try:
+        score = member.score
+    except Exception:  # noqa: BLE001 — score needs a well-formed tinfo
+        score = None
+    return {
+        "offset": getattr(member, "offset", 0),
+        "name": getattr(member, "name", ""),
+        "type": _member_type_str(member),
+        "size": _member_size(member),
+        "enabled": bool(getattr(member, "enabled", True)),
+        "is_array": bool(getattr(member, "is_array", False)),
+        "comment": getattr(member, "comment", ""),
+        "origin": getattr(member, "origin", 0),
+        "score": score,
+    }
+
+
+def _to_structure_dict(structure) -> dict:
+    return {
+        "name": structure.name,
+        "main_offset": structure.main_offset,
+        "created_type_name": structure.created_type_name,
+        "members": [_to_member_dict(member) for member in structure.members],
+        "collisions": list(structure.collisions),
+        "child_relationships": [
+            {
+                "parent_structure_name": rel.parent_structure_name,
+                "child_structure_name": rel.child_structure_name,
+                "parent_member_offset": rel.parent_member_offset,
+                "parent_member_name": rel.parent_member_name,
+                "relation_kind": rel.relation_kind,
+            }
+            for rel in structure.child_relationships
+        ],
+    }
+
+
+def _normalize_member_child_links(structure) -> None:
+    """Rebind each member's child link to its relationship (form mirror)."""
+    relationship_by_key = {
+        (rel.child_structure_name, rel.parent_member_offset): rel
+        for rel in structure.child_relationships
+    }
+    for member in structure.members:
+        child_name = getattr(member, "linked_child_structure_name", None)
+        if child_name is None:
+            continue
+        relationship = relationship_by_key.get((child_name, member.offset))
+        if relationship is None:
+            member.linked_child_structure_name = None
+            member.child_relation_kind = None
+            continue
+        member.child_relation_kind = relationship.relation_kind
+
+
+def _copy_duplicate_child_relationships(source, duplicate, structures: dict) -> None:
+    for relationship in source.child_relationships:
+        child_structure_name = (
+            duplicate.name
+            if relationship.child_structure_name == source.name
+            else relationship.child_structure_name
+        )
+        source_member = source.get_member_by_offset(relationship.parent_member_offset)
+        parent_member_name = (
+            source_member.name
+            if source_member is not None
+            else relationship.parent_member_name
+        )
+        duplicated_relationship = duplicate.add_child_relationship(
+            child_structure_name=child_structure_name,
+            parent_member_offset=relationship.parent_member_offset,
+            parent_member_name=parent_member_name,
+            relation_kind=relationship.relation_kind,
+        )
+        child = structures.get(child_structure_name)
+        if child is not None:
+            child.add_parent_relationship(duplicated_relationship)
+    _normalize_member_child_links(duplicate)
+
+
+def _unique_structure_name(base_name: str) -> str:
+    if base_name not in _structures:
+        return base_name
+    copy_index = 2
+    candidate = f"{base_name} Copy"
+    while candidate in _structures:
+        candidate = f"{base_name} Copy {copy_index}"
+        copy_index += 1
+    return candidate
+
+
+# --------------------------------------------------------------------------- #
+# meta
+# --------------------------------------------------------------------------- #
+@api(
+    group="meta",
+    returns="dict",
+    example='catalog = forge_api.help()',
+)
+def help(topic: str | None = None) -> dict:
+    """Return the self-describing catalog of every forge_api function.
+
+    With ``topic`` returns only that entry (raises :class:`ForgeApiError` for an
+    unknown name); without it returns all entries. Works outside IDA. Each entry
+    has ``group``/``signature``/``doc``/``params``/``returns``/``example``.
+
+    Returns:
+        dict with ``module``, ``version`` and ``functions`` (name -> entry).
+    """
+    ordered = {
+        name: _API[name]
+        for name in sorted(_API, key=lambda n: (_API[n]["group"], n))
+    }
+    if topic is not None:
+        entry = _API.get(topic)
+        if entry is None:
+            raise ForgeApiError(f"unknown topic {topic!r}")
+        ordered = {topic: entry}
+    return {"module": __name__, "version": __version__, "functions": ordered}
+
+
+@api(
+    group="meta",
+    returns="str",
+    example='forge_api.to_hex(0x401000)',
+)
+def to_hex(ea: int) -> str:
+    """Format an address as a hex string for display or logging.
+
+    This function is pure and works outside IDA.
+
+    Returns:
+        str like ``"0x401000"``.
+    """
+    try:
+        from forge.api.hexrays import to_hex as _to_hex
+    except (ImportError, ModuleNotFoundError):
+        return f"0x{ea:08X}"
+    return _to_hex(ea)
+
+
+# --------------------------------------------------------------------------- #
+# decompile / named types
+# --------------------------------------------------------------------------- #
+@api(
+    group="decompile",
+    returns="dict | None",
+    example='d = forge_api.decompile(0x1400014F0); d["lvars"]',
+)
+def decompile(ea: int) -> dict | None:
+    """Decompile the function containing ``ea``: pseudocode, variables, calls.
+
+    Returns ``None`` when the address is not in a function. The pseudocode is a
+    single flattened string; ``lvars`` carries each local with its index, name,
+    type declaration and whether it is a function argument; ``calls`` lists the
+    EAs of functions called from the body.
+
+    Returns:
+        dict or None.
+    """
+    _require_ida()
+    import ida_funcs
+    import ida_idaapi
+    import ida_lines
+
+    from forge.api.hexrays import ctype as _ctype
+    from forge.api.hexrays import decompile as _decompile
+
+    cfunc = _decompile(ea)
+    if cfunc is None:
+        return None
+    cfunc.get_pseudocode()
+
+    # get_lvars() returns an ida_hexrays.lvars_t whose int indexing is not
+    # usable in every build; materialize a plain list (iteration is supported).
+    lvars = list(cfunc.get_lvars())
+    lvar_rows = []
+    for index, lvar in enumerate(lvars):
+        type_str = None
+        try:
+            type_str = lvar.type().dstr()
+        except Exception:  # noqa: BLE001 — broken lvar types degrade to None
+            type_str = None
+        lvar_rows.append(
+            {
+                "index": index,
+                "name": lvar.name,
+                "type": type_str,
+                "is_arg": bool(getattr(lvar, "is_arg_var", False)),
+            }
+        )
+
+    pseudocode_lines = []
+    for line in cfunc.pseudocode:
+        text = getattr(line, "line", None)
+        pseudocode_lines.append(
+            ida_lines.tag_remove(text) if isinstance(text, str) else str(line)
+        )
+
+    # cfunc.treeitems yields ida_hexrays.citem_t; the specific expression (with
+    # .x / .obj_ea) is reached through the `to_specific_type` property.
+    calls = set()
+    for item in getattr(cfunc, "treeitems", []) or []:
+        specific = getattr(item, "to_specific_type", None) or item
+        if getattr(specific, "op", None) == _ctype.call:
+            callee_ea = getattr(getattr(specific, "x", None), "obj_ea", None)
+            if callee_ea is not None and callee_ea != ida_idaapi.BADADDR:
+                calls.add(callee_ea)
+
+    return {
+        "ea": ea,
+        "name": ida_funcs.get_func_name(ea),
+        "pseudocode": "\n".join(pseudocode_lines),
+        "lvars": lvar_rows,
+        "calls": sorted(calls),
+    }
+
+
+@api(
+    group="types",
+    returns="list[str]",
+    example='names = forge_api.named_types()',
+)
+def named_types() -> list[str]:
+    """List every named type currently in the IDB (structs, enums, typedefs).
+
+    Returns:
+        sorted list of type names.
+    """
+    _require_ida()
+    import ida_typeinf
+
+    idati = ida_typeinf.get_idati()
+    names = []
+    for ordinal in range(ida_typeinf.get_ordinal_count(idati)):
+        tinfo = ida_typeinf.tinfo_t()
+        if tinfo.get_numbered_type(idati, ordinal):
+            name = tinfo.get_type_name()
+            if name:
+                names.append(name)
+    return sorted(set(names))
+
+
+@api(
+    group="types",
+    returns="dict | None",
+    example='t = forge_api.type_of("Recovered"); t["members"]',
+)
+def type_of(name: str) -> dict | None:
+    """Describe an IDB named type: declaration string, size, kind, members.
+
+    For UDTs ``members`` lists each udt member's ``offset``/``size`` in bytes
+    (converted from IDA's bit units when bit-aligned; ``bit_offset`` always
+    carries the raw value) plus ``name`` and ``type``. Returns ``None`` when
+    ``name`` is not a known type.
+
+    Returns:
+        dict or None.
+    """
+    _require_ida()
+    import ida_typeinf
+
+    idati = ida_typeinf.get_idati()
+    tinfo = ida_typeinf.tinfo_t()
+    if not tinfo.get_named_type(idati, name):
+        return None
+
+    if tinfo.is_udt():
+        kind = "struct"
+    elif tinfo.is_ptr():
+        kind = "pointer"
+    elif tinfo.is_func():
+        kind = "function"
+    else:
+        kind = "scalar"
+
+    members = []
+    if kind == "struct":
+        udt_data = ida_typeinf.udt_type_data_t()
+        if tinfo.get_udt_details(udt_data):
+            for member in udt_data:
+                # udt members report offsets/sizes in BITS; convert to the
+                # byte units the rest of forge_api uses when bit-clean, and
+                # keep the raw bit value available.
+                offset_raw = getattr(member, "offset", 0)
+                size_raw = getattr(member, "size", 0)
+                member_type = None
+                try:
+                    member_type = member.type.dstr()
+                except Exception:  # noqa: BLE001 — broken udt handles degrade
+                    member_type = None
+                members.append(
+                    {
+                        "offset": offset_raw // 8 if offset_raw % 8 == 0 else offset_raw,
+                        "size": size_raw // 8 if size_raw % 8 == 0 else size_raw,
+                        "bit_offset": offset_raw,
+                        "name": getattr(member, "name", ""),
+                        "type": member_type,
+                    }
+                )
+            members.sort(key=lambda m: m["offset"])
+
+    return {
+        "name": name,
+        "type": tinfo.dstr(),
+        "size": tinfo.get_size(),
+        "kind": kind,
+        "members": members,
+    }
+
+
+# --------------------------------------------------------------------------- #
+# structure store
+# --------------------------------------------------------------------------- #
+@api(
+    group="structures",
+    returns="bool",
+    example='forge_api.set_current("Recovered")',
+)
+def set_current(name: str) -> bool:
+    """Select the store structure that ``structure=None`` functions act on.
+
+    The store is isolated from the GUI Structure Builder form. Returns ``False``
+    (no raise) when ``name`` is not in the store.
+
+    Returns:
+        bool.
+    """
+    if name not in _structures:
+        return False
+    _state.current = name
+    return True
+
+
+@api(
+    group="structures",
+    returns="list[str]",
+    example='names = forge_api.structures()',
+)
+def structures() -> list[str]:
+    """List the names of every structure in the headless store.
+
+    Returns:
+        sorted list of structure names.
+    """
+    return sorted(_structures)
+
+
+@api(
+    group="structures",
+    returns="None",
+    example="forge_api.clear_structures()",
+)
+def clear_structures() -> None:
+    """Remove every structure from the headless store (not from the IDB).
+
+    Returns:
+        None.
+    """
+    _structures.clear()
+    _state.current = None
+
+
+@api(
+    group="structures",
+    returns="dict | None",
+    example='s = forge_api.get_structure("Recovered")',
+)
+def get_structure(name: str | None = None) -> dict | None:
+    """Return a structure's full model (members, collisions, relationships).
+
+    With ``name`` None, returns the current structure. Returns ``None`` when no
+    structure matches and none is selected.
+
+    Returns:
+        dict with ``name``/``main_offset``/``created_type_name``/``members``/
+        ``collisions``/``child_relationships`` or None.
+    """
+    structure = _resolve_structure(name, required=False)
+    if structure is None:
+        return None
+    return _to_structure_dict(structure)
+
+
+@api(
+    group="structures",
+    returns="dict",
+    example='s = forge_api.create_structure("Recovered")',
+)
+def create_structure(
+    name: str, members: list[dict] | None = None, origin: int = 0
+) -> dict:
+    """Create a structure in the headless store and select it.
+
+    ``members`` is an optional list of member specs: ``{"offset": int, "type":
+    str, "name": str|None, "comment": str|None, "enabled": bool, "is_array":
+    bool}``, each inserted through the same path as :func:`add_member`. Raises
+    :class:`ForgeApiError` when the name already exists in the store. Nothing is
+    written to the IDB until :func:`create_type`/:func:`finalize`.
+
+    Returns:
+        the new structure's dict (see :func:`get_structure`).
+    """
+    from forge.api.structure import Structure
+
+    if name in _structures:
+        raise ForgeApiError(f"structure {name!r} already exists")
+    structure = Structure(name)
+    _structures[name] = structure
+    _state.current = name
+    for spec in members or []:
+        add_member(
+            name,
+            offset=spec["offset"],
+            type=spec["type"],
+            name=spec.get("name"),
+            comment=spec.get("comment", ""),
+            origin=spec.get("origin", origin),
+            is_array=spec.get("is_array", False),
+            enabled=spec.get("enabled", True),
+        )
+    return _to_structure_dict(structure)
+
+
+@api(
+    group="structures",
+    returns="bool",
+    example='removed = forge_api.remove_structure("Recovered")',
+)
+def remove_structure(name: str | None = None) -> bool:
+    """Remove a structure from the headless store and unlink its relationships.
+
+    With ``name`` None, removes the current structure. Returns whether a
+    structure was removed.
+
+    Returns:
+        bool.
+    """
+    structure = _resolve_structure(name, required=False)
+    if structure is None:
+        return False
+    del _structures[structure.name]
+    for other in _structures.values():
+        other.remove_relationships_with(structure.name)
+    if _state.current == structure.name:
+        _state.current = None
+    return True
+
+
+@api(
+    group="structures",
+    returns="dict",
+    example='m = forge_api.add_member("Recovered", 0x10, "u32", name="count")',
+)
+def add_member(
+    structure: str | None = None,
+    offset: int = 0,
+    type: str = "u32",
+    name: str | None = None,
+    comment: str = "",
+    origin: int = 0,
+    is_array: bool = False,
+    enabled: bool = True,
+) -> dict:
+    """Add a member at ``offset`` with the given type to a store structure.
+
+    ``type`` is a C type declaration parsed the same way the GUI accepts it
+    (e.g. ``"u32"``, ``"MyStruct *"``, ``"__int64[8]"``). Returns the new
+    member dict, or ``{"ok": False, "error": ...}`` when the type does not parse.
+
+    Returns:
+        member dict (see member fields on :func:`get_structure`).
+    """
+    from forge.api.members import Member, parse_user_tinfo
+
+    target = _resolve_structure(structure)
+    tinfo = parse_user_tinfo(type)
+    if tinfo is None:
+        return {"ok": False, "error": f"could not parse type {type!r}"}
+    member = Member(offset, tinfo, None, origin)
+    if name is not None:
+        member.name = name
+    member.comment = comment
+    member.is_array = is_array
+    if not enabled:
+        member.set_enabled(False)
+    target.add_member(member)
+    return _to_member_dict(member)
+
+
+@api(
+    group="structures",
+    returns="None",
+    example='forge_api.remove_members("Recovered", [0x10, 0x18])',
+)
+def remove_members(structure: str | None = None, offsets: list = ()) -> None:
+    """Remove the members at the given offsets from a store structure.
+
+    Unknown offsets are ignored. Collisions are refreshed afterwards.
+
+    Returns:
+        None.
+    """
+    target = _resolve_structure(structure)
+    indices = []
+    for index, member in enumerate(target.members):
+        if member.offset in offsets:
+            indices.append(index)
+    target.remove_members(indices)
+
+
+@api(
+    group="structures",
+    returns="dict",
+    example='m = forge_api.set_member("Recovered", 0x10, name="size", enabled=False)',
+)
+def set_member(
+    structure: str | None = None,
+    offset: int = 0,
+    *,
+    type: str | None = None,
+    name: str | None = None,
+    comment: str | None = None,
+    enabled: bool | None = None,
+    is_array: bool | None = None,
+) -> dict:
+    """Edit the member at ``offset`` in a store structure.
+
+    Only the provided keyword fields change. ``type`` must parse as a C type;
+    a parse failure returns ``{"ok": False, "error": ...}`` without changing
+    anything. Raises :class:`ForgeApiError` when no member exists at ``offset``.
+
+    Returns:
+        the updated member dict.
+    """
+    from forge.api.members import parse_user_tinfo
+
+    target = _resolve_structure(structure)
+    member = target.get_member_by_offset(offset)
+    if member is None:
+        raise ForgeApiError(f"no member at offset 0x{offset:x}")
+    if type is not None:
+        tinfo = parse_user_tinfo(type)
+        if tinfo is None:
+            return {"ok": False, "error": f"could not parse type {type!r}"}
+        member.tinfo = tinfo
+        member.is_array = False
+        member.invalidate_score()
+    if name is not None:
+        member.name = name
+    if comment is not None:
+        member.comment = comment
+    if is_array is not None:
+        member.is_array = is_array
+        member.invalidate_score()
+    if enabled is not None and hasattr(member, "set_enabled"):
+        member.set_enabled(bool(enabled))
+    target.refresh_collisions()
+    return _to_member_dict(member)
+
+
+@api(
+    group="structures",
+    returns="dict",
+    example='r = forge_api.nudge_members("Recovered", [0x10, 0x18], 8)',
+)
+def nudge_members(
+    structure: str | None = None, offsets: list = (), delta: int = 0
+) -> dict:
+    """Shift the given member offsets by ``delta`` (form ``nudge_selected_rows``).
+
+    Mirrors the GUI rule: a nudge that would make a member overlap a member that
+    was NOT moved is rejected and restored. Negative ``delta`` moving a member
+    below zero is also rejected. The structure's ``main_offset`` follows when a
+    moved member is the origin row.
+
+    Returns:
+        ``{"ok": True}`` or ``{"ok": False, "error": ...}``.
+    """
+    target = _resolve_structure(structure)
+    members = [m for m in target.members if m.offset in offsets]
+    if not members:
+        return {"ok": True}
+    if any(member.offset + delta < 0 for member in members):
+        return {"ok": False, "error": "cannot move rows to a negative offset"}
+
+    moved = {id(member) for member in members}
+    original_offsets = {id(member): member.offset for member in target.members}
+    original_main_offset = target.main_offset
+
+    for member in members:
+        old_offset = member.offset
+        member.offset += delta
+        member.invalidate_score()
+        if target.main_offset == old_offset:
+            target.set_main_offset(member.offset)
+
+    target.members.sort()
+    target.refresh_collisions()
+
+    collides_outside_selection = any(
+        target.has_collision(index) and id(member) not in moved
+        for index, member in enumerate(target.members)
+    )
+    if collides_outside_selection:
+        for member in target.members:
+            member.offset = original_offsets[id(member)]
+        target.set_main_offset(original_main_offset)
+        target.members.sort()
+        target.refresh_collisions()
+        return {"ok": False, "error": "would overlap a non-selected member"}
+
+    return {"ok": True}
+
+
+@api(
+    group="structures",
+    returns="dict",
+    example='r = forge_api.auto_resolve("Recovered")',
+)
+def auto_resolve(structure: str | None = None) -> dict:
+    """Disable the lower-scoring half of each colliding member pair.
+
+    Applies the same collision-resolution heuristic as the form's "Auto
+    resolve". The disabled member dicts are returned so the caller can preview
+    or revert.
+
+    Returns:
+        ``{"ok": True, "disabled": [member dicts]}``.
+    """
+    target = _resolve_structure(structure)
+    disabled = target.auto_resolve()
+    return {"ok": True, "disabled": [_to_member_dict(m) for m in disabled]}
+
+
+@api(
+    group="structures",
+    returns="bool",
+    example='ok = forge_api.rename_structure("Recovered", "Recovered2")',
+)
+def rename_structure(old: str, new: str) -> bool:
+    """Rename a structure in the store (updates relationships).
+
+    If the structure had a created IDA type named ``old``, the IDA type is
+    renamed too. Returns ``False`` (no raise) when ``new`` already exists; raises
+    :class:`ForgeApiError` when ``old`` is not in the store.
+
+    Returns:
+        bool.
+    """
+    structure = _resolve_structure(old)
+    if new in _structures:
+        return False
+    if not structure.rename_created_type(old, new):
+        return False
+    structure.name = new
+    structure.is_auto_named = False
+    _structures[new] = structure
+    del _structures[old]
+    for other in _structures.values():
+        other.rename_relationship_references(old, new)
+    if _state.current == old:
+        _state.current = new
+    return True
+
+
+@api(
+    group="structures",
+    returns="str",
+    example='new = forge_api.duplicate_structure("Recovered")',
+)
+def duplicate_structure(name: str) -> str:
+    """Duplicate a store structure (members, provenance, child relationships).
+
+    The duplicate gets a free name (``"X Copy"``, then ``"X Copy 2"``, ...) and
+    becomes the current structure. Child members are re-linked to the duplicate
+    like the form's duplicate action.
+
+    Returns:
+        the new structure's name.
+    """
+    import copy as _copy
+
+    from forge.api.structure import Structure
+
+    source = _resolve_structure(name)
+    new_name = _unique_structure_name(source.name)
+    cloned = Structure(new_name)
+    cloned.main_offset = source.main_offset
+    cloned.members = [
+        _copy.copy(member) for member in source.members
+    ]
+    for member in cloned.members:
+        if hasattr(member, "scanned_variables"):
+            member.scanned_variables = set(member.scanned_variables)
+    cloned.provenance = source.clone_provenance()
+    cloned.is_auto_named = True
+    _structures[new_name] = cloned
+    _copy_duplicate_child_relationships(source, cloned, _structures)
+    cloned.refresh_collisions()
+    _state.current = new_name
+    return new_name
+
+
+@api(
+    group="structures",
+    returns="dict",
+    example='vt = forge_api.to_vtable("Recovered", 0x0, 0x140006358)',
+)
+def to_vtable(structure: str | None = None, offset: int = 0, address: int = 0) -> dict:
+    """Convert the member at ``offset`` into a vtable row at ``address``.
+
+    Reads the vtable pointer table at ``address`` (IDA functions) and replaces
+    the member with a :class:`VirtualTable`; the member's scanned variables and
+    comment carry over. Raises :class:`ForgeApiError` when there is no member at
+    ``offset``.
+
+    Returns:
+        the new vtable member dict.
+    """
+    _require_ida()
+    from forge.api.members import VirtualTable
+
+    target = _resolve_structure(structure)
+    member = target.get_member_by_offset(offset)
+    if member is None:
+        raise ForgeApiError(f"no member at offset 0x{offset:x}")
+    target.members.remove(member)
+    vtable = VirtualTable(offset, address, None, member.origin)
+    vtable.scanned_variables = getattr(member, "scanned_variables", set())
+    vtable.comment = getattr(member, "comment", "")
+    target.add_member(vtable)
+    return _to_member_dict(vtable)
+
+
+# --------------------------------------------------------------------------- #
+# scanning
+# --------------------------------------------------------------------------- #
+def _make_var_root(cfunc, lvars, index):
+    from forge.api.scan_object import VariableObject
+
+    obj = VariableObject(lvars[index], index)
+    obj.func_ea = cfunc.entry_ea
+    return obj
+
+
+def _resolve_scan_root(
+    cfunc, *, var_name: str | None = None, var_index: int | None = None, item_ea: int | None = None
+):
+    """Resolve a scan root ScanObject from the explicit-or-default criteria."""
+    import ida_idaapi
+
+    from forge.api.scan_object import ScanObject
+
+    if item_ea is not None and item_ea != ida_idaapi.BADADDR:
+        from forge.api.hexrays import collect_ctree_items_near_ea
+
+        for item in collect_ctree_items_near_ea(cfunc, item_ea, exhaustive=True):
+            try:
+                obj = ScanObject.create(cfunc, item)
+            except Exception:  # noqa: BLE001 — non-expression items are skipped
+                obj = None
+            if obj is not None:
+                return obj
+        raise ForgeApiError(f"no scan-able expression near 0x{item_ea:x}")
+
+    lvars = list(cfunc.get_lvars())
+    if var_name is not None:
+        for index, lvar in enumerate(lvars):
+            if lvar.name == var_name:
+                return _make_var_root(cfunc, lvars, index)
+        raise ForgeApiError(f"no variable named {var_name!r} in function")
+    if var_index is not None:
+        if 0 <= var_index < len(lvars):
+            return _make_var_root(cfunc, lvars, var_index)
+        raise ForgeApiError(f"variable index {var_index} out of range")
+
+    argids = list(getattr(cfunc, "argidx", None) or [])
+    if argids and 0 <= argids[0] < len(lvars):
+        return _make_var_root(cfunc, lvars, argids[0])
+    return None
+
+
+def _scan_result(target) -> dict:
+    return {
+        "structure": target.name,
+        "members": [_to_member_dict(member) for member in target.members],
+    }
+
+
+@api(
+    group="scan",
+    returns="dict",
+    example='r = forge_api.deep_scan(0x1400014F0, var_name="a1", structure="Recovered")',
+)
+def deep_scan(
+    ea: int,
+    *,
+    var_name: str | None = None,
+    var_index: int | None = None,
+    item_ea: int | None = None,
+    recurse_calls: bool = False,
+    max_depth: int | None = None,
+    structure: str | None = None,
+) -> dict:
+    """Recover the structure's members by deep-scanning a decompiled function.
+
+    Decompiles the function containing ``ea`` and runs the same
+    ``NewDeepScanVisitor`` the GUI uses over the chosen root variable (default:
+    the first argument; override with ``var_name``/``var_index``/``item_ea``).
+    Members are merged into the target structure in the headless store.
+    ``recurse_calls`` follows values passed into called functions; ``max_depth``
+    caps recursion (None = unlimited). On an unresolvable root returns
+    ``{"ok": False, "error": ...}``.
+
+    Returns:
+        ``{"structure": name, "members": [member dicts]}`` or an ok:False dict.
+    """
+    _require_ida()
+    from forge.api.hexrays import decompile as _decompile
+    from forge.api.scanner import NewDeepScanVisitor
+
+    target = _resolve_structure(structure)
+    cfunc = _decompile(ea)
+    if cfunc is None:
+        return {"ok": False, "error": f"could not decompile {hex(ea)}"}
+    obj = _resolve_scan_root(cfunc, var_name=var_name, var_index=var_index, item_ea=item_ea)
+    if obj is None:
+        return {"ok": False, "error": "could not resolve a scan root (default: first argument)"}
+    visitor = NewDeepScanVisitor(
+        cfunc,
+        target.main_offset,
+        obj,
+        target,
+        recurse_calls=recurse_calls,
+        max_depth=max_depth,
+    )
+    visitor.process()
+    return _scan_result(target)
+
+
+@api(
+    group="scan",
+    returns="dict",
+    example='r = forge_api.shallow_scan(0x1400014F0, var_name="a1", structure="Recovered")',
+)
+def shallow_scan(
+    ea: int,
+    *,
+    var_name: str | None = None,
+    var_index: int | None = None,
+    item_ea: int | None = None,
+    structure: str | None = None,
+) -> dict:
+    """Recover a structure's members with a single-pass shallow scan.
+
+    Runs ``NewShallowScanVisitor`` over the chosen root variable (same root
+    resolution as :func:`deep_scan` but without recursing into called
+    functions).
+
+    Returns:
+        ``{"structure": name, "members": [member dicts]}`` or an ok:False dict.
+    """
+    _require_ida()
+    from forge.api.hexrays import decompile as _decompile
+    from forge.api.scanner import NewShallowScanVisitor
+
+    target = _resolve_structure(structure)
+    cfunc = _decompile(ea)
+    if cfunc is None:
+        return {"ok": False, "error": f"could not decompile {hex(ea)}"}
+    obj = _resolve_scan_root(cfunc, var_name=var_name, var_index=var_index, item_ea=item_ea)
+    if obj is None:
+        return {"ok": False, "error": "could not resolve a scan root (default: first argument)"}
+    visitor = NewShallowScanVisitor(cfunc, target.main_offset, obj, target)
+    visitor.process()
+    return _scan_result(target)
+
+
+@api(
+    group="scan",
+    returns="dict",
+    example='r = forge_api.scan_global(0x1400A4000)',
+)
+def scan_global(ea: int, *, max_depth: int | None = None) -> dict:
+    """Deep-scan a global object from every function that references it.
+
+    Creates a store structure named ``global_<short_name>`` and runs a deep scan
+    (with call recursion, like the GUI's global scan) per referring function.
+    Returns ``{"ok": False, "error": ...}`` when the address has no references.
+
+    Returns:
+        ``{"structure": name, "functions_scanned": int, "members": [...]}``.
+    """
+    _require_ida()
+    import ida_name
+
+    from forge.api.hexrays import decompile as _decompile
+    from forge.api.hexrays import get_funcs_referencing_address
+    from forge.api.scan_object import GlobalVariableObject
+    from forge.api.scanner import NewDeepScanVisitor
+    from forge.api.structure import Structure
+
+    xrefs = sorted(get_funcs_referencing_address(ea))
+    if not xrefs:
+        return {"ok": False, "error": "no function references to this address"}
+    short_name = ida_name.get_short_name(ea) or hex(ea)
+    struct_name = f"global_{short_name}"
+    target = _structures.get(struct_name)
+    if target is None:
+        target = Structure(struct_name)
+        _structures[struct_name] = target
+    _state.current = struct_name
+
+    scanned = 0
+    for func_ea in xrefs:
+        cfunc = _decompile(func_ea)
+        if cfunc is None:
+            continue
+        obj = GlobalVariableObject(ea)
+        obj.name = short_name
+        NewDeepScanVisitor(
+            cfunc,
+            target.main_offset,
+            obj,
+            target,
+            recurse_calls=True,
+            max_depth=max_depth,
+        ).process()
+        scanned += 1
+
+    return {
+        "structure": struct_name,
+        "functions_scanned": scanned,
+        "members": [_to_member_dict(member) for member in target.members],
+    }
+
+
+# --------------------------------------------------------------------------- #
+# build / apply / finalize
+# --------------------------------------------------------------------------- #
+@api(
+    group="build",
+    returns="dict",
+    example='r = forge_api.create_type("Recovered", overwrite=True)',
+)
+def create_type(name: str | None = None, *, overwrite: bool = False) -> dict:
+    """Build the IDA type for a structure and apply it to scan evidence.
+
+    Packs the structure's enabled members into a C declaration
+    (:meth:`Structure.build_cdecl`), creates/overwrites the IDA named type via
+    :meth:`Structure.set_cdecl` and applies the pointer type to every variable
+    the scans recorded (the "apply globally" step). ``overwrite=True`` replaces
+    an existing type without asking; ``overwrite=False`` aborts if the type
+    exists. Never shows a dialog.
+
+    Returns:
+        ``{"ok": True, "type_name": str, "declaration": str}`` or
+        ``{"ok": False, "error": str}``.
+    """
+    _require_ida()
+    target = _resolve_structure(name)
+    result = target.build_cdecl()
+    if result is None:
+        return {"ok": False, "error": "no enabled packable members"}
+    _, cdecl = result
+    created = target.set_cdecl(cdecl, target.main_offset, overwrite=overwrite)
+    if created is None:
+        return {"ok": False, "error": "type already exists (overwrite disabled)"}
+    return {"ok": True, "type_name": target.created_type_name, "declaration": cdecl}
+
+
+@api(
+    group="build",
+    returns="dict",
+    example='r = forge_api.create_child_types("Parent")',
+)
+def create_child_types(name: str | None = None) -> dict:
+    """Create the IDA types for every child structure of ``name``.
+
+    Each linked child that does not have a created type yet is finalized with
+    :meth:`Structure.create_type_if_ready` (children-first). ``skipped`` lists
+    children that could not be created because they have unresolved children.
+
+    Returns:
+        ``{"ok": bool, "created": [names], "skipped": [names]}``.
+    """
+    _require_ida()
+    target = _resolve_structure(name)
+    if not target.child_relationships:
+        return {"ok": False, "error": "structure has no child relationships"}
+    created = []
+    for child in target.iter_child_structures(_structures):
+        if child.created_type_name is not None:
+            created.append(child.name)
+            continue
+        if child.create_type_if_ready(_structures) is not None:
+            created.append(child.name)
+    skipped = target.get_unresolved_child_names(_structures)
+    return {"ok": not skipped, "created": created, "skipped": skipped}
+
+
+@api(
+    group="build",
+    returns="dict",
+    example='r = forge_api.finalize("Recovered")',
+)
+def finalize(name: str | None = None) -> dict:
+    """Finalize one structure: build its type and apply to scan evidence.
+
+    Equivalent to the GUI "Finalize": guards unresolved children, refreshes
+    linked child member types, packs and creates the type. Returns the
+    unresolved child names when the structure cannot be finalized.
+
+    Returns:
+        ``{"ok": True, "type_name": str}`` or ``{"ok": False, "unresolved": [...]}``.
+    """
+    _require_ida()
+    target = _resolve_structure(name)
+    tinfo = target.create_type_if_ready(_structures)
+    if tinfo is None:
+        return {"ok": False, "unresolved": target.get_unresolved_child_names(_structures)}
+    return {"ok": True, "type_name": target.created_type_name}
+
+
+@api(
+    group="build",
+    returns="list[dict]",
+    example='results = forge_api.finalize_all()',
+)
+def finalize_all() -> list:
+    """Finalize every top-level structure in the store, children first.
+
+    For each structure that is not some other structure's child, runs the
+    subtree postorder walk (:meth:`Structure.create_subtree_types_postorder`).
+
+    Returns:
+        list of ``{"structure": name, "ok": bool, "created": bool}``.
+    """
+    _require_ida()
+    child_names = {
+        rel.child_structure_name
+        for s in _structures.values()
+        for rel in s.child_relationships
+    }
+    roots = [name for name in _structures if name not in child_names]
+    results = []
+    for root_name in roots:
+        root = _structures[root_name]
+        ok = root.create_subtree_types_postorder(_structures)
+        results.append(
+            {
+                "structure": root_name,
+                "ok": ok,
+                "created": root.created_type_name is not None,
+            }
+        )
+    return results
+
+
+# --------------------------------------------------------------------------- #
+# templated types
+# --------------------------------------------------------------------------- #
+def _templated_instance():
+    if _state.templated is None:
+        from forge.features.templated_types.templated_types import TemplatedTypes
+
+        _state.templated = TemplatedTypes()
+    return _state.templated
+
+
+@api(
+    group="templated",
+    returns="list[str]",
+    example='keys = forge_api.templated_keys()',
+)
+def templated_keys() -> list:
+    """List the available templated-type keys (from the templated-types TOML).
+
+    Returns:
+        sorted list of template keys.
+    """
+    _require_ida()
+    return sorted(_templated_instance().keys)
+
+
+@api(
+    group="templated",
+    returns="dict | None",
+    example='d = forge_api.templated_decl("Vector", ["u32"])',
+)
+def templated_decl(key: str, args: list) -> dict | None:
+    """Resolve a templated type's declaration for the given type arguments.
+
+    ``args`` are the template type arguments (each key expects a fixed count;
+    the templated-types TOML formats the struct/name with them). Returns
+    ``None`` when the key is unknown or the argument count is wrong.
+
+    Returns:
+        ``{"name": str, "cdecl": str}`` or None.
+    """
+    _require_ida()
+    result = _templated_instance().get_decl_str(key, list(args))
+    if result is None:
+        return None
+    name, cdecl = result
+    return {"name": name, "cdecl": cdecl}
+
+
+@api(
+    group="templated",
+    returns="bool",
+    example='ok = forge_api.templated_apply("Vector", ["u32"])',
+)
+def templated_apply(key: str, args: list) -> bool:
+    """Apply a templated type into the IDB (imports the type and its typedef).
+
+    Returns ``False`` when the key is unknown or arguments do not match; on
+    success the generated struct and typedef are created in the IDB.
+
+    Returns:
+        bool.
+    """
+    _require_ida()
+    template = _templated_instance()
+    if template.get_decl_str(key, list(args)) is None:
+        return False
+    template.set_type(key, list(args))
+    return True
+
+
+# --------------------------------------------------------------------------- #
+# other features
+# --------------------------------------------------------------------------- #
+@api(
+    group="features",
+    returns="dict",
+    example='r = forge_api.to_usercall(0x1400014F0)',
+)
+def to_usercall(ea: int) -> dict:
+    """Convert a function's calling convention to the ``__usercall`` family.
+
+    Applies the same cc-remap as the "Convert to __usercall" action
+    (CDECL -> ``__usercall``, register conventions -> ``__usercall_``,
+    varargs -> ``__usercalle_``) via ``ConvertToUsercall.convert_to_usercall``.
+
+    Returns:
+        ``{"ok": True, "ea": int, "convention": str}`` or
+        ``{"ok": False, "error": str}``.
+    """
+    _require_ida()
+    from forge.api.hexrays import decompile as _decompile
+    from forge.features.convert_to_usercall import convert_to_usercall
+
+    cfunc = _decompile(ea)
+    if cfunc is None:
+        return {"ok": False, "error": "decompile failed"}
+    name = convert_to_usercall(cfunc)
+    if name is None:
+        return {"ok": False, "error": "unknown calling convention"}
+    return {"ok": True, "ea": ea, "convention": name}
+
+
+@api(
+    group="features",
+    returns="bool",
+    example='ok = forge_api.inverse_if(0x1400014F0, 0x140001723)',
+)
+def inverse_if(ea: int, insn_ea: int) -> bool:
+    """Invert an unconditional ``if`` statement at ``insn_ea`` in function ``ea``.
+
+    Locates the ``cit_if`` item nearest to ``insn_ea``, flips its condition with
+    :func:`forge.features.swap_if.helper.inverse_if` and records the inversion in
+    the swap-if storage so IDA re-decompilation keeps it. Returns ``False`` when
+    no ``if`` is found or decompilation fails.
+
+    Returns:
+        bool.
+    """
+    _require_ida()
+    import ida_hexrays
+
+    from forge.api.hexrays import collect_ctree_items_near_ea
+    from forge.api.hexrays import decompile as _decompile
+    from forge.features.swap_if.helper import inverse_if as _inverse_if
+    from forge.features.swap_if.storage import set_inverted
+
+    cfunc = _decompile(ea)
+    if cfunc is None:
+        return False
+
+    cif = None
+    for item in collect_ctree_items_near_ea(cfunc, insn_ea, exhaustive=True):
+        insn = getattr(item, "it", None)
+        if insn is None:
+            insn = item
+        specific = getattr(insn, "to_specific_type", None) or insn
+        if getattr(specific, "op", None) == getattr(ida_hexrays, "cit_if", None):
+            candidate = getattr(specific, "cif", None)
+            # The qswap in helper.inverse_if needs a real else branch (the GUI
+            # SwapThenElse action gates on ielse too); skip else-less ifs.
+            if candidate is not None and getattr(candidate, "ielse", None) is not None:
+                cif = candidate
+                break
+    if cif is None:
+        return False
+
+    _inverse_if(cif)
+    set_inverted(ea, insn_ea)
+    return True
+
+
+@api(
+    group="features",
+    returns="bool",
+    example='ok = forge_api.create_field("Recovered", 0x18, "u32 field_18")',
+)
+def create_field(
+    struct_name: str, offset: int, declaration: str, idx: int = 0
+) -> bool:
+    """Insert a new field into an existing IDB struct type at ``offset``+``idx``.
+
+    Mirrors the "Create new field" action: replaces part of the padding member
+    at ``offset`` with the given field (``declaration`` is ``TYPE NAME[SIZE]``),
+    shrinking/re-splitting the surrounding padding. Raises :class:`ForgeApiError`
+    when ``struct_name`` is not a known type.
+
+    Returns:
+        bool — True when the field was written into the numbered type.
+    """
+    _require_ida()
+    import ida_typeinf
+
+    from forge.features.create_new_field.create_new_field import apply_new_field
+
+    tinfo = ida_typeinf.tinfo_t()
+    if not tinfo.get_named_type(ida_typeinf.get_idati(), struct_name):
+        raise ForgeApiError(f"no type {struct_name}")
+    return apply_new_field(tinfo, offset, idx, declaration)
+
+
+@api(
+    group="features",
+    returns="list[dict]",
+    example='rows = forge_api.guess_allocation(0x1400014F0, var_name="a1")',
+)
+def guess_allocation(
+    ea: int,
+    *,
+    var_name: str | None = None,
+    var_index: int | None = None,
+    item_ea: int | None = None,
+) -> list:
+    """Guess the allocation sites of a variable (heap/stack/global).
+
+    Runs the same ``GuessAllocationVisitor`` as the action over the chosen root
+    variable and returns its collected rows instead of showing a chooser.
+
+    Returns:
+        list of ``{"ea": int, "var": str, "line": str, "kind": "HEAP"|"STACK"|"GLOBAL"}``.
+    """
+    _require_ida()
+    from forge.api.hexrays import decompile as _decompile
+    from forge.features.guess_allocation.guess_allocation import GuessAllocationVisitor
+
+    cfunc = _decompile(ea)
+    if cfunc is None:
+        return []
+    obj = _resolve_scan_root(cfunc, var_name=var_name, var_index=var_index, item_ea=item_ea)
+    if obj is None:
+        return []
+    visitor = GuessAllocationVisitor(cfunc, obj, interactive=False)
+    visitor.process()
+    return [
+        {"ea": int(row[0]), "var": row[1], "line": row[2], "kind": row[3]}
+        for row in visitor._data
+    ]

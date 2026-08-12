@@ -6,30 +6,41 @@ import ida_kernwin
 
 from forge.api.hexrays import ctype, find_expr_address, to_function_offset_str
 from forge.api.scan_object import MemoryAllocationObject, ObjectType, ScanObject
-from forge.api.ui import Choose
 from forge.api.ui_actions import HexRaysPopupAction, register_action
 from forge.api.visitor import RecursiveUpwardsObjectVisitor
 
 
-class StructureAllocationChoose(Choose):
-    title = "Possible structure allocations"
-    cols: ClassVar[list] = [["Function", 30], ["Variable", 10], ["Line", 50], ["Type", 10]]
+def _make_allocation_chooser(items):
+    """Build the allocations chooser for a scan's collected rows.
 
-    def __init__(self, items):
-        super().__init__(items)
-    def OnSelectLine(self, n):
-        ida_kernwin.jumpto(self.items[n][0])
+    ``forge.api.ui`` pulls in Qt, which only exists in GUI IDA sessions, so it
+    is imported lazily: the headless ``forge_api`` facade runs the visitor with
+    ``interactive=False`` and never constructs the chooser at all.
+    """
+    from forge.api.ui import Choose
 
+    class StructureAllocationChoose(Choose):
+        title = "Possible structure allocations"
+        cols: ClassVar[list] = [["Function", 30], ["Variable", 10], ["Line", 50], ["Type", 10]]
 
-    def OnGetLine(self, n):
-        func_ea, var, line, alloc_type = self.items[n]
-        return [to_function_offset_str(func_ea), var, line, alloc_type]
+        def __init__(self, items):
+            super().__init__(items)
+
+        def OnSelectLine(self, n):
+            ida_kernwin.jumpto(self.items[n][0])
+
+        def OnGetLine(self, n):
+            func_ea, var, line, alloc_type = self.items[n]
+            return [to_function_offset_str(func_ea), var, line, alloc_type]
+
+    return StructureAllocationChoose(items)
 
 
 class GuessAllocationVisitor(RecursiveUpwardsObjectVisitor):
-    def __init__(self, cfunc, obj: ScanObject):
+    def __init__(self, cfunc, obj: ScanObject, *, interactive: bool = True):
         super().__init__(cfunc, obj, skip_until_object=True)
         self._data = []
+        self._interactive = interactive
 
     def _matches_object(self, obj: ScanObject, cexpr) -> bool:
         base_matcher = getattr(super(), "_matches_object", None)
@@ -75,8 +86,9 @@ class GuessAllocationVisitor(RecursiveUpwardsObjectVisitor):
             )
 
     def _finish(self):
-        chooser = StructureAllocationChoose(self._data)
-        chooser.Show(True)
+        if self._interactive:
+            chooser = _make_allocation_chooser(self._data)
+            chooser.Show(True)
 
 
 @register_action

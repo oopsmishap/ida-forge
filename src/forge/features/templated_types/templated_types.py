@@ -13,6 +13,9 @@ from forge.util.logging import log_debug, log_error
 
 from .config import config
 
+# IDA 9.4 moved BADORD off ida_idaapi; resolve it wherever the build keeps it.
+_BADORD = getattr(ida_idaapi, "BADORD", getattr(ida_typeinf, "BADORD", -1))
+
 # from forge.util.cxx_to_c_name import demangled_name_to_c_str, maybe implement this in later
 
 
@@ -71,11 +74,38 @@ class TemplatedTypes:
             log_error(f"Could not parse structure declarations, found {ret_val} errors")
             return
 
-        tid = ida_typeinf.import_type(ida_typeinf.get_idati(), -1, name)
-        if tid is ida_idaapi.BADORD:
+        tid = self._import_named_type(name)
+        if tid is _BADORD:
             log_error(f'could not import type "{name}" into idb')
             return
         ida_hexrays.create_typedef(name)
+
+    @staticmethod
+    def _import_named_type(name: str):
+        """Import a named type into the IDB across IDA 9 API changes.
+
+        IDA 9.4 moved ``import_type`` off the ``ida_typeinf`` module (it is now
+        ``til.import_type(tinfo)`` or ``idc.import_type(idati, name)``); older
+        builds keep ``ida_typeinf.import_type(idati, -1, name)``. Returns the
+        type ordinal or ``BADORD`` on failure.
+        """
+        idati = ida_typeinf.get_idati()
+
+        module_import = getattr(ida_typeinf, "import_type", None)
+        if callable(module_import):
+            return module_import(idati, -1, name)
+
+        til_import = getattr(idati, "import_type", None)
+        if callable(til_import):
+            tinfo = ida_typeinf.tinfo_t()
+            if not tinfo.get_named_type(idati, name):
+                return _BADORD
+            result = til_import(tinfo)
+            return name if result is not None else _BADORD
+
+        import idc
+
+        return idc.import_type(idati, name)
 
     def get_types(self, key):
         if key in self._types_dict:

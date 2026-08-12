@@ -63,8 +63,6 @@ class CreateNewField(HexRaysPopupAction):
         struct_tinfo.remove_ptr_or_array()
 
         offset = item.m
-        ordinal = struct_tinfo.get_ordinal()
-        struct_name = struct_tinfo.dstr()
 
         if (offset + idx) % 2:
             default_field_type = types["u8"].name
@@ -83,53 +81,7 @@ class CreateNewField(HexRaysPopupAction):
         if declaration is None:
             return
 
-        result = self.parse_declaration(declaration)
-        if result is None:
-            log_warning("Bad member declaration!", True)
-            return
-
-        field_tinfo, field_name = result
-        field_size = field_tinfo.get_size()
-        udt_data = ida_typeinf.udt_type_data_t()
-        udt_member = ida_typeinf.udt_member_t()
-
-        struct_tinfo.get_udt_details(udt_data)
-        udt_member.offset = offset * 8
-        struct_tinfo.find_udt_member(udt_member, ida_typeinf.STRMEM_OFFSET)
-        gap_size = udt_member.size // 8
-
-        gap_leftover = gap_size - idx - field_size
-
-        if gap_leftover < 0:
-            log_error(
-                f"Too big size for the field. Type with maximum {gap_size - idx} bytes can be used"
-            )
-            return
-
-        iterator = udt_data.find(udt_member)
-        iterator = udt_data.erase(iterator)
-
-        if gap_leftover > 0:
-            udt_data.insert(
-                iterator,
-                create_udt_padding_member(offset + idx + field_size, gap_leftover),
-            )
-
-        udt_member = ida_typeinf.udt_member_t()
-        udt_member.offset = offset * 8 + idx
-        udt_member.name = field_name
-        udt_member.type = field_tinfo
-        udt_member.size = field_size
-
-        iterator = udt_data.insert(iterator, udt_member)
-
-        if idx > 0:
-            udt_data.insert(iterator, create_udt_padding_member(offset, idx))
-
-        struct_tinfo.create_udt(udt_data, ida_typeinf.BTF_STRUCT)
-        struct_tinfo.set_numbered_type(
-            ida_typeinf.get_idati(), ordinal, ida_typeinf.BTF_STRUCT, struct_name
-        )
+        apply_new_field(struct_tinfo, offset, idx, declaration)
         hx_view.refresh_view(True)
 
     @staticmethod
@@ -160,3 +112,66 @@ class CreateNewField(HexRaysPopupAction):
         if arr_size:
             tinfo.create_array(tinfo, int(arr_size))
         return tinfo, field_name
+
+
+def apply_new_field(struct_tinfo, offset: int, idx: int, declaration: str) -> bool:
+    """Insert a new field into an existing struct type (headless).
+
+    Shared by :class:`CreateNewField` (widget-driven) and the ``forge_api``
+    facade. ``offset`` is the struct gap's byte offset, ``idx`` the byte
+    offset of the new field inside that gap, and ``declaration`` a
+    ``TYPE_NAME NAME[SIZE]`` string. Returns ``True`` on success (the
+    numbered type is rewritten in place); on failure logs and returns
+    ``False``.
+    """
+    result = CreateNewField.parse_declaration(declaration)
+    if result is None:
+        log_warning("Bad member declaration!", True)
+        return False
+
+    field_tinfo, field_name = result
+    field_size = field_tinfo.get_size()
+    udt_data = ida_typeinf.udt_type_data_t()
+    udt_member = ida_typeinf.udt_member_t()
+
+    struct_tinfo.get_udt_details(udt_data)
+    udt_member.offset = offset * 8
+    struct_tinfo.find_udt_member(udt_member, ida_typeinf.STRMEM_OFFSET)
+    gap_size = udt_member.size // 8
+
+    gap_leftover = gap_size - idx - field_size
+
+    if gap_leftover < 0:
+        log_error(
+            f"Too big size for the field. Type with maximum {gap_size - idx} bytes can be used"
+        )
+        return False
+
+    iterator = udt_data.find(udt_member)
+    iterator = udt_data.erase(iterator)
+
+    if gap_leftover > 0:
+        udt_data.insert(
+            iterator,
+            create_udt_padding_member(offset + idx + field_size, gap_leftover),
+        )
+
+    udt_member = ida_typeinf.udt_member_t()
+    udt_member.offset = offset * 8 + idx
+    udt_member.name = field_name
+    udt_member.type = field_tinfo
+    udt_member.size = field_size
+
+    iterator = udt_data.insert(iterator, udt_member)
+
+    if idx > 0:
+        udt_data.insert(iterator, create_udt_padding_member(offset, idx))
+
+    struct_tinfo.create_udt(udt_data, ida_typeinf.BTF_STRUCT)
+    struct_tinfo.set_numbered_type(
+        ida_typeinf.get_idati(),
+        struct_tinfo.get_ordinal(),
+        ida_typeinf.BTF_STRUCT,
+        struct_tinfo.dstr(),
+    )
+    return True

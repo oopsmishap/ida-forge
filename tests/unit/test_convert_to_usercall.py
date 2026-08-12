@@ -2,11 +2,16 @@
 
 from __future__ import annotations
 
+from importlib import import_module
 from types import SimpleNamespace
 
 import pytest
 
-from forge.features.convert_to_usercall import convert_to_usercall as module
+# The inner module defines a module-level `convert_to_usercall` helper whose
+# name shadows the submodule in the package namespace (__init__ does
+# `from .convert_to_usercall import *`), so a plain `import ... as module`
+# would bind the function, not the module. import_module is unambiguous.
+module = import_module("forge.features.convert_to_usercall.convert_to_usercall")
 
 
 @pytest.fixture(autouse=True)

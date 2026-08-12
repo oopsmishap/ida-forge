@@ -19,7 +19,6 @@ import forge.api.types as forge_types
 from forge.api.hexrays import create_udt_padding_member
 from forge.api.members import AbstractMember, VirtualTable, materialize_linked_child_member_type
 from forge.util.logging import log_debug, log_error, log_warning
-from forge.util.qt import QtWidgets
 
 
 @contextmanager
@@ -558,17 +557,27 @@ class Structure:
             if member.enabled and member.offset >= origin:
                 yield index, member
 
-    def pack_structure(self, start: int | None = None, end: int | None = None):
+    def build_cdecl(self, start: int | None = None, end: int | None = None):
+        """Build the packed C declaration for the enabled members.
+
+        Returns ``(struct_name, cdecl)`` with ``cdecl`` the ``print_tinfo``
+        declaration (callers add the ``#pragma pack`` wrapper), or ``None``
+        when packing is impossible (empty structure / no packable members).
+
+        This is the non-interactive packing core shared by
+        :meth:`pack_structure` (which adds the name/rewrite dialogs on top)
+        and the headless ``forge_api`` facade (which packs and applies via
+        :meth:`set_cdecl` directly).
+        """
         if not self.members:
             log_warning("Structure is empty", True)
             return None
 
         self.refresh_collisions()
-        struct_name = self.get_name()
+        struct_name = self.get_name() or self.name
         if not struct_name:
-            struct_name = ida_kernwin.ask_str("", ida_kernwin.HIST_TYPE, "Struct name:")
-            if not struct_name:
-                return None
+            log_warning("Structure has no usable name to pack.", True)
+            return None
 
         start_index = self.get_main_offset_index() if start is None else start
         origin = (
@@ -622,6 +631,29 @@ class Structure:
         )
         if not cdecl:
             raise RuntimeError("Failed to generate C declaration")
+        return struct_name, cdecl
+
+    def pack_structure(self, start: int | None = None, end: int | None = None):
+        if not self.members:
+            log_warning("Structure is empty", True)
+            return None
+
+        self.refresh_collisions()
+        struct_name = self.get_name()
+        if not struct_name:
+            struct_name = ida_kernwin.ask_str("", ida_kernwin.HIST_TYPE, "Struct name:")
+            if not struct_name:
+                return None
+
+        start_index = self.get_main_offset_index() if start is None else start
+        origin = (
+            self.members[start_index].offset if start_index < len(self.members) else 0
+        )
+
+        result = self.build_cdecl(start, end)
+        if result is None:
+            return None
+        _, cdecl = result
 
         edited_cdecl = ida_kernwin.ask_text(
             0x10000,
@@ -692,28 +724,58 @@ class Structure:
             scan_object.apply_type(ptr_tinfo)
         return tinfo
 
-    def set_cdecl(self, cdecl: str, origin: int = 0):
+    def set_cdecl(
+        self, cdecl: str, origin: int = 0, *, overwrite: bool | None = None
+    ):
+        """Create/overwrite the IDA type from ``cdecl`` and apply it.
+
+        ``overwrite`` controls the behavior when ``structure_name`` already
+        exists as an IDA type: ``None`` asks the user (GUI flow, shown from
+        :meth:`pack_structure`), ``True`` overwrites without asking, and
+        ``False`` aborts. The headless ``forge_api`` facade always passes an
+        explicit bool so it never raises a Qt dialog.
+        """
         structure_name = self._extract_type_name(cdecl)
         if not structure_name:
             log_warning("Failed to determine type name from the declaration.", True)
             return None
         with _type_write_undo(f"forge: set type {structure_name}"):
-            return self._set_cdecl_impl(cdecl, structure_name, origin)
+            return self._set_cdecl_impl(cdecl, structure_name, origin, overwrite)
 
     def _set_cdecl_impl(
-        self, cdecl: str, structure_name: str, origin: int = 0
+        self,
+        cdecl: str,
+        structure_name: str,
+        origin: int = 0,
+        overwrite: bool | None = None,
     ) -> ida_typeinf.tinfo_t | None:
         if forge_types.create_type(structure_name, cdecl):
             self.created_type_name = structure_name
             log_debug(f"Created type {structure_name}")
             return self._apply_scanned_variable_types(structure_name, origin)
 
-        reply = QtWidgets.QMessageBox.question(
-            None,
-            "Overwrite existing type?",
-            f"Type {structure_name} already exists. Overwrite?",
-            QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
-        )
+        if overwrite is False:
+            log_warning(
+                f"Type {structure_name} already exists; skipping (overwrite disabled).",
+                True,
+            )
+            return None
+
+        # Local import: Qt (and its QMessageBox confirm) is only needed by the
+        # GUI dialog path. The headless forge_api facade always passes an
+        # explicit bool, so importing forge.util.qt here keeps the module (and
+        # everything that imports it) importable without any Qt at all.
+        from forge.util.qt import QtWidgets
+
+        if overwrite is True:
+            reply = QtWidgets.QMessageBox.Yes
+        else:
+            reply = QtWidgets.QMessageBox.question(
+                None,
+                "Overwrite existing type?",
+                f"Type {structure_name} already exists. Overwrite?",
+                QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+            )
         if reply != QtWidgets.QMessageBox.Yes:
             log_error(
                 f"Structure {structure_name} probably already exists. Please check manually.",
