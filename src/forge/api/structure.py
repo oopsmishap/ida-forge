@@ -18,7 +18,12 @@ except ImportError:
 
 import forge.api.types as forge_types
 from forge.api.hexrays import create_udt_padding_member
-from forge.api.members import AbstractMember, VirtualTable, materialize_linked_child_member_type
+from forge.api.members import (
+    AbstractMember,
+    VirtualTable,
+    materialize_linked_child_member_type,
+    parse_user_tinfo,
+)
 from forge.util.logging import log_debug, log_error, log_warning
 
 
@@ -218,6 +223,17 @@ class Structure:
         for member in self.members:
             if getattr(member, "linked_child_structure_name", None) == old_name:
                 member.linked_child_structure_name = new_name
+            # E4 (eval review 2026-08-13): member type strings that name
+            # the renamed structure must follow it, or the next pack
+            # re-parse (see Member._resolve_pack_tinfo) resolves a stale
+            # declaration and rebuilds the member as ``#NN *``.
+            src = getattr(member, "decl_src", None)
+            if src and re.search(rf"\b{re.escape(old_name)}\b", src):
+                new_src = re.sub(rf"\b{re.escape(old_name)}\b", new_name, src)
+                member.decl_src = new_src
+                refreshed = parse_user_tinfo(new_src)
+                if refreshed is not None:
+                    member.tinfo = refreshed
 
 
     def rename_created_type(self, old_name: str, new_name: str) -> bool:
@@ -348,11 +364,24 @@ class Structure:
         *,
         visited: set[str] | None = None,
         headless: bool = False,
-    ) -> bool:
+    ) -> tuple[bool, list[str], str | None]:
+        """Create every type in the subtree postorder (children first).
+
+        Returns ``(ok, created_names, error)`` — E9 (eval review
+        2026-08-13): callers could not distinguish "child missing" from a
+        real commit failure, and a partially-created subtree reported
+        ``ok=False`` with no reason. ``created_names`` lists every
+        structure whose type committed; ``error`` is the first failure
+        reason (unresolved child, cycle, or the exception text), None when
+        the whole subtree committed.
+        """
         completed = visited if visited is not None else set()
         stack: list[str] = []
+        created_names: list[str] = []
+        error: str | None = None
 
         def _walk(structure: Structure) -> bool:
+            nonlocal error
             if structure.name in completed:
                 return True
             if structure.name in stack:
@@ -362,6 +391,7 @@ class Structure:
                     f"Cycle detected while creating type subtree: {cycle_path}",
                     True,
                 )
+                error = error or f"cycle: {cycle_path}"
                 return False
 
             stack.append(structure.name)
@@ -369,22 +399,41 @@ class Structure:
                 for child_structure in structure.iter_child_structures(structures_by_name):
                     if not _walk(child_structure):
                         log_warning(
-                            f"Cannot create subtree for {structure.name}: child subtree {child_structure.name} could not be finalized",
+                            f"Cannot create subtree for {structure.name}: "
+                            f"child subtree {child_structure.name} "
+                            "could not be finalized",
                             True,
+                        )
+                        error = error or (
+                            f"child subtree {child_structure.name} "
+                            "could not be finalized"
                         )
                         return False
 
                 if structure.create_type_if_ready(
                     structures_by_name, headless=headless
                 ) is None:
+                    unresolved = structure.get_unresolved_child_names(
+                        structures_by_name
+                    )
+                    error = error or (
+                        f"unresolved children: {', '.join(unresolved)}"
+                        if unresolved
+                        else f"type creation failed for {structure.name}"
+                    )
                     return False
 
                 completed.add(structure.name)
+                created_names.append(structure.name)
                 return True
+            except Exception as exc:  # noqa: BLE001 — subtree walk must not abort the batch
+                error = error or f"{type(exc).__name__}: {exc}"
+                return False
             finally:
                 stack.pop()
 
-        return _walk(self)
+        ok = _walk(self)
+        return ok, created_names, error
 
     def has_collision(self, index: int) -> bool:
         return 0 <= index < len(self.collisions) and self.collisions[index]

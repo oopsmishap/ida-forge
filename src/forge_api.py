@@ -667,29 +667,73 @@ def imports(pattern: str | None = None) -> list[dict]:
     _require_ida()
     import ida_name
     import ida_segment
-    import idautils
 
     rows = []
-    for entry in idautils.Entries():
-        # shape differs across IDA versions: (ea, ordinal, name) or
-        # (index, ordinal, ea, name) — normalize by length
-        if len(entry) == 3:
-            _ordinal, ea, name = entry
-        elif len(entry) == 4:
-            _index, _ordinal, ea, name = entry
-        else:
-            continue
-        resolved = name or ida_name.get_name(ea)
-        segment = ida_segment.getseg(ea)
-        module = (
-            ida_segment.get_segm_name(segment)
-            if segment is not None
-            else ""
-        )
-        rows.append({"module": module, "ea": ea, "name": resolved})
+    # E5 (eval review 2026-08-13): the old ``idautils.Entries()`` walk
+    # resolved the wrong namespace (returned one bogus ``.text`` row and
+    # filtered every real module to []). Walk the actual import table with
+    # the ordinal API, falling back to Entries() only when the IAT API is
+    # unavailable or empty.
+    try:
+        import ida_idaapi
+        import ida_nalt
+
+        module_count = ida_nalt.get_import_module_qty()
+        if module_count > 0:
+            for module_index in range(module_count):
+                module = ida_nalt.get_import_module_name(module_index) or ""
+                seen_addresses: set[int] = set()
+
+                def _collect(
+                    ea: int,
+                    name: str,
+                    _ordinal: int,
+                    _seen=seen_addresses,
+                    _module=module,
+                ) -> int:
+                    if ea in (ida_idaapi.BADADDR, 0) or ea in _seen:
+                        return 1
+                    _seen.add(ea)
+                    rows.append(
+                        {
+                            "module": _module,
+                            "ea": ea,
+                            "name": name or ida_name.get_name(ea),
+                        }
+                    )
+                    return 1
+
+                ida_nalt.enum_import_names(module_index, _collect)
+    except Exception:  # noqa: BLE001 — IAT API shape varies; fall back below
+        rows = []
+
+    if not rows:
+        import idautils
+
+        for entry in idautils.Entries():
+            # shape differs across IDA versions: (ea, ordinal, name) or
+            # (index, ordinal, ea, name) — normalize by length
+            if len(entry) == 3:
+                _ordinal, ea, name = entry
+            elif len(entry) == 4:
+                _index, _ordinal, ea, name = entry
+            else:
+                continue
+            resolved = name or ida_name.get_name(ea)
+            segment = ida_segment.getseg(ea)
+            module = (
+                ida_segment.get_segm_name(segment)
+                if segment is not None
+                else ""
+            )
+            rows.append({"module": module, "ea": ea, "name": resolved})
     if pattern:
         folded = pattern.casefold()
-        rows = [row for row in rows if folded in row["name"].casefold()]
+        rows = [
+            row
+            for row in rows
+            if folded in row["name"].casefold() or folded in row["module"].casefold()
+        ]
     return sorted(rows, key=lambda row: row["ea"])
 
 
@@ -763,6 +807,42 @@ def set_lvar_types(ea: int, types, *, scope: str = "arg") -> dict:
     return {"ok": any_ok, "updated": updated, "signature": signature}
 
 
+def _parse_function_decl(declaration: str):
+    """Parse a function prototype across IDA versions (E1, 2026-08-13).
+
+    ``ida_typeinf.parse_decl`` returns None for function declarations on
+    the 9.4 build; ``idc.parse_decl`` is the working path. Tries both,
+    plus the ``None``-til form used by the member parser.
+    """
+    _require_ida()
+    import ida_typeinf
+
+    flags = ida_typeinf.PT_TYP | ida_typeinf.PT_SIL
+    for til in (None, ida_typeinf.get_idati()):
+        tinfo = ida_typeinf.tinfo_t()
+        try:
+            if ida_typeinf.parse_decl(tinfo, til, declaration, flags):
+                return tinfo
+        except Exception as exc:  # noqa: BLE001 — version/format tolerance
+            from forge.util.logging import log_debug
+
+            log_debug(f"parse_decl({til!r}) failed for {declaration!r}: {exc}")
+            continue
+    try:
+        import idc
+
+        tinfo = idc.parse_decl(
+            ida_typeinf.get_idati(), declaration, ida_typeinf.PT_TYP
+        )
+        if tinfo is not None:
+            return tinfo
+    except Exception as exc:  # noqa: BLE001 — idc.parse_decl shape varies by version
+        from forge.util.logging import log_debug
+
+        log_debug(f"idc.parse_decl failed for {declaration!r}: {exc}")
+    return None
+
+
 @api(
     group="types",
     returns="dict",
@@ -771,28 +851,28 @@ def set_lvar_types(ea: int, types, *, scope: str = "arg") -> dict:
 def set_func_proto(ea: int, declaration: str) -> dict:
     """Set a function's prototype in the IDB.
 
-    Parses ``declaration`` as a function type (the til must be the local
-    til — ``None`` silently fails) and applies it via ``ida_funcs.set_ti``.
-    The result's ``prototype`` is the re-decompiled first line.
+    Parses ``declaration`` as a function type (``ida_typeinf.parse_decl``
+    then ``idc.parse_decl`` fallback, E1) and applies it via
+    ``ida_typeinf.apply_tinfo`` (``ida_funcs.set_ti`` was removed on
+    9.4). The result's ``prototype`` is the re-decompiled first line.
 
     Returns:
         ``{"ok": True, "ea": int, "prototype": str}`` or
         ``{"ok": False, "error": str}``.
     """
     _require_ida()
-    import ida_funcs
     import ida_typeinf
 
-    t = ida_typeinf.tinfo_t()
-    parsed_name = ida_typeinf.parse_decl(
-        t,
-        ida_typeinf.get_idati(),
-        declaration,
-        ida_typeinf.PT_TYP | ida_typeinf.PT_SIL,
-    )
-    if parsed_name is None:
+    t = _parse_function_decl(declaration)
+    if t is None:
         return {"ok": False, "error": f"could not parse declaration {declaration!r}"}
-    ida_funcs.set_ti(ea, t)
+    apply_tinfo = getattr(ida_typeinf, "apply_tinfo", None)
+    if apply_tinfo is not None:
+        apply_tinfo(ea, t, ida_typeinf.TINFO_DEFINITE)
+    else:  # pragma: no cover — pre-7.x builds only
+        import ida_funcs
+
+        ida_funcs.set_ti(ea, t)
     return {"ok": True, "ea": ea, "prototype": signature(ea)}
 
 
@@ -1098,14 +1178,17 @@ def get_member(
     structure: str | None = None,
     offset: int = 0,
     *,
+    member_name: str | None = None,
     include_disabled: bool = True,
 ) -> dict | None:
     """Return the first member dict at ``offset``.
 
     Unlike :meth:`Structure.get_member_by_offset`, ``include_disabled=False``
-    skips collision-disabled members. Returns ``None`` when no structure is
-    selected/resolvable or no member matches (read-side convention matches
-    :func:`get_structure`).
+    skips collision-disabled members. ``member_name`` (E11, 2026-08-13)
+    disambiguates collision pairs — without it, the offset match silently
+    picks whichever member sorts first. Returns ``None`` when no structure
+    is selected/resolvable or no member matches (read-side convention
+    matches :func:`get_structure`).
 
     Returns:
         member dict or None.
@@ -1115,6 +1198,8 @@ def get_member(
         return None
     for member in target.members:
         if member.offset != offset:
+            continue
+        if member_name is not None and member.name != member_name:
             continue
         if not include_disabled and not member.enabled:
             continue
@@ -1148,6 +1233,14 @@ def create_structure(
     structure = Structure(name)
     _structures[name] = structure
     _state.current = name
+    # E3 (eval review 2026-08-13): a member whose type references the
+    # structure's own name (``"KV *"`` inside ``KV``) cannot parse until
+    # an IDB type named ``KV`` exists — previously the parse failure was
+    # swallowed and the member silently dropped from the created
+    # structure. Seed the lazy placeholder up front so the first
+    # self/forward reference survives.
+    if members and not is_type(name):
+        _ensure_placeholder_type(name)
     for spec in members or []:
         add_member(
             name,
@@ -1276,6 +1369,7 @@ def set_member(
     structure: str | None = None,
     offset: int = 0,
     *,
+    member_name: str | None = None,
     type: str | None = None,
     name: str | None = None,
     comment: str | None = None,
@@ -1284,9 +1378,12 @@ def set_member(
 ) -> dict:
     """Edit the member at ``offset`` in a store structure.
 
-    Only the provided keyword fields change. ``type`` must parse as a C type;
-    a parse failure returns ``{"ok": False, "error": ...}`` without changing
-    anything. Raises :class:`ForgeApiError` when no member exists at ``offset``.
+    Only the provided keyword fields change. ``member_name`` (E11,
+    2026-08-13) selects which member at a collision-offset is edited —
+    without it the offset match silently picks whichever member sorts
+    first. ``type`` must parse as a C type; a parse failure returns
+    ``{"ok": False, "error": ...}`` without changing anything. Raises
+    :class:`ForgeApiError` when no member exists at ``offset``.
 
     Returns:
         the updated member dict.
@@ -1294,9 +1391,22 @@ def set_member(
     from forge.api.members import parse_user_tinfo
 
     target = _resolve_structure(structure)
-    member = target.get_member_by_offset(offset)
+    if member_name is not None:
+        member = next(
+            (
+                m
+                for m in target.members
+                if m.offset == offset and m.name == member_name
+            ),
+            None,
+        )
+    else:
+        member = target.get_member_by_offset(offset)
     if member is None:
-        raise ForgeApiError(f"no member at offset 0x{offset:x}")
+        raise ForgeApiError(
+            f"no member at offset 0x{offset:x}"
+            + (f" named {member_name!r}" if member_name else "")
+        )
     if type is not None:
         tinfo = parse_user_tinfo(type)
         if tinfo is None:
@@ -1306,6 +1416,7 @@ def set_member(
         if tinfo is None:
             return {"ok": False, "error": f"could not parse type {type!r}"}
         member.tinfo = tinfo
+        member.decl_src = type
         member.is_array = False
         member.invalidate_score()
     if name is not None:
@@ -1360,6 +1471,13 @@ def link_child(
                 f"could not create placeholder member at 0x{offset:x}"
             )
         member = target.get_member_by_offset(offset)
+    # E8 (eval review 2026-08-13): linking used to leave the placeholder's
+    # ``u32`` type in place (the linked member serially rendered u32_10
+    # and needed a manual set_member afterwards). Materialize the pointer
+    # member type now that the child is known.
+    from forge.api.members import materialize_linked_child_member_type
+
+    materialize_linked_child_member_type(member, child_name, "pointer")
     member.linked_child_structure_name = child_name
     member.child_relation_kind = "pointer"
     relationship = target.add_child_relationship(
@@ -1585,7 +1703,7 @@ def vtable_entries(address: int) -> list[dict] | dict:
             {"offset": vf.offset, "ea": vf.address, "slot": index}
             for index, vf in enumerate(vtable.virtual_functions)
         ]
-    except (AssertionError, AttributeError, TypeError, ValueError) as exc:
+    except (AssertionError, AttributeError, OSError, TypeError, ValueError) as exc:
         return {"ok": False, "error": f"no vtable at {hex(address)}: {exc}"}
     return slots
 
@@ -2287,6 +2405,26 @@ def _add_named_sub_heads(target, ea: int, span: int):
 # --------------------------------------------------------------------------- #
 # build / apply / finalize
 # --------------------------------------------------------------------------- #
+def _is_forge_placeholder_type(name: str) -> bool:
+    """True when ``name`` is a lazy placeholder this plugin seeded earlier.
+
+    E10 (eval review 2026-08-13): placeholders (``struct X { char
+    _placeholder; };``, see ``_ensure_placeholder_type``) are forge's own
+    scaffolding, not a user type — ``create_type(overwrite=False)`` must
+    not treat them as an existing type, or the default scan→commit flow
+    breaks on every self-referencing struct.
+    """
+    import ida_typeinf
+
+    tinfo = ida_typeinf.tinfo_t()
+    if not tinfo.get_named_type(ida_typeinf.get_idati(), name):
+        return False
+    udt = ida_typeinf.udt_type_data_t()
+    if not tinfo.get_udt_details(udt):
+        return False
+    return len(udt) == 1 and getattr(udt[0], "name", "") == "_placeholder"
+
+
 @api(
     group="build",
     returns="dict",
@@ -2322,7 +2460,12 @@ def create_type(name: str | None = None, *, overwrite: bool = False) -> dict:
         # generic set_cdecl-None lie (which used to mask recreate failures).
         tinfo = ida_typeinf.tinfo_t()
         if tinfo.get_named_type(ida_typeinf.get_idati(), name):
-            return {"ok": False, "error": "type already exists (overwrite disabled)"}
+            if _is_forge_placeholder_type(name):
+                # E10: forge's own lazy placeholder — replace it wholesale,
+                # as if this were the first commit.
+                overwrite = True
+            else:
+                return {"ok": False, "error": "type already exists (overwrite disabled)"}
     elif overwrite is True and not Structure._declaration_parses(cdecl):
         # Validate before the destructive delete so a malformed edit cannot
         # destroy the existing type (the DB would end up with no type at all).
@@ -2422,7 +2565,8 @@ def finalize_all() -> list:
     subtree postorder walk (:meth:`Structure.create_subtree_types_postorder`).
 
     Returns:
-        list of ``{"structure": name, "ok": bool, "created": bool}``.
+        list of ``{"structure": name, "ok": bool, "created": bool,
+        "created_names": [str], "error": str|None}``.
     """
     _require_ida()
     child_names = {
@@ -2434,12 +2578,20 @@ def finalize_all() -> list:
     results = []
     for root_name in roots:
         root = _structures[root_name]
-        ok = root.create_subtree_types_postorder(_structures, headless=True)
+        # E9 (eval review 2026-08-13): the old bool hid partial successes
+        # and the reason for failure ("see IDA log" is unreachable via the
+        # facade) — the subtree walk now reports created names + the first
+        # failure reason.
+        ok, created_names, error = root.create_subtree_types_postorder(
+            _structures, headless=True
+        )
         results.append(
             {
                 "structure": root_name,
                 "ok": ok,
                 "created": root.created_type_name is not None,
+                "created_names": created_names,
+                "error": error,
             }
         )
     return results
@@ -2567,7 +2719,6 @@ def inverse_if(ea: int, insn_ea: int) -> bool:
     _require_ida()
     import ida_hexrays
 
-    from forge.api.hexrays import collect_ctree_items_near_ea
     from forge.api.hexrays import decompile as _decompile
     from forge.features.swap_if.helper import inverse_if as _inverse_if
     from forge.features.swap_if.storage import set_inverted
@@ -2576,19 +2727,82 @@ def inverse_if(ea: int, insn_ea: int) -> bool:
     if cfunc is None:
         return False
 
+    # E6 (eval review 2026-08-13): the treeitems/eamap lookup silently
+    # found nothing on the live 9.4 build (treeitems is empty and
+    # closest-addr resolution missed the if), so inverse_if always
+    # returned False. Walk the ctree instead and pick the ``cit_if`` with
+    # an else branch nearest to ``insn_ea`` — the same visitor fallback
+    # the I.25 scanners use.
     cif = None
-    for item in collect_ctree_items_near_ea(cfunc, insn_ea, exhaustive=True):
-        insn = getattr(item, "it", None)
-        if insn is None:
-            insn = item
-        specific = getattr(insn, "to_specific_type", None) or insn
-        if getattr(specific, "op", None) == getattr(ida_hexrays, "cit_if", None):
-            candidate = getattr(specific, "cif", None)
-            # The qswap in helper.inverse_if needs a real else branch (the GUI
-            # SwapThenElse action gates on ielse too); skip else-less ifs.
-            if candidate is not None and getattr(candidate, "ielse", None) is not None:
-                cif = candidate
-                break
+    treeitems = getattr(cfunc, "treeitems", None)
+    ci_if_op = getattr(ida_hexrays, "cit_if", None)
+    if ci_if_op is not None:
+        if treeitems:
+            candidates = []
+            for item in treeitems:
+                # treeitems are ctree_item_t wrappers: unwrap .it, then
+                # invoke to_specific_type (it is a method — ``or item``
+                # would keep the bound method and never match).
+                specific = getattr(item, "it", None) or item
+                to_specific = getattr(specific, "to_specific_type", None)
+                if callable(to_specific):
+                    specific = to_specific()
+                candidate = getattr(specific, "cif", None)
+                if (
+                    getattr(specific, "op", None) == ci_if_op
+                    and candidate is not None
+                    and getattr(candidate, "ielse", None) is not None
+                ):
+                    candidates.append(candidate)
+            if candidates:
+                cif = min(
+                    candidates,
+                    key=lambda c: abs(getattr(c, "ea", insn_ea) - insn_ea),
+                )
+        else:
+            walker_cls = getattr(ida_hexrays, "ctree_visitor_t", None)
+            if walker_cls is not None:
+
+                class _IfWalker(walker_cls):
+                    def __init__(self, target_ea):
+                        try:
+                            walker_cls.__init__(self, 0)
+                        except TypeError:  # pragma: no cover — binding drift
+                            walker_cls.__init__(self, None)
+                        self.target_ea = target_ea
+                        self.closest = None
+                        self.closest_distance = None
+
+                    def visit_insn(self, insn):
+                        # statements are visited through visit_insn (O1
+                        # finding: cit_return/visit_statement mismatch)
+                        if getattr(insn, "op", None) != ci_if_op:
+                            return 0
+                        candidate = getattr(insn, "cif", None)
+                        if candidate is None or getattr(
+                            candidate, "ielse", None
+                        ) is None:
+                            return 0
+                        distance = abs(
+                            getattr(candidate, "ea", self.target_ea)
+                            - self.target_ea
+                        )
+                        if (
+                            self.closest is None
+                            or distance < self.closest_distance
+                        ):
+                            self.closest = candidate
+                            self.closest_distance = distance
+                        return 0
+
+                finder = _IfWalker(insn_ea)
+                body = getattr(cfunc, "body", None)
+                if body is not None:
+                    from contextlib import suppress
+
+                    with suppress(Exception):
+                        finder.apply_to(body, None)
+                cif = finder.closest
     if cif is None:
         return False
 

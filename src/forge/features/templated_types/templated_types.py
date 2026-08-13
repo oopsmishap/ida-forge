@@ -7,7 +7,11 @@ import pathlib
 import ida_hexrays
 import ida_idaapi
 import ida_typeinf
-import toml
+
+try:  # stdlib tomllib on Python 3.11+ (IDA 9.x ships 3.12) — E7, 2026-08-13
+    import tomllib
+except ImportError:  # Python 3.9/3.10 falls back to the optional `toml` package
+    tomllib = None
 
 from forge.util.logging import log_debug, log_error
 
@@ -133,8 +137,17 @@ class TemplatedTypes:
     def reload_types(self):
         if self.file_path == "":
             return False
-        with open(self.file_path) as f:
-            types_dict = toml.loads(f.read())
+        # E7 (eval review 2026-08-13): a hard ``import toml`` made the whole
+        # templated subsystem dead in headless envs that lack the package.
+        # Read via stdlib tomllib, falling back to the optional package.
+        if tomllib is not None:
+            with open(self.file_path, "rb") as f:
+                types_dict = tomllib.load(f)
+        else:
+            import toml
+
+            with open(self.file_path, encoding="utf-8") as f:
+                types_dict = toml.loads(f.read())
         self._types_dict = types_dict
         self.keys = list(types_dict.keys())
         return True

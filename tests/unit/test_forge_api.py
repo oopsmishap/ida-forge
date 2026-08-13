@@ -317,7 +317,15 @@ def test_finalize_all_runs_headless_subtree(monkeypatch):
 
     results = forge_api.finalize_all()
 
-    assert results == [{"structure": "Root", "ok": True, "created": True}]
+    assert results == [
+        {
+            "structure": "Root",
+            "ok": True,
+            "created": True,
+            "created_names": ["Root"],
+            "error": None,
+        }
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -1537,7 +1545,8 @@ def test_vtable_entries_reads_slots(monkeypatch):
 
 def test_vtable_entries_reports_non_vtable(monkeypatch):
     """I.14: an address that is not a vtable returns an error dict, not a
-    raise."""
+    raise — and since E2 (2026-08-13) an unnamed pointer table no longer
+    asserts either: it yields an empty slot list."""
     from forge.api import members as members_api
 
     monkeypatch.setattr(members_api, "read_pointer", lambda ea: 0, raising=False)
@@ -1545,8 +1554,17 @@ def test_vtable_entries_reports_non_vtable(monkeypatch):
         members_api.ida_name, "get_name", lambda ea: "", raising=False
     )
 
+    # E2: unnamed table → vtbl_<addr> fallback, zero slots, no assert.
     result = forge_api.vtable_entries(0x140006358)
+    assert result == []
 
+    # A genuinely broken read still surfaces as an error dict.
+    def _broken_read(ea):
+        raise OSError("unmapped")
+
+    monkeypatch.setattr(members_api, "read_pointer", _broken_read, raising=False)
+
+    result = forge_api.vtable_entries(0x140006358)
     assert result["ok"] is False
     assert "error" in result
 
@@ -1559,3 +1577,258 @@ def test_vtable_name_resolves_display_name(monkeypatch):
 
     assert result["name"] == "vftable_140006358"
     assert result["is_nice"] is True
+
+
+# ---------------------------------------------------------------------------
+# E-series regression tests (eval review 2026-08-13)
+# ---------------------------------------------------------------------------
+
+def test_create_structure_seeds_own_placeholder_before_members(monkeypatch):
+    """E3: a member whose type references the structure's own name must
+    not be silently dropped — the lazy placeholder is seeded before the
+    member loop parses."""
+    ensure_calls = []
+    monkeypatch.setattr(forge_api, "is_type", lambda name: False, raising=False)
+    monkeypatch.setattr(
+        forge_api,
+        "_ensure_placeholder_type",
+        lambda name: (ensure_calls.append(name) or True),
+        raising=False,
+    )
+
+    result = forge_api.create_structure(
+        "KV",
+        members=[
+            {"offset": 0, "type": "char *", "name": "key"},
+            {"offset": 8, "type": "char *", "name": "value"},
+            {"offset": 0x10, "type": "KV *", "name": "next"},
+        ],
+    )
+
+    assert ensure_calls == ["KV"]
+    assert result["name"] == "KV"
+    # members that parse survive the loop (parse is stubbed to FakeTinfo)
+    assert {m["name"] for m in result["members"]} == {"key", "value", "next"}
+
+
+def test_e3_no_placeholder_seeded_without_members(monkeypatch):
+    ensure_calls = []
+    monkeypatch.setattr(
+        forge_api,
+        "_ensure_placeholder_type",
+        lambda name: (ensure_calls.append(name) or True)[1],
+        raising=False,
+    )
+    forge_api.create_structure("Empty")
+    assert ensure_calls == []
+
+
+def test_e5_imports_walks_iat_and_filters_module_and_name(monkeypatch):
+    """E5: imports() reads the real import table (module + name filters),
+    not the bogus Entries() namespace."""
+    import ida_nalt
+
+    monkeypatch.setattr(ida_nalt, "get_import_module_qty", lambda: 2)
+    monkeypatch.setattr(
+        ida_nalt,
+        "get_import_module_name",
+        lambda idx: ("KERNEL32.dll" if idx == 0 else "VCRUNTIME140.dll"),
+    )
+
+    def fake_enum(idx, cb):
+        if idx == 0:
+            cb(0x140001000, "CreateFileW", 1)
+            cb(0x140001008, "printf", 2)
+        else:
+            cb(0x140001010, "malloc", 1)
+        return True
+
+    monkeypatch.setattr(ida_nalt, "enum_import_names", fake_enum)
+
+    rows = forge_api.imports("printf")
+    assert rows == [{"module": "KERNEL32.dll", "ea": 0x140001008, "name": "printf"}]
+
+    all_rows = forge_api.imports()
+    assert [r["name"] for r in all_rows] == ["CreateFileW", "printf", "malloc"]
+    assert {r["module"] for r in all_rows} == {
+        "KERNEL32.dll",
+        "VCRUNTIME140.dll",
+    }
+
+
+def test_e8_link_child_materializes_child_pointer_type(monkeypatch):
+    """E8: linking a member at an offset materializes the ``Child *``
+    member type instead of leaving the ``u32`` placeholder."""
+    from forge.api import members as members_mod
+
+    parsed = []
+
+    def _fake_parse(declaration):
+        parsed.append(declaration)
+        name = (declaration or "u32").split()[0]
+        return FakeTinfo(name)
+
+    monkeypatch.setattr(members_mod, "parse_user_tinfo", _fake_parse, raising=False)
+
+    forge_api.create_structure("PointerParent")
+    forge_api.create_structure("Kid")
+    linked = forge_api.link_child("PointerParent", 0x10, "Kid")
+
+    assert linked["offset"] == 0x10
+    assert parsed[0] == "u32"  # placeholder creation
+    assert parsed[1] == "Kid *"  # E8 materialization
+    member = forge_api.get_member("PointerParent", 0x10)
+    assert member is not None
+    assert member["type"] == "Kid"
+
+
+def test_e10_create_type_overwrites_own_placeholder(monkeypatch):
+    """E10: create_type(overwrite=False) treats the plugin's lazy
+    placeholder as absent — the default scan→commit flow survives
+    self-referencing structs."""
+    _commit_structure_stubs(monkeypatch)
+    overwrite_seen = []
+
+    from forge.api import structure as structure_mod
+
+    real_set_cdecl = structure_mod.Structure.set_cdecl
+    monkeypatch.setattr(
+        structure_mod.Structure,
+        "set_cdecl",
+        lambda self, cdecl, origin=0, *, overwrite=None: (
+            overwrite_seen.append(overwrite)
+            or real_set_cdecl(self, cdecl, origin, overwrite=overwrite)
+        ),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        forge_api, "_is_forge_placeholder_type", lambda name: True, raising=False
+    )
+
+    forge_api.create_structure("KV")
+    forge_api.add_member("KV", 0, "u32", name="key")
+
+    result = forge_api.create_type("KV")  # overwrite=False by default
+
+    assert result["ok"] is True
+    assert overwrite_seen == [True]
+
+
+def _sized_parse(declaration):
+    """Autouse fixture override: distinct type names by width so
+    same-offset members don't merge (Member.__eq__ keys on offset+type)."""
+    name = (declaration or "u32").split()[0]
+    size = {"u64": 8, "u16": 2}.get(name, 4)
+    return FakeTinfo(name, size=size)
+
+
+def test_e11_get_member_disambiguates_collision_by_name(monkeypatch):
+    from forge.api import members as members_mod
+
+    monkeypatch.setattr(members_mod, "parse_user_tinfo", _sized_parse, raising=False)
+    forge_api.create_structure("Coll")
+    forge_api.add_member("Coll", 0x10, "u32", name="scanned")
+    forge_api.add_member("Coll", 0x10, "u64", name="hand")
+
+    assert forge_api.get_member("Coll", 0x10, member_name="hand")["name"] == "hand"
+    assert (
+        forge_api.get_member("Coll", 0x10, member_name="scanned")["name"]
+        == "scanned"
+    )
+    assert forge_api.get_member("Coll", 0x10)["name"] in {"scanned", "hand"}
+
+
+def test_e11_set_member_targets_collision_by_name(monkeypatch):
+    from forge.api import members as members_mod
+
+    monkeypatch.setattr(members_mod, "parse_user_tinfo", _sized_parse, raising=False)
+    forge_api.create_structure("Coll")
+    forge_api.add_member("Coll", 0x10, "u32", name="scanned")
+    forge_api.add_member("Coll", 0x10, "u64", name="hand")
+
+    result = forge_api.set_member(
+        "Coll", 0x10, member_name="hand", name="key", comment="E11"
+    )
+
+    assert result["name"] == "key"
+    assert result["comment"] == "E11"
+    assert forge_api.get_member("Coll", 0x10, member_name="scanned")["name"] == "scanned"
+
+
+def test_e11_set_member_unknown_name_raises(monkeypatch):
+    from forge.api import members as members_mod
+
+    monkeypatch.setattr(members_mod, "parse_user_tinfo", _sized_parse, raising=False)
+    forge_api.create_structure("Coll")
+    forge_api.add_member("Coll", 0x10, "u32", name="scanned")
+
+    with pytest.raises(forge_api.ForgeApiError):
+        forge_api.set_member("Coll", 0x10, member_name="nope", name="x")
+
+
+def test_e6_inverse_if_picks_nearest_if_with_else(monkeypatch):
+    """E6: inverse_if locates the cit_if nearest to insn_ea (treeitems
+    path) instead of returning False on the first miss."""
+    import ida_hexrays
+
+    from forge.api import hexrays as hexrays_mod
+    from forge.features.swap_if import helper as swap_helper
+    from forge.features.swap_if import storage as swap_storage
+
+    monkeypatch.setattr(ida_hexrays, "cit_if", 42, raising=False)
+
+    def fake_decompile(ea):
+        return SimpleNamespace(
+            treeitems=[
+                SimpleNamespace(
+                    to_specific_type=lambda: SimpleNamespace(
+                        op=42,
+                        cif=SimpleNamespace(ielse=True, ea=0x4000),
+                    )
+                ),
+                SimpleNamespace(
+                    to_specific_type=lambda: SimpleNamespace(
+                        op=42,
+                        cif=SimpleNamespace(ielse=True, ea=0x4020),
+                    )
+                ),
+            ],
+            body=None,
+        )
+
+    monkeypatch.setattr(hexrays_mod, "decompile", fake_decompile, raising=False)
+    inverted = []
+    monkeypatch.setattr(
+        swap_helper, "inverse_if", lambda cif: inverted.append(cif), raising=False
+    )
+    monkeypatch.setattr(
+        swap_storage, "set_inverted", lambda *args: None, raising=False
+    )
+
+    assert forge_api.inverse_if(0x140001000, 0x4010) is True
+    assert len(inverted) == 1
+    assert inverted[0].ea == 0x4000
+
+
+def test_e6_inverse_if_skips_else_less_ifs(monkeypatch):
+    import ida_hexrays
+
+    from forge.api import hexrays as hexrays_mod
+
+    monkeypatch.setattr(ida_hexrays, "cit_if", 42, raising=False)
+
+    def fake_decompile(ea):
+        return SimpleNamespace(
+            treeitems=[
+                SimpleNamespace(
+                    to_specific_type=lambda: SimpleNamespace(
+                        op=42, cif=SimpleNamespace(ielse=None, ea=0x4000)
+                    )
+                )
+            ],
+            body=None,
+        )
+
+    monkeypatch.setattr(hexrays_mod, "decompile", fake_decompile, raising=False)
+
+    assert forge_api.inverse_if(0x140001000, 0x4010) is False

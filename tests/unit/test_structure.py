@@ -395,6 +395,32 @@ def test_iter_child_structures_resolves_children_in_offset_order():
     ]
 
 
+def test_rename_relationship_references_rewrites_member_decl_src(monkeypatch):
+    """E4 (eval review 2026-08-13): member type strings that name the
+    renamed structure follow it, and the member tinfo is re-parsed — a
+    stale ``KV *`` declaration would otherwise rebuild as ``#NN *``."""
+    from types import SimpleNamespace
+
+    refreshed = []
+    monkeypatch.setattr(
+        structure_module,
+        "parse_user_tinfo",
+        lambda decl: (refreshed.append(decl) or object()),
+    )
+
+    parent = Structure("KV")
+    self_ref = SimpleNamespace(decl_src="KV *")
+    unrelated = SimpleNamespace(decl_src="Kid *")
+    parent.members = [self_ref, unrelated]
+
+    parent.rename_relationship_references("KV", "KeyValuePair")
+
+    assert self_ref.decl_src == "KeyValuePair *"
+    assert self_ref.tinfo is not None
+    assert unrelated.decl_src == "Kid *"
+    assert refreshed == ["KeyValuePair *"]
+
+
 def test_create_subtree_types_postorder_creates_children_before_parent(monkeypatch):
     warnings = []
     pack_calls = []
@@ -435,7 +461,12 @@ def test_create_subtree_types_postorder_creates_children_before_parent(monkeypat
         "Gamma": Structure("Gamma"),
     }
 
-    assert parent.create_subtree_types_postorder(structures_by_name) is True
+    ok, created_names, error = parent.create_subtree_types_postorder(
+        structures_by_name
+    )
+    assert ok is True
+    assert created_names == ["Alpha", "Gamma", "Beta", "Parent"]
+    assert error is None
     assert pack_calls == ["Alpha", "Gamma", "Beta", "Parent"]
     assert warnings == []
 
@@ -463,7 +494,12 @@ def test_create_subtree_types_postorder_warns_on_missing_child(monkeypatch):
         parent_member_name="missing_ptr",
     )
 
-    assert parent.create_subtree_types_postorder({"Parent": parent}) is False
+    ok, created_names, error = parent.create_subtree_types_postorder(
+        {"Parent": parent}
+    )
+    assert ok is False
+    assert created_names == []
+    assert error == "unresolved children: Missing"
     assert pack_calls == []
     assert warnings == [
         "Cannot create type for Parent: unresolved child structures: Missing",
@@ -501,7 +537,12 @@ def test_create_subtree_types_postorder_detects_cycles(monkeypatch):
 
     structures_by_name = {"A": parent, "B": child}
 
-    assert parent.create_subtree_types_postorder(structures_by_name) is False
+    ok, created_names, error = parent.create_subtree_types_postorder(
+        structures_by_name
+    )
+    assert ok is False
+    assert created_names == []
+    assert error == "cycle: A -> B -> A"
     assert pack_calls == []
     assert any(
         warning == "Cycle detected while creating type subtree: A -> B -> A"

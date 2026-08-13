@@ -92,13 +92,13 @@ def _parse_decl_attempt(declaration: str) -> ida_typeinf.tinfo_t | None:
 
 
 def _parse_idc_decl_attempt(declaration: str) -> ida_typeinf.tinfo_t | None:
-    result = idaapi.idc_parse_decl(ida_typeinf.get_idati(), declaration, idaapi.PT_TYP)
-    if result is None:
-        return None
+    # ``idaapi.idc_parse_decl`` does not exist on IDA 9.4 (AttributeError);
+    # the idc-module wrapper is the working path (eval review E.1, 2026-08-13).
+    import idc as _idc
 
-    _, type_bytes, field_bytes = result
-    tinfo = ida_typeinf.tinfo_t()
-    tinfo.deserialize(ida_typeinf.get_idati(), type_bytes, field_bytes, None)
+    tinfo = _idc.parse_decl(ida_typeinf.get_idati(), declaration, idaapi.PT_TYP)
+    if tinfo is None:
+        return None
     return tinfo
 
 
@@ -191,6 +191,7 @@ def materialize_linked_child_member_type(
 
     member.tinfo = tinfo
     member.is_array = False
+    member.decl_src = type_decl
     if hasattr(member, "invalidate_score"):
         member.invalidate_score()
     return True
@@ -206,6 +207,12 @@ class AbstractMember:
         self._score: int = 0
         self.scanned_variables = {scanned_variable} if scanned_variable else set()
         self.tinfo: ida_typeinf.tinfo_t = tinfo
+        # E4 (eval review 2026-08-13): the textual type declaration this
+        # member was created from, when it came from a string. Packing
+        # re-parses it fresh so stale tinfo ordinals (the overwrite flow
+        # deletes + recreates types, freeing ordinals mid-session) can
+        # never serialize as ``#NN *`` into a committed cdecl.
+        self.decl_src: str | None = None
 
     def invalidate_score(self) -> None:
         self._score = 0
@@ -367,6 +374,25 @@ class Member(AbstractMember):
         super().__init__(offset, scanned_variable, origin, tinfo)
         self.name = f"{self.type_alias}_{self.offset:x}"
 
+    def _resolve_pack_tinfo(self) -> ida_typeinf.tinfo_t | None:
+        """The tinfo to serialize for this member at pack time.
+
+        E4 (eval review 2026-08-13): members created from a declaratio
+        string re-parse it fresh on every pack. The overwrite flow (and
+        the vtable importer) deletes + recreates types, freeing the ordinal
+        a stored tinfo points at — a stale handle then serializes as a
+        bare ``#NN *`` in the committed cdecl and breaks ``push_type``.
+        Re-parsing keeps the member's self/cross references on the current
+        type table. Returns None when the stored tinfo must be used.
+        """
+        decl_src = getattr(self, "decl_src", None)
+        if not decl_src:
+            return None
+        try:
+            return parse_user_tinfo(decl_src)
+        except Exception:  # noqa: BLE001 — degraded tils degrade to the stored handle
+            return None
+
     def get_udt_member(self, array_size: int = 0, offset: int = 0):
         udt_member = ida_typeinf.udt_member_t()
 
@@ -375,18 +401,19 @@ class Member(AbstractMember):
             if self._is_name_aliased()
             else self.name
         )
-        udt_member.type = ida_typeinf.tinfo_t(self.tinfo)
+        pack_tinfo = self._resolve_pack_tinfo() or self.tinfo
+        udt_member.type = ida_typeinf.tinfo_t(pack_tinfo)
         if array_size:
             array_data = ida_typeinf.array_type_data_t()
             array_data.base = 0
-            array_data.elem_type = ida_typeinf.tinfo_t(self.tinfo)
+            array_data.elem_type = ida_typeinf.tinfo_t(pack_tinfo)
             array_data.nelems = array_size
             array_tinfo = ida_typeinf.tinfo_t()
             array_tinfo.create_array(array_data)
             udt_member.type = array_tinfo
         udt_member.offset = self.offset - offset
-        udt_member.cmt = self.comment
         udt_member.size = self.size * array_size if array_size else self.size
+        udt_member.cmt = self.comment
         return udt_member
 
     def activate(self):
@@ -768,9 +795,12 @@ class VirtualTable(AbstractMember):
         demangled_name = ida_name.demangle_name(
             original_name, idc.get_inf_attr(idc.INF_SHORT_DN)
         )
-        assert (
-            demangled_name
-        ), "Virtual table must have either a legal C++ type name or a mangled name"
+        # E2 (eval review 2026-08-13): an unnamed pointer table used to
+        # AssertionError here. Fall back to ``vtbl_<addr>`` like the GUI's
+        # auto-naming instead, so to_vtable/vtable_name compose on any data
+        # table (the eval fixture's dispatch table was exactly this shape).
+        if not demangled_name:
+            return f"vtbl_{self.address:X}", False
         normalized_name = (
             demangled_name
             .replace("const_", "")

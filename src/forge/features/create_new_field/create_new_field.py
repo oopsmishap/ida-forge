@@ -4,6 +4,7 @@ from typing import ClassVar
 import ida_hexrays
 import ida_idaapi
 import ida_typeinf
+import idc
 
 from forge.api.config import ForgeConfig
 from forge.api.hexrays import create_udt_padding_member
@@ -101,14 +102,17 @@ class CreateNewField(HexRaysPopupAction):
             log_error("Bad field name", True)
             return None, None
 
-        result = ida_idaapi.idc_parse_decl(type_name, 0)
+        # E1 (eval review 2026-08-13): ``ida_idaapi.idc_parse_decl`` does
+        # not exist on IDA 9.4 (AttributeError); the idc-module wrapper is
+        # the working path and returns the tinfo directly.
+        result = idc.parse_decl(
+            ida_typeinf.get_idati(), type_name, ida_typeinf.PT_TYP
+        )
         if result is None:
             log_error("Failed to parse member type.", True)
             return None, None
 
-        _, tp, fld = result
-        tinfo = ida_typeinf.tinfo_t()
-        tinfo.deserialize(ida_typeinf.get_idati(), tp, fld, None)
+        tinfo = result
         if arr_size:
             tinfo.create_array(tinfo, int(arr_size))
         return tinfo, field_name

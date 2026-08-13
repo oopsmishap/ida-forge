@@ -159,6 +159,38 @@ def test_parse_vtable_name_sanitizes_demangled_vtable_symbols(monkeypatch):
     assert name == "fixture_Interface_std_vector_int_vtbl"
 
 
+def test_parse_vtable_name_falls_back_to_hex_name_when_unnamed(monkeypatch):
+    """E2 (eval review 2026-08-13): an unnamed pointer table must not
+    AssertionError — it falls back to ``vtbl_<addr>`` like the GUI's
+    auto-naming."""
+    vtable = members.VirtualTable.__new__(members.VirtualTable)
+    vtable.address = 0x140006128
+
+    monkeypatch.setattr(
+        members.ida_name,
+        "get_name",
+        lambda _ea: "",
+        raising=False,
+    )
+    monkeypatch.setattr(
+        members.ida_name,
+        "is_valid_typename",
+        lambda _name: False,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        members.ida_name,
+        "demangle_name",
+        lambda _name, _flags: None,
+        raising=False,
+    )
+
+    name, nice = vtable._parse_vtable_name()
+
+    assert nice is False
+    assert name == "vtbl_140006128"
+
+
 def test_virtual_table_init_wires_origin_and_scanned_variable(monkeypatch):
     monkeypatch.setattr(
         members.VirtualTable, "populate_virtual_functions", lambda self: None

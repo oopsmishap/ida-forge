@@ -122,7 +122,12 @@ class GuessAllocationVisitor(RecursiveUpwardsObjectVisitor):
         treeitems = getattr(cfunc, "treeitems", None)
         if treeitems:
             for item in treeitems:
-                specific = getattr(item, "to_specific_type", None) or item
+                # to_specific_type is a method; ``or item`` would keep the
+                # bound method and never match (same trap as inverse_if E6).
+                specific = getattr(item, "it", None) or item
+                to_specific = getattr(specific, "to_specific_type", None)
+                if callable(to_specific):
+                    specific = to_specific()
                 if ret_op is not None and getattr(specific, "op", None) == ret_op:
                     yield getattr(specific, "x", None)
             return
@@ -201,7 +206,10 @@ class GuessAllocationVisitor(RecursiveUpwardsObjectVisitor):
         treeitems = getattr(cfunc, "treeitems", None)
         if treeitems:
             for item in treeitems:
-                specific = getattr(item, "to_specific_type", None) or item
+                specific = getattr(item, "it", None) or item
+                to_specific = getattr(specific, "to_specific_type", None)
+                if callable(to_specific):
+                    specific = to_specific()
                 if asg_op is not None and getattr(specific, "op", None) == asg_op:
                     yield getattr(specific, "x", None), getattr(specific, "y", None)
             return

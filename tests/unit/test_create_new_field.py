@@ -20,7 +20,6 @@ class _FakeTInfo:
 
 @pytest.fixture
 def _stubs(monkeypatch):
-    import ida_idaapi
     import ida_typeinf
 
     module_ida = CreateNewField.__module__
@@ -28,29 +27,45 @@ def _stubs(monkeypatch):
 
     target = importlib.import_module(module_ida)
 
+    # E1: parse_declaration parses via idc.parse_decl (ida_idaapi's
+    # idc_parse_decl does not exist on IDA 9.4).
     monkeypatch.setattr(
-        ida_idaapi,
-        "idc_parse_decl",
-        lambda decl, flags: (None, "tp-bytes", "fld-bytes"),
+        ida_typeinf,
+        "tinfo_t",
+        _FakeTInfo,
         raising=False,
     )
-    monkeypatch.setattr(ida_typeinf, "tinfo_t", _FakeTInfo, raising=False)
     return target
 
 
-def test_parse_declaration_happy_path(_stubs):
+def test_parse_declaration_happy_path(_stubs, monkeypatch):
+    monkeypatch.setattr(
+        "idc.parse_decl",
+        lambda til, decl, flags: _FakeTInfo(),
+        raising=False,
+    )
     tinfo, name = CreateNewField.parse_declaration("int my_field")
     assert name == "my_field"
     assert isinstance(tinfo, _FakeTInfo)
 
 
-def test_parse_declaration_array_size(_stubs):
+def test_parse_declaration_array_size(_stubs, monkeypatch):
+    monkeypatch.setattr(
+        "idc.parse_decl",
+        lambda til, decl, flags: _FakeTInfo(),
+        raising=False,
+    )
     _tinfo, name = CreateNewField.parse_declaration("char buffer[16]")
     assert name == "buffer"
     assert _tinfo.array_size == 16
 
 
-def test_parse_declaration_array_optional(_stubs):
+def test_parse_declaration_array_optional(_stubs, monkeypatch):
+    monkeypatch.setattr(
+        "idc.parse_decl",
+        lambda til, decl, flags: _FakeTInfo(),
+        raising=False,
+    )
     _tinfo, name = CreateNewField.parse_declaration("char *pointer")
     assert name == "pointer"
 
@@ -63,8 +78,10 @@ def test_parse_declaration_rejects_digit_leading_name(_stubs):
     assert CreateNewField.parse_declaration("int 123abc") == (None, None)
 
 
-def test_parse_declaration_handles_parse_failure(_stubs):
-    import ida_idaapi
-
-    ida_idaapi.idc_parse_decl = lambda decl, flags: None
+def test_parse_declaration_handles_parse_failure(_stubs, monkeypatch):
+    monkeypatch.setattr(
+        "idc.parse_decl",
+        lambda *args, **kwargs: None,
+        raising=False,
+    )
     assert CreateNewField.parse_declaration("int my_field") == (None, None)

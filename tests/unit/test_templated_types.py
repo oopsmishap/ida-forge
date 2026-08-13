@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import pytest
-import toml
 
 from forge.features.templated_types.templated_types import TemplatedTypes
 
@@ -82,5 +81,12 @@ def test_reload_types_raises_for_invalid_toml(tmp_path):
     templated_types = TemplatedTypes()
     templated_types.file_path = str(toml_file)
 
-    with pytest.raises(toml.TomlDecodeError):
+    # E7: reads now go through stdlib tomllib (the `toml` package is no
+    # longer required); TOMLDecodeError is the contract either way.
+    try:
+        import tomllib
+    except ImportError:  # pragma: no cover — Python < 3.11
+        import toml as tomllib  # type: ignore[no-redef]
+
+    with pytest.raises(tomllib.TOMLDecodeError):
         templated_types.reload_types()

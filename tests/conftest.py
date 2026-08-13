@@ -244,6 +244,12 @@ _stub_module(
     get_segm_name=lambda *_args: "",
     get_func_attr=lambda ea, _attr: ea,
     get_name=lambda ea: f"sub_{ea:x}",
+    get_inf_attr=lambda *_args, **_kwargs: 0,
+    INF_SHORT_DN=0,
+    # E1: parse_declaration / parse_user_tinfo fall back to idc.parse_decl
+    # (ida_idaapi.idc_parse_decl does not exist on IDA 9.4); None means
+    # "could not parse", matching the real module's failure mode.
+    parse_decl=lambda *args, **kwargs: None,
 )
 
 _stub_module("ida_auto")
