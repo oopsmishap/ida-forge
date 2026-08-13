@@ -5,7 +5,6 @@ from pathlib import Path
 from typing import Any, ClassVar
 
 import ida_diskio
-import toml  # still needed for writing; tomllib is read-only
 
 try:  # stdlib tomllib on Python 3.11+ (IDA 9.x ships 3.12)
     import tomllib
@@ -15,17 +14,47 @@ except ImportError:  # Python 3.9/3.10 read via the `toml` package
 from forge.util.logging import log_debug, log_error
 
 
+def _toml_write_backend():
+    """The write backend — the ``toml`` package, imported only when needed.
+
+    Deliberately lazy: headless workers (idalib) may lack the package and
+    only ever *read* config; a hard top-level import made the whole plugin
+    unimportable there (2026-08-13, O1 live pass).
+    """
+    try:
+        import toml
+    except ImportError as exc:
+        raise RuntimeError(
+            "writes to forge.toml need the 'toml' package; install it or "
+            "read-only mode (reads use stdlib tomllib)"
+        ) from exc
+    return toml
+
+
 def _load_toml_file(path: Path) -> dict:
     """Read a TOML file via :mod:`tomllib` (stdlib) or the ``toml`` fallback."""
     if tomllib is not None:
         with path.open("rb") as f:  # tomllib requires binary mode
             return tomllib.load(f)
     with path.open("r", encoding="utf-8") as f:
-        return toml.load(f)
+        return _load_toml_file_legacy(f)
+
+
+def _load_toml_file_legacy(f) -> dict:
+    return _toml_read_fallback().load(f)
+
+
+def _toml_read_fallback():
+    try:
+        import toml
+    except ImportError as exc:  # pragma: no cover — 3.9/3.10 without toml
+        raise RuntimeError("reading forge.toml needs tomllib or the 'toml' package") from exc
+    return toml
 
 
 def _dump_toml_file(path: Path, data: dict) -> None:
     """Persist a dict to a TOML file via the ``toml`` package (no stdlib dumper)."""
+    toml = _toml_write_backend()
     with path.open("w", encoding="utf-8") as f:
         toml.dump(data, f)
 
