@@ -404,7 +404,25 @@ def import_type(name):
     :param str name: The name of the type to import.
     :return int: The ordinal number of the imported type.
     """
-    last_ordinal = ida_typeinf.get_ordinal_count(ida_typeinf.get_idati())
-    type_id = ida_typeinf.import_type(ida_typeinf.get_idati(), -1, name)
+    # IDA 9.4 moved ``import_type`` off the module (now ``til.import_type(tinfo)``
+    # or ``idc.import_type(idati, name)``); older builds keep the module call.
+    idati = ida_typeinf.get_idati()
+
+    module_import = getattr(ida_typeinf, "import_type", None)
+    if callable(module_import):
+        type_id = module_import(idati, -1, name)
+        if type_id != ida_idaapi.BADORD:
+            return type_id
+
+    til_import = getattr(idati, "import_type", None)
+    if callable(til_import):
+        tinfo = ida_typeinf.tinfo_t()
+        if tinfo.get_named_type(idati, name) and til_import(tinfo) is not None:
+            return 1
+
+    import idc
+
+    type_id = idc.import_type(idati, name)
     if type_id != ida_idaapi.BADORD:
-        return last_ordinal
+        return type_id
+    return -1

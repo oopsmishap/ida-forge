@@ -285,6 +285,39 @@ def test_get_unresolved_child_names_only_returns_missing_or_untyped_children():
         {"Child": unresolved_child, "Resolved": resolved_child}
     ) == ["Child", "Missing"]
 
+def test_create_type_if_ready_headless_commits_via_set_cdecl(monkeypatch):
+    """R11: ``headless=True`` commits through build_cdecl -> set_cdecl with
+    ``overwrite=True`` and never touches ``pack_structure`` (whose Qt
+    dialogs return None in idalib workers and turned ``finalize`` into a
+    0-diagnostic failure)."""
+    recorded = {}
+
+    def fail(*_args, **_kwargs):
+        raise AssertionError("pack_structure must not run headless")
+
+    def fake_build_cdecl(self, start=None, end=None):
+        return (self.name, f"struct {self.name} {{ int x; }};")
+
+    def fake_set_cdecl(self, cdecl, origin=0, *, overwrite=None):
+        recorded["cdecl"] = cdecl
+        recorded["origin"] = origin
+        recorded["overwrite"] = overwrite
+        return object()
+
+    monkeypatch.setattr(Structure, "pack_structure", fail)
+    monkeypatch.setattr(Structure, "build_cdecl", fake_build_cdecl)
+    monkeypatch.setattr(Structure, "set_cdecl", fake_set_cdecl)
+
+    structure = Structure("X")
+    structure.add_member(FakeMember(0, 4))
+
+    result = structure.create_type_if_ready({}, headless=True)
+
+    assert result is not None
+    assert recorded["overwrite"] is True
+    assert "struct X" in recorded["cdecl"]
+
+
 def test_create_type_if_ready_blocks_unresolved_children_and_skips_pack_structure(monkeypatch):
     warnings = []
     pack_calls = []
@@ -487,17 +520,34 @@ def _overwrite_setup(monkeypatch, structure_module):
     """Reusable setup: existing type, user confirms overwrite.
 
     ``create_type`` fails on the first call (the type exists) and succeeds on
-    the second (after the delete) — mirroring the real flow.
+    the second (after the delete) — mirroring the real flow. The fake
+    ``tinfo_t.get_named_type`` tracks whether the (fake) IDB type exists, so
+    the ordinal-delete step visibly removes it and the recreate restores it.
     """
     recorded = {"deleted": [], "created": []}
+    state = {"exists": True}
 
     def create_type(name, decl):
         recorded["created"].append((name, decl))
-        return len(recorded["created"]) >= 2
+        if len(recorded["created"]) >= 2:
+            state["exists"] = True
+            return True
+        return False
 
     monkeypatch.setattr(
-        structure_module.ida_typeinf, "del_named_type",
-        lambda *_a, **_k: recorded["deleted"].append(_a), raising=False,
+        structure_module.idaapi, "get_type_ordinal",
+        lambda *_a, **_k: 50, raising=False,
+    )
+    monkeypatch.setattr(
+        structure_module.idaapi, "del_numbered_type",
+        lambda *_a, **_k: recorded["deleted"].append(_a) or (state.__setitem__("exists", False) or True),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        structure_module.ida_typeinf.tinfo_t,
+        "get_named_type",
+        lambda self, *a, **k: state["exists"],
+        raising=False,
     )
     monkeypatch.setattr(structure_module.forge_types, "create_type", create_type, raising=False)
 
@@ -554,6 +604,125 @@ def test_set_cdecl_overwrite_deletes_and_recreates_when_declaration_valid(monkey
 
     assert len(recorded["deleted"]) == 1
     assert len(recorded["created"]) == 2  # failed probe + recreate after delete
+
+
+def test_set_cdecl_overwrite_prefers_ordinal_delete_over_name_delete(monkeypatch):
+    """Regression (R10): the overwrite branch must delete by ordinal
+    (``get_type_ordinal`` -> ``del_numbered_type``), not ``del_named_type``
+    which is a silent no-op on IDA 9.4. The two delete calls land in order
+    before the recreate, and the name-delete fallback only runs when the
+    ordinal delete left the type resolvable."""
+    structure_module = import_module("forge.api.structure")
+    calls = []
+
+    def create_type(name, decl):
+        calls.append("create_type")
+        return calls.count("create_type") == 2  # probe fails, recreate succeeds
+
+    state = {"exists": True}
+    monkeypatch.setattr(
+        structure_module.idaapi,
+        "get_type_ordinal",
+        lambda *_a, **_k: calls.append("get_type_ordinal") or 50,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        structure_module.idaapi,
+        "del_numbered_type",
+        lambda *_a, **_k: calls.append("del_numbered_type") or state.__setitem__("exists", False) or True,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        structure_module.ida_typeinf.tinfo_t,
+        "get_named_type",
+        lambda self, *a, **k: calls.append("get_named_type") or state["exists"],
+        raising=False,
+    )
+    name_deletes = []
+    monkeypatch.setattr(
+        structure_module.ida_typeinf,
+        "del_named_type",
+        lambda *_a, **_k: name_deletes.append(_a),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        structure_module.ida_typeinf, "parse_decl", lambda *_a, **_k: "test", raising=False,
+    )
+    monkeypatch.setattr(structure_module.forge_types, "create_type", create_type, raising=False)
+
+    qt_module = import_module("forge.util.qt")
+    monkeypatch.setattr(
+        qt_module,
+        "QtWidgets",
+        SimpleNamespace(QMessageBox=type("M", (), {"Yes": 1, "No": 0, "question": lambda *a, **k: 1})),
+    )
+
+    structure = structure_module.Structure("test")
+    structure.created_type_name = "test"
+    structure.set_cdecl("struct test { int x; };")
+
+    assert calls[0] == "create_type"  # existence probe first
+    assert calls[1] == "get_type_ordinal"
+    assert calls[2] == "del_numbered_type"
+    assert "del_numbered_type" not in calls[3:]
+    assert name_deletes == [], "ordinal delete succeeded; name-delete must not run"
+
+
+def test_set_cdecl_overwrite_reports_failed_delete_instead_of_silently_keeping(monkeypatch):
+    """Regression (R10): when the type STILL resolves after both delete
+    attempts, the overwrite must fail loudly (log + None) — never report a
+    bogus "recreated" state over a stale type."""
+    structure_module = import_module("forge.api.structure")
+    logged = []
+    monkeypatch.setattr(
+        structure_module, "log_error",
+        lambda message, *args, **kwargs: logged.append(message),
+    )
+
+    def create_type(name, decl):
+        # The probe must fail (type exists) to enter the overwrite branch;
+        # the recreate after a real delete never runs in this test because
+        # the delete itself fails.
+        return False
+
+    state = {"exists": True}
+    monkeypatch.setattr(
+        structure_module.idaapi, "get_type_ordinal",
+        lambda *_a, **_k: 50, raising=False,
+    )
+    monkeypatch.setattr(
+        structure_module.idaapi, "del_numbered_type",
+        lambda *_a, **_k: None, raising=False,  # ordinal delete does nothing
+    )
+    monkeypatch.setattr(
+        structure_module.ida_typeinf.tinfo_t,
+        "get_named_type",
+        lambda self, *a, **k: state["exists"],
+        raising=False,
+    )
+    monkeypatch.setattr(
+        structure_module.ida_typeinf,
+        "del_named_type",
+        lambda *_a, **_k: None, raising=False,  # name-delete fallback also fails
+    )
+    monkeypatch.setattr(
+        structure_module.ida_typeinf, "parse_decl", lambda *_a, **_k: "test", raising=False,
+    )
+    monkeypatch.setattr(structure_module.forge_types, "create_type", create_type, raising=False)
+
+    qt_module = import_module("forge.util.qt")
+    monkeypatch.setattr(
+        qt_module,
+        "QtWidgets",
+        SimpleNamespace(QMessageBox=type("M", (), {"Yes": 1, "No": 0, "question": lambda *a, **k: 1})),
+    )
+
+    structure = structure_module.Structure("test")
+    structure.created_type_name = "test"
+    result = structure.set_cdecl("struct test { int x; };")
+
+    assert result is None
+    assert any("delete existing type" in message for message in logged)
 
 
 def test_declaration_parses_rejects_bad_declarations(monkeypatch):

@@ -192,19 +192,41 @@ class ScannedVariableObject(ScannedObject):
         if not self._applicable:
             return
 
-        hx_view = ida_hexrays.open_pseudocode(self.func_ea, -1)
-        if hx_view:
-            log_debug(f"Applying t info to variable {self.name} in {self.function_name}")
-            # Finding lvar of new window that have the same name that saved one and applying tinfo_t
-            lvar = [x for x in hx_view.cfunc.get_lvars() if x == self._lvar]
-            if lvar:
-                log_debug("Successful")
-                hx_view.set_lvar_type(lvar[0], tinfo)
-            else:
-                log_warning(
-                    "Failed to find previously scanned local variable "
-                    f"{self.name} from {to_hex(self.ea)}"
-                )
+        try:
+            cfunc = decompile(self.func_ea)
+        except Exception:  # noqa: BLE001 — GUI/hx version tolerance
+            log_warning(
+                f"Failed to re-decompile {self.function_name} to apply "
+                f"{to_hex(self.ea)}"
+            )
+            return
+
+        # Headless-safe replacement for the GUI-only ``vdui_t.set_lvar_type``
+        # (``open_pseudocode`` crashes native in idalib). Commits the type via
+        # ``modify_user_lvar_info`` with the ``MLI_TYPE`` flag — the same
+        # mechanism the headless root-retype uses.
+        lvar = next(
+            (
+                x
+                for x in list(cfunc.get_lvars())
+                if x.location == self._lvar.location and x.defea == self._lvar.defea
+            ),
+            None,
+        )
+        if lvar is None:
+            log_warning(
+                f"Failed to find previously scanned local variable "
+                f"{self.name} from {to_hex(self.ea)}"
+            )
+            return
+
+        lvi = ida_hexrays.lvar_saved_info_t()
+        lvi.ll = ida_hexrays.lvar_locator_t(lvar.location, lvar.defea)
+        lvi.type = tinfo
+        log_debug(f"Applying t info to variable {self.name} in {self.function_name}")
+        ida_hexrays.modify_user_lvar_info(
+            cfunc.entry_ea, ida_hexrays.MLI_TYPE, lvi
+        )
 
 
 class ScannedStructureMemberObject(ScannedObject):

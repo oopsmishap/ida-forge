@@ -62,6 +62,25 @@ def mark_cfunc_dirty(ea: int, close_views: bool = False) -> None:
     if hasattr(ida_hexrays, "mark_cfunc_dirty"):
         ida_hexrays.mark_cfunc_dirty(ea, close_views)
 
+
+def set_lvar_type(cfunc, lvar, tinfo) -> bool:
+    """Commit a local variable's type headless via ``modify_user_lvar_info``.
+
+    ``cfunc``/``lvar`` come from a decompiled function; this is the same
+    mechanism :class:`forge.api.scanner.ScannedVariableObject.apply_type`
+    uses to apply recovered types to scan evidence. The ``MLI_TYPE`` flag is
+    mandatory — without it ``modify_user_lvar_info`` returns False silently.
+    (``vdui_t.set_lvar_type`` is GUI-only and ``cfunc.set_lvar_type`` was
+    removed in IDA 9.4, so this is the one working headless path.)
+
+    Returns:
+        bool — True when the type was committed.
+    """
+    lvi = ida_hexrays.lvar_saved_info_t()
+    lvi.ll = ida_hexrays.lvar_locator_t(lvar.location, lvar.defea)
+    lvi.type = tinfo
+    return bool(ida_hexrays.modify_user_lvar_info(cfunc.entry_ea, ida_hexrays.MLI_TYPE, lvi))
+
 def get_line(ctree: ida_hexrays.ctree_parentee_t, cfunc) -> str:
     for p in reversed(ctree.parents):
         if not p.is_expr():

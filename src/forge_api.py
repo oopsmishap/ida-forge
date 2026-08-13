@@ -29,6 +29,7 @@ __version__ = "0.1.0"
 
 __all__ = [
     "add_member",
+    "apply_type",
     "auto_resolve",
     "clear_structures",
     "create_child_types",
@@ -44,15 +45,19 @@ __all__ = [
     "guess_allocation",
     "help",
     "inverse_if",
+    "is_type",
     "named_types",
     "nudge_members",
     "remove_members",
     "remove_structure",
+    "rename_local",
     "rename_structure",
     "scan_global",
     "set_current",
+    "set_lvar_types",
     "set_member",
     "shallow_scan",
+    "signature",
     "structures",
     "templated_apply",
     "templated_decl",
@@ -271,6 +276,43 @@ def _unique_structure_name(base_name: str) -> str:
     return candidate
 
 
+def _ensure_placeholder_type(store_name: str) -> bool:
+    """Make the IDB know a store structure's name so self/forward references
+    parse before the real type is committed.
+
+    The chicken-egg: ``add_member(..., "GridNode *")`` cannot parse until an
+    IDB type named ``GridNode`` exists, but committing ``GridNode`` first
+    was blocked while it was being refined (R10). The placeholder is a
+    minimal struct that the overwrite path (R10) replaces wholesale at
+    commit time. Idempotent — skips when the type already exists.
+
+    Returns:
+        bool — True when the store name is already an IDB type or the
+        placeholder parsed.
+    """
+    if store_name not in _structures:
+        return False
+    if is_type(store_name):
+        return True
+    import ida_typeinf
+
+    for placeholder_decl in (
+        f"struct {store_name} {{ char _placeholder; }};",
+        f"struct {store_name} {{ unsigned char _placeholder; }};",
+    ):
+        try:
+            if ida_typeinf.idc_parse_types(placeholder_decl, 0):
+                return True
+        except Exception as exc:  # noqa: BLE001 — version/format tolerance
+            from forge.util.logging import log_debug
+
+            log_debug(
+                f"Placeholder parse failed for {store_name}: "
+                f"{placeholder_decl!r} ({exc})"
+            )
+    return False
+
+
 # --------------------------------------------------------------------------- #
 # meta
 # --------------------------------------------------------------------------- #
@@ -329,25 +371,37 @@ def to_hex(ea: int) -> str:
     returns="dict | None",
     example='d = forge_api.decompile(0x1400014F0); d["lvars"]',
 )
-def decompile(ea: int) -> dict | None:
+def decompile(
+    ea: int,
+    *,
+    max_lines: int | None = None,
+    line_range: tuple[int, int] | None = None,
+    force: bool = False,
+) -> dict | None:
     """Decompile the function containing ``ea``: pseudocode, variables, calls.
 
     Returns ``None`` when the address is not in a function. The pseudocode is a
     single flattened string; ``lvars`` carries each local with its index, name,
     type declaration and whether it is a function argument; ``calls`` lists the
-    EAs of functions called from the body.
+    EAs of functions called from the body. ``line_range`` (1-based, inclusive)
+    or ``max_lines`` slice the pseudocode lines only — ``lvars``/``calls`` are
+    untouched. ``force=True`` clears IDA's cached cfunctions first so freshly
+    retyped globals/locals render (``clear_cached_cfuncs``).
 
     Returns:
         dict or None.
     """
     _require_ida()
     import ida_funcs
+    import ida_hexrays
     import ida_idaapi
     import ida_lines
 
     from forge.api.hexrays import ctype as _ctype
     from forge.api.hexrays import decompile as _decompile
 
+    if force and hasattr(ida_hexrays, "clear_cached_cfuncs"):
+        ida_hexrays.clear_cached_cfuncs()
     cfunc = _decompile(ea)
     if cfunc is None:
         return None
@@ -379,6 +433,12 @@ def decompile(ea: int) -> dict | None:
             ida_lines.tag_remove(text) if isinstance(text, str) else str(line)
         )
 
+    if line_range is not None:
+        start, end = line_range
+        pseudocode_lines = pseudocode_lines[max(0, start - 1) : end]
+    elif max_lines is not None and max_lines >= 0:
+        pseudocode_lines = pseudocode_lines[:max_lines]
+
     # cfunc.treeitems yields ida_hexrays.citem_t; the specific expression (with
     # .x / .obj_ea) is reached through the `to_specific_type` property.
     calls = set()
@@ -396,6 +456,131 @@ def decompile(ea: int) -> dict | None:
         "lvars": lvar_rows,
         "calls": sorted(calls),
     }
+
+
+@api(
+    group="decompile",
+    returns="str | None",
+    example='proto = forge_api.signature(0x1400014F0)',
+)
+def signature(ea: int) -> str | None:
+    """Return the function's first pseudocode line (its prototype).
+
+    ``World *__fastcall sub_1400017A0(World *a1)`` for a typed function.
+    Returns ``None`` when ``ea`` is not in a function or the function has no
+    pseudocode.
+
+    Returns:
+        str or None.
+    """
+    result = decompile(ea, max_lines=1)
+    if result is None:
+        return None
+    return result["pseudocode"] or None
+
+
+@api(
+    group="decompile",
+    returns="dict",
+    example='r = forge_api.set_lvar_types(0x1400014F0, {"a1": "World *"}); r["updated"]',
+)
+def set_lvar_types(ea: int, types, *, scope: str = "arg") -> dict:
+    """Commit C types onto the function's local variables headless.
+
+    ``types`` maps each local name to a C declaration (``dict`` or list of
+    ``(name, decl)`` tuples). ``"*"`` is shorthand for ``void *``. With the
+    default ``scope="arg"`` only function arguments are retyped; pass
+    ``scope="all"`` to also retype plain locals. Each entry resolves
+    independently — a missing name or unparsable declaration reports
+    ``ok: False`` for that entry without aborting the rest. The result's
+    ``signature`` is the first pseudocode line of a fresh decompile, so the
+    caller sees the committed prototype immediately.
+
+    Returns:
+        ``{"ok": bool, "updated": [{"name", "ok"}],
+        "signature": str | None}``.
+    """
+    _require_ida()
+    from forge.api.hexrays import decompile as _decompile
+    from forge.api.hexrays import mark_cfunc_dirty as _mark_cfunc_dirty
+    from forge.api.hexrays import set_lvar_type as _set_lvar_type
+    from forge.api.members import parse_user_tinfo
+
+    cfunc = _decompile(ea)
+    if cfunc is None:
+        return {"ok": False, "error": f"could not decompile {hex(ea)}"}
+    lvars = list(cfunc.get_lvars())
+    by_name = {lvar.name: lvar for lvar in lvars}
+
+    pairs = list(types.items()) if isinstance(types, dict) else list(types)
+    updated = []
+    any_ok = False
+    for name, declaration in pairs:
+        lvar = by_name.get(name)
+        if lvar is None or (scope == "arg" and not getattr(lvar, "is_arg_var", False)):
+            updated.append({"name": name, "ok": False})
+            continue
+        c_decl = "void *" if declaration == "*" else declaration
+        tinfo = parse_user_tinfo(c_decl)
+        if tinfo is None:
+            updated.append({"name": name, "ok": False})
+            continue
+        if _set_lvar_type(cfunc, lvar, tinfo):
+            updated.append({"name": name, "ok": True})
+            any_ok = True
+        else:
+            updated.append({"name": name, "ok": False})
+
+    signature = None
+    if any_ok:
+        _mark_cfunc_dirty(ea)
+        fresh = _decompile(ea)
+        if fresh is not None:
+            import ida_lines
+
+            for line in fresh.pseudocode:
+                text = getattr(line, "line", None)
+                rendered = (
+                    ida_lines.tag_remove(text) if isinstance(text, str) else str(line)
+                )
+                if rendered:
+                    signature = rendered
+                    break
+    return {"ok": any_ok, "updated": updated, "signature": signature}
+
+
+@api(
+    group="decompile",
+    returns="bool",
+    example='renamed = forge_api.rename_local(0x1400014F0, "a1", "world")',
+)
+def rename_local(ea: int, name_or_index, new_name: str | None = None) -> bool:
+    """Rename a local variable (``rename_lvar``, the surviving headless API).
+
+    ``name_or_index`` is the variable's name or its 0-based lvar index.
+    Returns False when the function cannot be decompiled, the name/index is
+    unknown, or IDA declines the rename.
+
+    Returns:
+        bool.
+    """
+    _require_ida()
+    import ida_hexrays
+
+    from forge.api.hexrays import decompile as _decompile
+
+    cfunc = _decompile(ea)
+    if cfunc is None:
+        return False
+    old_name = name_or_index
+    if isinstance(name_or_index, int):
+        lvars = list(cfunc.get_lvars())
+        if not 0 <= name_or_index < len(lvars):
+            return False
+        old_name = lvars[name_or_index].name
+    if not old_name:
+        return False
+    return bool(ida_hexrays.rename_lvar(ea, old_name, new_name))
 
 
 @api(
@@ -489,6 +674,92 @@ def type_of(name: str) -> dict | None:
         "kind": kind,
         "members": members,
     }
+
+
+@api(
+    group="types",
+    returns="bool",
+    example='present = forge_api.is_type("World")',
+)
+def is_type(name: str) -> bool:
+    """Return whether ``name`` is a named type in the IDB.
+
+    Thin existence guard for ``create_type``/``to_vtable`` callers, using
+    the same ``tinfo_t.get_named_type`` lookup as :func:`type_of`.
+
+    Returns:
+        bool.
+    """
+    _require_ida()
+    import ida_typeinf
+
+    tinfo = ida_typeinf.tinfo_t()
+    return bool(tinfo.get_named_type(ida_typeinf.get_idati(), name))
+
+
+@api(
+    group="types",
+    returns="dict",
+    example='r = forge_api.apply_type(0x1400060C0, "OuterAggregate", redefine_range=True)',
+)
+def apply_type(
+    ea: int, declaration: str, *, redefine_range: bool = False
+) -> dict:
+    """Apply a parsed type at any address — no scan evidence needed.
+
+    ``create_type`` only types variables the scans recorded; ``apply_type``
+    types an arbitrary global, local or data address from a C declaration.
+    Store-structure names resolve via a lazy placeholder (same path as
+    :func:`add_member`), so ``"GridNode"`` parses before its type exists.
+    With ``redefine_range=True`` the type's byte span is first cleared: auto
+    names on heads inside ``[ea, ea + size)`` are deleted (so a flattened
+    ``qword_...`` chain cannot shadow the struct), then ``del_items`` (a
+    simple delete), then the type is applied with ``TINFO_DEFINITE`` — the
+    sequence that makes a global render as ``g_outer.cell_meta[0].tag``.
+
+    Returns:
+        ``{"ok": True, "ea": int, "type": str}`` or
+        ``{"ok": False, "error": str}``.
+    """
+    _require_ida()
+    import re as _re
+
+    import ida_bytes
+    import ida_name
+    import ida_typeinf
+
+    from forge.api.members import parse_user_tinfo
+
+    tinfo = parse_user_tinfo(declaration)
+    if tinfo is None:
+        base_name = _re.sub(
+            r"(?:\s*\*+\s*|\s*\[[^\]]*\]\s*)+$", "", declaration.strip()
+        )
+        if base_name in _structures and _ensure_placeholder_type(base_name):
+            tinfo = parse_user_tinfo(declaration)
+    if tinfo is None:
+        return {"ok": False, "error": f"could not parse declaration {declaration!r}"}
+
+    if redefine_range:
+        size = tinfo.get_size()
+        if size is not None and size > 0 and size != ida_typeinf.BADSIZE:
+            for head in range(ea, ea + size):
+                if head == ea:
+                    continue
+                flags = ida_bytes.get_flags(head)
+                if not ida_bytes.is_head(flags):
+                    continue
+                if not ida_name.get_name(head):
+                    continue
+                # Keep user-typed names; strip the auto qword_/xmmword_
+                # shadowing names so the struct owns the range.
+                if hasattr(ida_bytes, "has_user_name") and ida_bytes.has_user_name(flags):
+                    continue
+                ida_name.del_global_name(head)
+            ida_bytes.del_items(ea, ida_bytes.DELIT_SIMPLE, ea + size)
+
+    ida_typeinf.apply_tinfo(ea, tinfo, ida_typeinf.TINFO_DEFINITE)
+    return {"ok": True, "ea": ea, "type": tinfo.dstr()}
 
 
 # --------------------------------------------------------------------------- #
@@ -1141,13 +1412,34 @@ def create_type(name: str | None = None, *, overwrite: bool = False) -> dict:
         ``{"ok": False, "error": str}``.
     """
     _require_ida()
+    import ida_typeinf
+
+    from forge.api.structure import Structure
+
     target = _resolve_structure(name)
     result = target.build_cdecl()
     if result is None:
         return {"ok": False, "error": "no enabled packable members"}
     _, cdecl = result
+
+    if overwrite is False:
+        # Distinct early path: a type that exists is a hard abort, not the
+        # generic set_cdecl-None lie (which used to mask recreate failures).
+        tinfo = ida_typeinf.tinfo_t()
+        if tinfo.get_named_type(ida_typeinf.get_idati(), name):
+            return {"ok": False, "error": "type already exists (overwrite disabled)"}
+    elif overwrite is True and not Structure._declaration_parses(cdecl):
+        # Validate before the destructive delete so a malformed edit cannot
+        # destroy the existing type (the DB would end up with no type at all).
+        return {"ok": False, "error": "declaration could not be parsed for overwrite"}
+
     created = target.set_cdecl(cdecl, target.main_offset, overwrite=overwrite)
     if created is None:
+        if overwrite is True:
+            return {
+                "ok": False,
+                "error": "failed to recreate type after delete (see IDA log)",
+            }
         return {"ok": False, "error": "type already exists (overwrite disabled)"}
     return {"ok": True, "type_name": target.created_type_name, "declaration": cdecl}
 
@@ -1176,7 +1468,7 @@ def create_child_types(name: str | None = None) -> dict:
         if child.created_type_name is not None:
             created.append(child.name)
             continue
-        if child.create_type_if_ready(_structures) is not None:
+        if child.create_type_if_ready(_structures, headless=True) is not None:
             created.append(child.name)
     skipped = target.get_unresolved_child_names(_structures)
     return {"ok": not skipped, "created": created, "skipped": skipped}
@@ -1191,17 +1483,26 @@ def finalize(name: str | None = None) -> dict:
     """Finalize one structure: build its type and apply to scan evidence.
 
     Equivalent to the GUI "Finalize": guards unresolved children, refreshes
-    linked child member types, packs and creates the type. Returns the
-    unresolved child names when the structure cannot be finalized.
+    linked child member types, packs and creates the type. Runs headless —
+    the same dialog-free commit chain as :func:`create_type` (never
+    ``pack_structure``, whose Qt dialogs return None in idalib workers).
+    Returns the unresolved child names when the structure cannot be
+    finalized because of children; any other commit failure reports a real
+    error string instead of an empty ``unresolved`` list.
 
     Returns:
-        ``{"ok": True, "type_name": str}`` or ``{"ok": False, "unresolved": [...]}``.
+        ``{"ok": True, "type_name": str}`` or
+        ``{"ok": False, "unresolved": [...]}`` /
+        ``{"ok": False, "error": str}``.
     """
     _require_ida()
     target = _resolve_structure(name)
-    tinfo = target.create_type_if_ready(_structures)
+    unresolved = target.get_unresolved_child_names(_structures)
+    tinfo = target.create_type_if_ready(_structures, headless=True)
     if tinfo is None:
-        return {"ok": False, "unresolved": target.get_unresolved_child_names(_structures)}
+        if unresolved:
+            return {"ok": False, "unresolved": unresolved}
+        return {"ok": False, "error": "failed to create type (see IDA log for reason)"}
     return {"ok": True, "type_name": target.created_type_name}
 
 
@@ -1229,7 +1530,7 @@ def finalize_all() -> list:
     results = []
     for root_name in roots:
         root = _structures[root_name]
-        ok = root.create_subtree_types_postorder(_structures)
+        ok = root.create_subtree_types_postorder(_structures, headless=True)
         results.append(
             {
                 "structure": root_name,

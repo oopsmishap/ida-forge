@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from types import SimpleNamespace
 
 import pytest
 
@@ -135,6 +136,190 @@ def test_create_type_guards_missing_members():
     assert "error" in result
 
 
+def _commit_stubs(monkeypatch, *, parses=True, set_result=None):
+    from forge.api import structure as structure_mod
+
+    def fake_build_cdecl(self, start=None, end=None):
+        return (self.name, f"struct {self.name} {{ int x; }};")
+
+    def fake_set_cdecl(self, cdecl, origin=0, *, overwrite=None):
+        if set_result is None:
+            return None
+        self.created_type_name = self.name
+        return set_result
+
+    monkeypatch.setattr(
+        structure_mod.Structure, "build_cdecl", fake_build_cdecl, raising=False
+    )
+    monkeypatch.setattr(
+        structure_mod.Structure,
+        "_declaration_parses",
+        staticmethod(lambda cdecl: parses),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        structure_mod.Structure, "set_cdecl", fake_set_cdecl, raising=False
+    )
+    import ida_typeinf
+
+    return ida_typeinf
+
+
+def test_create_type_overwrite_disabled_reports_existing_type(monkeypatch):
+    """R10: overwrite=False + an existing IDB type is a hard abort with the
+    distinct error string — not the old generic set_cdecl-None lie."""
+    ida_typeinf = _commit_stubs(monkeypatch)
+    forge_api.create_structure("S")
+    forge_api.add_member("S", 0, "u32")
+    monkeypatch.setattr(
+        ida_typeinf.tinfo_t, "get_named_type", lambda self, *a, **k: True, raising=False
+    )
+
+    result = forge_api.create_type("S")
+
+    assert result == {"ok": False, "error": "type already exists (overwrite disabled)"}
+
+
+def test_create_type_overwrite_validates_declaration_before_delete(monkeypatch):
+    """R10: overwrite=True with an unparsable declaration must abort before
+    the destructive delete (existing type untouched)."""
+    ida_typeinf = _commit_stubs(monkeypatch, parses=False)
+    forge_api.create_structure("S")
+    forge_api.add_member("S", 0, "u32")
+    monkeypatch.setattr(
+        ida_typeinf.tinfo_t, "get_named_type", lambda self, *a, **k: True, raising=False
+    )
+
+    result = forge_api.create_type("S", overwrite=True)
+
+    assert result == {"ok": False, "error": "declaration could not be parsed for overwrite"}
+
+
+def test_create_type_overwrite_reports_failed_recreate(monkeypatch):
+    """R10: overwrite=True where set_cdecl still fails (delete/recreate
+    failure) returns the distinct recreate error, never "already exists"."""
+    _commit_stubs(monkeypatch, parses=True, set_result=None)
+    forge_api.create_structure("S")
+    forge_api.add_member("S", 0, "u32")
+
+    result = forge_api.create_type("S", overwrite=True)
+
+    assert result == {"ok": False, "error": "failed to recreate type after delete (see IDA log)"}
+
+
+def test_create_type_overwrite_success_returns_type_name(monkeypatch):
+    """R10: overwriting an existing type succeeds and reports the commit."""
+    _commit_stubs(monkeypatch, parses=True, set_result=object())
+    forge_api.create_structure("S")
+    forge_api.add_member("S", 0, "u32")
+
+    result = forge_api.create_type("S", overwrite=True)
+
+    assert result["ok"] is True
+    assert result["type_name"] == "S"
+    assert "int x" in result["declaration"]
+
+
+# ---------------------------------------------------------------------------
+# R11: headless finalize / finalize_all / create_child_types
+# ---------------------------------------------------------------------------
+
+def _commit_structure_stubs(monkeypatch):
+    from forge.api import structure as structure_mod
+
+    def fake_build_cdecl(self, start=None, end=None):
+        return (self.name, f"struct {self.name} {{ int x; }};")
+
+    def fake_set_cdecl(self, cdecl, origin=0, *, overwrite=None):
+        self.created_type_name = self.name
+        return object()
+
+    def fail_pack(*_args, **_kwargs):
+        raise AssertionError("pack_structure must not run headless")
+
+    monkeypatch.setattr(
+        structure_mod.Structure, "build_cdecl", fake_build_cdecl, raising=False
+    )
+    monkeypatch.setattr(
+        structure_mod.Structure, "set_cdecl", fake_set_cdecl, raising=False
+    )
+    monkeypatch.setattr(
+        structure_mod.Structure, "pack_structure", fail_pack, raising=False
+    )
+    return structure_mod
+
+
+def test_finalize_headless_commits_with_type_name(monkeypatch):
+    """R11: finalize routes through the headless commit chain and reports
+    the created type name — no pack dialogs, no empty ``unresolved``."""
+    _commit_structure_stubs(monkeypatch)
+    forge_api.create_structure("S")
+    forge_api.add_member("S", 0, "u32")
+
+    result = forge_api.finalize("S")
+
+    assert result == {"ok": True, "type_name": "S"}
+
+
+def test_finalize_reports_error_when_commit_fails(monkeypatch):
+    """R11: a non-child commit failure is a real error string — never the
+    old 0-diagnostic ``{"ok": False, "unresolved": []}``."""
+    from forge.api import structure as structure_mod
+
+    forge_api.create_structure("S")
+    forge_api.add_member("S", 0, "u32")
+    monkeypatch.setattr(
+        structure_mod.Structure,
+        "build_cdecl",
+        lambda self, start=None, end=None: (self.name, "struct S { int x; };"),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        structure_mod.Structure,
+        "set_cdecl",
+        lambda self, cdecl, origin=0, *, overwrite=None: None,
+        raising=False,
+    )
+
+    result = forge_api.finalize("S")
+
+    assert result == {
+        "ok": False,
+        "error": "failed to create type (see IDA log for reason)",
+    }
+    assert "unresolved" not in result
+
+
+def test_finalize_reports_unresolved_children(monkeypatch):
+    """R11: the child-resolution guard still reports unresolved children by
+    name (that failure mode is not an error string)."""
+    _commit_structure_stubs(monkeypatch)
+    forge_api.create_structure("Parent")
+    forge_api.create_structure("Missing")
+    parent = forge_api._resolve_structure("Parent")
+    parent.add_child_relationship(
+        child_structure_name="Missing",
+        parent_member_offset=0x10,
+        parent_member_name="missing_ptr",
+    )
+
+    result = forge_api.finalize("Parent")
+
+    assert result == {"ok": False, "unresolved": ["Missing"]}
+
+
+def test_finalize_all_runs_headless_subtree(monkeypatch):
+    """R11: finalize_all walks subtrees headless (no pack dialogs) and
+    reports the committed root."""
+    _commit_structure_stubs(monkeypatch)
+    forge_api.create_structure("Root")
+    forge_api.add_member("Root", 0, "u32")
+
+    results = forge_api.finalize_all()
+
+    assert results == [{"structure": "Root", "ok": True, "created": True}]
+
+
 def test_api_returns_only_json_types():
     forge_api.create_structure("JsonSafe")
     forge_api.add_member("JsonSafe", 0x0, "u32", name="a")
@@ -169,3 +354,365 @@ def test_nudge_members_rejects_overlap_nondestructive():
     result = forge_api.nudge_members("N", [0x0], 4)
     assert result["ok"] is True
     assert [m["offset"] for m in forge_api.get_structure("N")["members"]] == [0x4, 0x8]
+
+
+# ---------------------------------------------------------------------------
+# I.17 is_type / I.12 set_lvar_types + rename_local
+# ---------------------------------------------------------------------------
+
+def test_is_type_reports_idb_type_existence(monkeypatch):
+    import ida_typeinf
+
+    monkeypatch.setattr(
+        ida_typeinf.tinfo_t, "get_named_type", lambda self, *a, **k: False, raising=False
+    )
+    assert forge_api.is_type("Missing") is False
+
+    # the conftest tinfo double reports every named lookup as present
+    monkeypatch.setattr(
+        ida_typeinf.tinfo_t, "get_named_type", lambda self, *a, **k: True, raising=False
+    )
+    assert forge_api.is_type("Anything") is True
+
+
+@pytest.fixture
+def _real_hexrays(monkeypatch):
+    """Load the real forge.api.hexrays module (the conftest stub drops it).
+
+    The I.12 facade helpers import decompile/set_lvar_type from
+    ``forge.api.hexrays`` at call time; the stub carries none of them, so
+    these tests temporarily swap in the real module (test_scanner pattern).
+    """
+    import sys as _sys
+    from importlib import util as _util
+    from pathlib import Path
+
+    hexrays_path = (
+        Path(__file__).resolve().parents[2] / "src" / "forge" / "api" / "hexrays.py"
+    )
+    spec = _util.spec_from_file_location("forge.api.hexrays", hexrays_path)
+    assert spec is not None and spec.loader is not None
+    module = _util.module_from_spec(spec)
+    saved = _sys.modules.get("forge.api.hexrays")
+    _sys.modules["forge.api.hexrays"] = module
+    spec.loader.exec_module(module)
+    yield module
+    if saved is not None:
+        _sys.modules["forge.api.hexrays"] = saved
+    else:
+        _sys.modules.pop("forge.api.hexrays", None)
+
+
+def _lvar_env(monkeypatch):
+    import ida_hexrays
+    import ida_lines
+
+    monkeypatch.setattr(ida_lines, "tag_remove", lambda s: s, raising=False)
+
+    class FakeLocator:
+        def __init__(self, location, defea):
+            self.location = location
+            self.defea = defea
+
+    class FakeSavedInfo:
+        def __init__(self):
+            self.ll = None
+            self.type = None
+
+    monkeypatch.setattr(
+        ida_hexrays, "lvar_locator_t", lambda location, defea: FakeLocator(location, defea), raising=False
+    )
+    monkeypatch.setattr(ida_hexrays, "lvar_saved_info_t", FakeSavedInfo, raising=False)
+    monkeypatch.setattr(ida_hexrays, "MLI_TYPE", 0x10, raising=False)
+
+    lvars = [
+        SimpleNamespace(name="a1", location=7, defea=0x401010, is_arg_var=True),
+        SimpleNamespace(name="local", location=8, defea=0x401020, is_arg_var=False),
+    ]
+    cfunc = SimpleNamespace(
+        entry_ea=0x401000,
+        get_lvars=lambda: lvars,
+        pseudocode=[SimpleNamespace(line="World *a1;")],
+    )
+    return cfunc, lvars
+
+
+def test_set_lvar_types_commits_via_modify_user_lvar_info(monkeypatch, _real_hexrays):
+    """I.12: one call retypes ``a1`` via modify_user_lvar_info with the
+    mandatory MLI_TYPE flag and an lvar_locator_t(location, defea)."""
+    import ida_hexrays
+
+    cfunc, _lvars = _lvar_env(monkeypatch)
+    monkeypatch.setattr(_real_hexrays, "decompile", lambda ea: cfunc, raising=False)
+    seen = {}
+
+    def fake_modify(ea, flags, lvi):
+        seen["ea"] = ea
+        seen["flags"] = flags
+        seen["ll_location"] = lvi.ll.location
+        seen["ll_defea"] = lvi.ll.defea
+        seen["type"] = lvi.type
+        return True
+
+    monkeypatch.setattr(ida_hexrays, "modify_user_lvar_info", fake_modify, raising=False)
+    parsed = []
+    monkeypatch.setattr(
+        members_mod, "parse_user_tinfo", lambda decl: (parsed.append(decl) or FakeTinfo("World *")),
+        raising=False,
+    )
+
+    result = forge_api.set_lvar_types(0x401000, {"a1": "World *"})
+
+    assert seen["ea"] == 0x401000
+    assert seen["flags"] == 0x10  # MLI_TYPE is mandatory
+    assert seen["ll_location"] == 7
+    assert seen["ll_defea"] == 0x401010
+    assert result["updated"] == [{"name": "a1", "ok": True}]
+    assert result["signature"] == "World *a1;"
+
+
+def test_set_lvar_types_star_maps_to_void_pointer(monkeypatch, _real_hexrays):
+    """I.12: ``"*"`` shorthand resolves as ``void *``."""
+    import ida_hexrays
+
+    cfunc, _lvars = _lvar_env(monkeypatch)
+    monkeypatch.setattr(_real_hexrays, "decompile", lambda ea: cfunc, raising=False)
+    monkeypatch.setattr(
+        ida_hexrays, "modify_user_lvar_info", lambda *a, **k: True, raising=False
+    )
+    seen = []
+    monkeypatch.setattr(
+        members_mod, "parse_user_tinfo", lambda decl: (seen.append(decl) or FakeTinfo("void")),
+        raising=False,
+    )
+
+    forge_api.set_lvar_types(0x401000, {"a1": "*"})
+
+    assert seen == ["void *"]
+
+
+def test_set_lvar_types_scope_all_retypes_locals(monkeypatch, _real_hexrays):
+    """I.12: ``scope="all"`` retypes non-arg locals; ``scope="arg"`` skips
+    them (per-entry ok:False)."""
+    import ida_hexrays
+
+    cfunc, _lvars = _lvar_env(monkeypatch)
+    monkeypatch.setattr(_real_hexrays, "decompile", lambda ea: cfunc, raising=False)
+    monkeypatch.setattr(
+        ida_hexrays, "modify_user_lvar_info", lambda *a, **k: True, raising=False
+    )
+    monkeypatch.setattr(members_mod, "parse_user_tinfo", lambda decl: FakeTinfo(decl.split()[0]), raising=False)
+
+    arg_only = forge_api.set_lvar_types(0x401000, {"local": "u8"})
+    assert arg_only["updated"] == [{"name": "local", "ok": False}]
+
+    all_scope = forge_api.set_lvar_types(0x401000, {"local": "u8"}, scope="all")
+    assert all_scope["updated"] == [{"name": "local", "ok": True}]
+
+
+def test_rename_local_by_name_and_index(monkeypatch, _real_hexrays):
+    """I.12: ``rename_local`` uses the surviving ``rename_lvar`` API, by
+    name and by lvar index."""
+    import ida_hexrays
+
+    cfunc, _lvars = _lvar_env(monkeypatch)
+    monkeypatch.setattr(_real_hexrays, "decompile", lambda ea: cfunc, raising=False)
+    calls = []
+    monkeypatch.setattr(
+        ida_hexrays, "rename_lvar", lambda ea, old, new: calls.append((ea, old, new)) or True,
+        raising=False,
+    )
+
+    assert forge_api.rename_local(0x401000, "a1", "world") is True
+    assert forge_api.rename_local(0x401000, 1, "local2") is True
+    assert calls == [
+        (0x401000, "a1", "world"),
+        (0x401000, "local", "local2"),
+    ]
+
+
+def test_rename_local_rejects_bad_index(monkeypatch, _real_hexrays):
+    import ida_hexrays
+
+    cfunc, _lvars = _lvar_env(monkeypatch)
+    monkeypatch.setattr(_real_hexrays, "decompile", lambda ea: cfunc, raising=False)
+    calls = []
+    monkeypatch.setattr(
+        ida_hexrays, "rename_lvar", lambda ea, old, new: calls.append(ea) or True,
+        raising=False,
+    )
+
+    assert forge_api.rename_local(0x401000, 99, "x") is False
+    assert calls == []
+
+
+# ---------------------------------------------------------------------------
+# I.16 decompile slicing + signature + force
+# ---------------------------------------------------------------------------
+
+def _pseudo_cfunc(lines):
+    """Reusable fake cfunc for the decompile facade (real hexrays swapped)."""
+    from types import SimpleNamespace as _SN
+
+    lvar = _SN(
+        index=0,
+        type=lambda: FakeTinfo("u32"),
+        name="a1",
+        is_arg_var=True,
+    )
+    return _SN(
+        entry_ea=0x401000,
+        get_pseudocode=lambda: None,
+        get_lvars=lambda: [lvar],
+        pseudocode=[_SN(line=line) for line in lines],
+        treeitems=[],
+    )
+
+
+def test_decompile_slices_pseudocode_lines(monkeypatch, _real_hexrays):
+    """I.16: max_lines / line_range slice pseudocode only; lvars stay whole."""
+    import ida_lines
+
+    monkeypatch.setattr(ida_lines, "tag_remove", lambda s: s, raising=False)
+    cfunc = _pseudo_cfunc(["l1", "l2", "l3", "l4"])
+    monkeypatch.setattr(_real_hexrays, "decompile", lambda ea: cfunc, raising=False)
+
+    full = forge_api.decompile(0x401000)
+    assert full["pseudocode"] == "l1\nl2\nl3\nl4"
+    assert len(full["lvars"]) == 1
+
+    capped = forge_api.decompile(0x401000, max_lines=2)
+    assert capped["pseudocode"] == "l1\nl2"
+    assert len(capped["lvars"]) == 1
+
+    ranged = forge_api.decompile(0x401000, line_range=(2, 3))
+    assert ranged["pseudocode"] == "l2\nl3"
+
+
+def test_decompile_force_clears_cached_cfuncs(monkeypatch, _real_hexrays):
+    """I.16: force=True calls clear_cached_cfuncs before decompiling."""
+    import ida_hexrays
+    import ida_lines
+
+    monkeypatch.setattr(ida_lines, "tag_remove", lambda s: s, raising=False)
+    monkeypatch.setattr(_real_hexrays, "decompile", lambda ea: _pseudo_cfunc(["l1"]), raising=False)
+    calls = []
+    monkeypatch.setattr(
+        ida_hexrays, "clear_cached_cfuncs", lambda: calls.append(1), raising=False
+    )
+
+    forge_api.decompile(0x401000, force=True)
+    assert calls == [1]
+    forge_api.decompile(0x401000)
+    assert calls == [1]  # not cleared without force
+
+
+def test_signature_returns_first_line(monkeypatch, _real_hexrays):
+    """I.16: signature(ea) is the first pseudocode line; None for a non-
+    function address."""
+    import ida_lines
+
+    monkeypatch.setattr(ida_lines, "tag_remove", lambda s: s, raising=False)
+    monkeypatch.setattr(
+        _real_hexrays, "decompile", lambda ea: _pseudo_cfunc(["void *__fastcall f(void *a1)", "body"]), raising=False
+    )
+    assert forge_api.signature(0x401000) == "void *__fastcall f(void *a1)"
+
+    monkeypatch.setattr(_real_hexrays, "decompile", lambda ea: None, raising=False)
+    assert forge_api.signature(0x401000) is None
+
+
+# ---------------------------------------------------------------------------
+# I.19 apply_type
+# ---------------------------------------------------------------------------
+
+def test_apply_type_redefine_range_order(monkeypatch):
+    """I.19: redefine_range clears auto names in the span, then del_items,
+    then apply_tinfo — in that order — and reports the applied type."""
+    import ida_bytes
+    import ida_name
+    import ida_typeinf
+
+    events = []
+    monkeypatch.setattr(ida_bytes, "get_flags", lambda h: 1, raising=False)
+    monkeypatch.setattr(ida_bytes, "is_head", lambda f: True, raising=False)
+    monkeypatch.setattr(ida_bytes, "has_user_name", lambda f: False, raising=False)
+    monkeypatch.setattr(ida_bytes, "DELIT_SIMPLE", 1, raising=False)
+    monkeypatch.setattr(
+        ida_bytes,
+        "del_items",
+        lambda ea, flags, end: events.append(("del_items", ea, flags, end)),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        ida_name,
+        "get_name",
+        lambda h: "g_outer_aggregate" if h == 0x401000 else f"qword_{h:x}",
+        raising=False,
+    )
+    monkeypatch.setattr(
+        ida_name,
+        "del_global_name",
+        lambda h: events.append(("del_name", h)),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        ida_typeinf,
+        "apply_tinfo",
+        lambda ea, tinfo, flags: events.append(("apply", ea, tinfo.dstr())),
+        raising=False,
+    )
+    monkeypatch.setattr(ida_typeinf, "TINFO_DEFINITE", 0x100, raising=False)
+
+    result = forge_api.apply_type(0x401000, "OuterAggregate", redefine_range=True)
+
+    kinds = [event[0] for event in events]
+    assert kinds[0] == "del_name"
+    assert kinds[-2:] == ["del_items", "apply"]
+    # the base address itself keeps its (user) name
+    assert 0x401000 not in [event[1] for event in events if event[0] == "del_name"]
+    assert result == {"ok": True, "ea": 0x401000, "type": "OuterAggregate"}
+
+
+def test_apply_type_parse_failure_reports_error(monkeypatch):
+    """I.19: an unparsable declaration that is not a store structure returns
+    an error dict instead of raising."""
+    monkeypatch.setattr(members_mod, "parse_user_tinfo", lambda decl: None, raising=False)
+    result = forge_api.apply_type(0x401000, "NotParsable */")
+    assert result == {"ok": False, "error": "could not parse declaration 'NotParsable */'"}
+    monkeypatch.setattr(members_mod, "parse_user_tinfo", lambda decl: FakeTinfo(decl.split()[0]), raising=False)
+
+
+def test_apply_type_store_fallback_creates_placeholder_first(monkeypatch):
+    """I.19: a store-structure declaration parses via the lazy placeholder
+    (B8) — the placeholder is created before the re-parse."""
+    import ida_typeinf
+
+    forge_api.create_structure("GridNode")
+    forged = []
+    monkeypatch.setattr(
+        ida_typeinf,
+        "idc_parse_types",
+        lambda decl, flags: forged.append(decl) or True,
+        raising=False,
+    )
+    monkeypatch.setattr(forge_api, "is_type", lambda name: False, raising=False)
+    monkeypatch.setattr(
+        ida_typeinf, "apply_tinfo", lambda *a, **k: None, raising=False
+    )
+    monkeypatch.setattr(ida_typeinf, "TINFO_DEFINITE", 0x100, raising=False)
+    calls = {"n": 0}
+
+    def first_fails_then_parses(decl):
+        calls["n"] += 1
+        return None if calls["n"] == 1 else FakeTinfo("GridNode *")
+
+    monkeypatch.setattr(members_mod, "parse_user_tinfo", first_fails_then_parses, raising=False)
+
+    result = forge_api.apply_type(0x401000, "GridNode *")
+
+    assert calls["n"] == 2
+    assert len(forged) == 1
+    assert "GridNode" in forged[0]
+    assert result["ok"] is True
+    assert result["type"] == "GridNode *"

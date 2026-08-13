@@ -9,6 +9,7 @@ from dataclasses import dataclass, replace
 
 import ida_kernwin
 import ida_typeinf
+import idaapi
 
 try:  # plugin runs under standalone unit tests without the IDA undo module
     import ida_undo
@@ -310,6 +311,7 @@ class Structure:
         *,
         start: int | None = None,
         end: int | None = None,
+        headless: bool = False,
     ) -> ida_typeinf.tinfo_t | None:
         unresolved_child_names = self.get_unresolved_child_names(structures_by_name)
         if unresolved_child_names:
@@ -321,6 +323,23 @@ class Structure:
             return None
         if not self.refresh_linked_member_types(structures_by_name):
             return None
+        if headless:
+            # Headless path (idalib workers / forge_api): the same commit
+            # chain facade create_type uses — build_cdecl then set_cdecl with
+            # an explicit overwrite. Never pack_structure, whose
+            # ida_kernwin.ask_str/ask_text dialogs return None headless and
+            # turned finalize into a 0-diagnostic failure.
+            start_index = self.get_main_offset_index() if start is None else start
+            origin = (
+                self.members[start_index].offset
+                if start_index < len(self.members)
+                else 0
+            )
+            result = self.build_cdecl(start, end)
+            if result is None:
+                return None
+            _, cdecl = result
+            return self.set_cdecl(cdecl, origin, overwrite=True)
         return self.pack_structure(start=start, end=end)
 
     def create_subtree_types_postorder(
@@ -328,6 +347,7 @@ class Structure:
         structures_by_name: Mapping[str, Structure],
         *,
         visited: set[str] | None = None,
+        headless: bool = False,
     ) -> bool:
         completed = visited if visited is not None else set()
         stack: list[str] = []
@@ -354,7 +374,9 @@ class Structure:
                         )
                         return False
 
-                if structure.create_type_if_ready(structures_by_name) is None:
+                if structure.create_type_if_ready(
+                    structures_by_name, headless=headless
+                ) is None:
                     return False
 
                 completed.add(structure.name)
@@ -795,7 +817,14 @@ class Structure:
             )
             return None
 
-        ida_typeinf.del_named_type(ida_typeinf.get_idati(), structure_name, 0)
+        if not self._delete_named_type(structure_name):
+            log_error(
+                f"Failed to delete existing type {structure_name}; "
+                "the existing (unrefined) type was kept.",
+                True,
+            )
+            return None
+
         if not forge_types.create_type(structure_name, cdecl):
             log_error(f"Failed to recreate type {structure_name}", True)
             return None
@@ -803,3 +832,43 @@ class Structure:
         self.created_type_name = structure_name
         log_debug(f"Created type {structure_name}")
         return self._apply_scanned_variable_types(structure_name, origin)
+
+    @staticmethod
+    def _delete_named_type(structure_name: str) -> bool:
+        """Delete a named type, preferring the ordinal delete.
+
+        ``ida_typeinf.del_named_type(idati, name, 0)`` is a silent no-op on
+        IDA 9.4 (the type stays resolvable, so every subsequent overwrite
+        "recreate" finds the old type and fails). Deleting by ordinal
+        (``get_type_ordinal`` → ``del_numbered_type``) removes it — the same
+        proven pattern the vtable overwrite path uses (``members.py``).
+        Returns False only when the type is still resolvable after both
+        attempts, so a failed delete is loud instead of silently keeping the
+        stale type.
+        """
+        ordinal = idaapi.get_type_ordinal(idaapi.cvar.idati, structure_name)
+        if ordinal:
+            idaapi.del_numbered_type(idaapi.cvar.idati, ordinal)
+
+        if not Structure._named_type_exists(structure_name):
+            return True
+
+        # Name-delete fallback: works on some IDA versions even when the
+        # ordinal delete path was unavailable.
+        if hasattr(ida_typeinf, "del_named_type"):
+            ida_typeinf.del_named_type(ida_typeinf.get_idati(), structure_name, 0)
+
+        return not Structure._named_type_exists(structure_name)
+
+    @staticmethod
+    def _named_type_exists(structure_name: str) -> bool:
+        tinfo = ida_typeinf.tinfo_t()
+        try:
+            return bool(
+                tinfo.get_named_type(
+                    ida_typeinf.get_idati(), structure_name, ida_typeinf.NTF_TYPE
+                )
+            )
+        except Exception:  # noqa: BLE001 — version tolerance: older builds drop ntf_flags
+            tinfo = ida_typeinf.tinfo_t()
+            return bool(tinfo.get_named_type(ida_typeinf.get_idati(), structure_name))

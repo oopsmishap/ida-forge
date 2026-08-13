@@ -137,6 +137,107 @@ def test_parse_left_assignee_scales_nested_index_offsets():
     assert offset == 16
 
 
+def _make_variable_object(scanner_module, lvar, **kwargs):
+    """Build a ScannedVariableObject with a stub env suitable for apply_type."""
+
+    class FakeLocator:
+        def __init__(self, location, defea):
+            self.location = location
+            self.defea = defea
+
+    class FakeSavedInfo:
+        def __init__(self):
+            self.ll = None
+            self.type = None
+
+    scanner_module.ida_hexrays.lvar_locator_t = lambda location, defea: FakeLocator(
+        location, defea
+    )
+    scanner_module.ida_hexrays.lvar_saved_info_t = FakeSavedInfo
+    scanner_module.ida_hexrays.MLI_TYPE = 0x10
+    scanner_module.ida_funcs.get_func = lambda ea: SimpleNamespace(start_ea=0x401000)
+    return scanner_module.ScannedVariableObject(lvar, "a1", 0x401000, 0, **kwargs)
+
+
+def test_scanned_variable_apply_type_uses_modify_user_lvar_info(monkeypatch):
+    """apply_type commits the type headless via modify_user_lvar_info.
+
+    Regression: the old GUI path (open_pseudocode + vdui_t.set_lvar_type)
+    crashes native in idalib workers; the headless path must be used.
+    """
+    scanner_module = _load_scanner_module()
+    obj = _make_variable_object(
+        scanner_module, SimpleNamespace(location=7, defea=0x401010)
+    )
+
+    seen = {}
+
+    def fake_modify(ea, flags, lvi):
+        seen["ea"] = ea
+        seen["flags"] = flags
+        seen["ll_location"] = lvi.ll.location
+        seen["ll_defea"] = lvi.ll.defea
+        seen["type"] = lvi.type
+
+    monkeypatch.setattr(
+        scanner_module.ida_hexrays, "modify_user_lvar_info", fake_modify, raising=False
+    )
+    scanner_module.decompile = lambda ea: SimpleNamespace(
+        entry_ea=0x401000,
+        get_lvars=lambda: [SimpleNamespace(location=7, defea=0x401010)],
+    )
+
+    captured_type = object()
+    obj.apply_type(captured_type)
+
+    assert seen["ea"] == 0x401000
+    assert seen["flags"] == 0x10
+    assert seen["ll_location"] == 7
+    assert seen["ll_defea"] == 0x401010
+    assert seen["type"] is captured_type
+
+
+def test_scanned_variable_apply_type_skips_when_lvar_missing(monkeypatch):
+    """A scanned variable that no longer matches any lvar is skipped safely."""
+    scanner_module = _load_scanner_module()
+    obj = _make_variable_object(
+        scanner_module, SimpleNamespace(location=7, defea=0x401010)
+    )
+
+    calls = []
+
+    def fake_modify(ea, flags, lvi):
+        calls.append(ea)
+
+    monkeypatch.setattr(
+        scanner_module.ida_hexrays, "modify_user_lvar_info", fake_modify, raising=False
+    )
+    scanner_module.decompile = lambda ea: SimpleNamespace(
+        entry_ea=0x401000,
+        get_lvars=lambda: [SimpleNamespace(location=99, defea=0x401020)],
+    )
+
+    # Must not raise, and must not commit a type against the wrong variable.
+    obj.apply_type(object())
+    assert calls == []
+
+
+def test_scanned_variable_apply_type_respects_applicable(monkeypatch):
+    """Inapplicable scan objects never re-decompile or commit."""
+    scanner_module = _load_scanner_module()
+    obj = _make_variable_object(
+        scanner_module,
+        SimpleNamespace(location=7, defea=0x401010),
+        applicable=False,
+    )
+
+    def failure(_ea):
+        raise AssertionError("decompile must not run for inapplicable objects")
+
+    scanner_module.decompile = failure
+    obj.apply_type(object())
+
+
 
 
 def test_extract_member_from_ptr_uses_raw_add_offsets(monkeypatch):
