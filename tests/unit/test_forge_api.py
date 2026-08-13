@@ -1007,3 +1007,211 @@ def test_apply_type_store_fallback_creates_placeholder_first(monkeypatch):
     assert "GridNode" in forged[0]
     assert result["ok"] is True
     assert result["type"] == "GridNode *"
+
+
+def _xref_stubs(monkeypatch, *, crefs=(), drefs=()):
+    """Route ida_xref walkers; each sequence is walked until -1."""
+    import ida_funcs
+    import ida_xref
+
+    def _walk(first, nxt):
+        calls = {"n": 0}
+
+        def get_first(ea):
+            calls["n"] = 0
+            return first[calls["n"]] if calls["n"] < len(first) else -1
+
+        def get_next(ea, src):
+            calls["n"] += 1
+            return first[calls["n"]] if calls["n"] < len(first) else -1
+
+        return get_first, get_next
+
+    if crefs:
+        cf, cn = _walk(crefs, None)
+        monkeypatch.setattr(ida_xref, "get_first_cref_to", cf, raising=False)
+        monkeypatch.setattr(ida_xref, "get_next_cref_to", cn, raising=False)
+    if drefs:
+        df, dn = _walk(drefs, None)
+        monkeypatch.setattr(ida_xref, "get_first_dref_to", df, raising=False)
+        monkeypatch.setattr(ida_xref, "get_next_dref_to", dn, raising=False)
+    monkeypatch.setattr(
+        ida_funcs,
+        "get_func",
+        lambda ea: SimpleNamespace(start_ea=ea & ~0xF, end_ea=(ea & ~0xF) + 0x20),
+        raising=False,
+    )
+
+
+def test_callers_of_walks_code_xrefs_to_function_starts(monkeypatch):
+    """I.13: cref sources are resolved to their containing function starts
+    and deduplicated (two refs from one function collapse to one EA)."""
+    _xref_stubs(monkeypatch, crefs=(0x401120, 0x401000, 0x401020, 0x401021))
+
+    assert forge_api.callers_of(0x400000) == [0x401000, 0x401020, 0x401120]
+
+
+def test_callers_of_data_kind_uses_dref_walkers(monkeypatch):
+    """I.13: kind='data' walks drefs only (vtable/RTTI discovery)."""
+    _xref_stubs(monkeypatch, drefs=(0x140006358, 0x140006360))
+
+    result = forge_api.callers_of(0x140006358, "data")
+
+    assert result == [0x140006350, 0x140006360]
+
+
+def test_callees_of_reuses_decompile_calls(monkeypatch, _real_hexrays):
+    """I.13: callees come from the decompiler's call-expression scan."""
+    import ida_lines
+
+    monkeypatch.setattr(ida_lines, "tag_remove", lambda s: s, raising=False)
+    monkeypatch.setattr(
+        _real_hexrays,
+        "decompile",
+        lambda ea: _pseudo_cfunc(["void f() { g(); h(); }"]),
+        raising=False,
+    )
+    assert forge_api.callees_of(0x400000) == []
+
+
+def test_function_info_aggregates_recon(monkeypatch, _real_hexrays):
+    """I.13: function_info aggregates the xref walk + prototype + calls."""
+    import ida_funcs
+    import ida_lines
+
+    _xref_stubs(monkeypatch, crefs=(0x401120,), drefs=(0x140006358,))
+    monkeypatch.setattr(ida_lines, "tag_remove", lambda s: s, raising=False)
+    monkeypatch.setattr(
+        _real_hexrays,
+        "decompile",
+        lambda ea: _pseudo_cfunc(["int __cdecl f(World *a1)"]),
+        raising=False,
+    )
+    table = {
+        0x400010: (0x400000, 0x400120),
+        0x401120: (0x401120, 0x401140),
+        0x140006358: (0x140006350, 0x140006378),
+    }
+    monkeypatch.setattr(
+        ida_funcs,
+        "get_func",
+        lambda ea: SimpleNamespace(start_ea=table[ea][0], end_ea=table[ea][1]),
+        raising=False,
+    )
+
+    info = forge_api.function_info(0x400010)
+
+    assert info["name"] == "sub_400010"
+    assert info["start_ea"] == 0x400000
+    assert info["size"] == 0x120
+    assert "World" in info["prototype"]
+    assert info["callers"] == [0x401120]
+    assert info["callees"] == []
+    assert info["refs"] == [0x401120, 0x140006350]
+
+
+def test_function_info_returns_none_outside_function(monkeypatch):
+    import ida_funcs
+
+    monkeypatch.setattr(ida_funcs, "get_func", lambda ea: None, raising=False)
+    assert forge_api.function_info(0x400000) is None
+
+
+def test_imports_walks_entries_and_filters(monkeypatch):
+    """I.15: walks idautils.Entries with per-version tuple shapes; pattern
+    case-folds on the name."""
+    import sys
+
+    import ida_segment
+
+    fake_entries = [
+        (1, 0x180001000, "CreateWindowExA"),
+        (2, 0x180001008, ""),
+        (9, 0x180001200, "malloc"),
+    ]
+    monkeypatch.setitem(
+        sys.modules,
+        "idautils",
+        SimpleNamespace(Entries=lambda: iter(fake_entries)),
+    )
+    monkeypatch.setattr(
+        ida_segment,
+        "getseg",
+        lambda ea: SimpleNamespace() if ea == 0x180001008 else None,
+        raising=False,
+    )
+    monkeypatch.setattr(ida_segment, "get_segm_name", lambda seg: ".idata", raising=False)
+
+    rows = forge_api.imports()
+    assert rows[0] == {"module": "", "ea": 0x180001000, "name": "CreateWindowExA"}
+    # an entry with an empty name resolves through ida_name.get_name ("" here)
+    assert rows[1] == {"module": ".idata", "ea": 0x180001008, "name": ""}
+    filtered = forge_api.imports("window")
+    assert [row["name"] for row in filtered] == ["CreateWindowExA"]
+    assert forge_api.imports("nomatch_xyz") == []
+
+
+def test_imports_handles_ida_7_tuple_shapes(monkeypatch):
+    import sys
+
+    monkeypatch.setitem(
+        sys.modules,
+        "idautils",
+        SimpleNamespace(Entries=lambda: iter([(0, 5, 0x180001000, "old_shape")])),
+    )
+    rows = forge_api.imports()
+    assert rows == [{"module": "", "ea": 0x180001000, "name": "old_shape"}]
+
+
+def _vtable_stubs(monkeypatch, pointers):
+    """Fake read_pointer/is_code/is_imported so VirtualTable reads ``pointers``
+    (code pointers until the first non-code), with a real-looking name."""
+    from forge.api import members as members_api
+
+    monkeypatch.setattr(
+        members_api, "read_pointer", lambda ea: pointers.pop(0) if pointers else 0, raising=False
+    )
+    monkeypatch.setattr(members_api, "is_code", lambda ea: ea != 0, raising=False)
+    monkeypatch.setattr(members_api, "is_imported", lambda ea: False, raising=False)
+    monkeypatch.setattr(
+        members_api.ida_name, "get_name", lambda ea: "vftable_140006358", raising=False
+    )
+    return members_api
+
+
+def test_vtable_entries_reads_slots(monkeypatch):
+    """I.14: vtable_entries maps the read pointer slots to slot dicts."""
+    members_api = _vtable_stubs(monkeypatch, [0x140001000, 0x140001010, 0])
+
+    slots = forge_api.vtable_entries(0x140006358)
+
+    assert slots == [
+        {"offset": 0, "ea": 0x140001000, "slot": 0},
+        {"offset": members_api.types.width, "ea": 0x140001010, "slot": 1},
+    ]
+
+
+def test_vtable_entries_reports_non_vtable(monkeypatch):
+    """I.14: an address that is not a vtable returns an error dict, not a
+    raise."""
+    from forge.api import members as members_api
+
+    monkeypatch.setattr(members_api, "read_pointer", lambda ea: 0, raising=False)
+    monkeypatch.setattr(
+        members_api.ida_name, "get_name", lambda ea: "", raising=False
+    )
+
+    result = forge_api.vtable_entries(0x140006358)
+
+    assert result["ok"] is False
+    assert "error" in result
+
+
+def test_vtable_name_resolves_display_name(monkeypatch):
+    """I.14: vtable_name returns the parsed name + niceness flag."""
+    _vtable_stubs(monkeypatch, [0x140001000, 0])
+
+    result = forge_api.vtable_name(0x140006358)
+
+    assert result["name"] == "vftable_140006358"
+    assert result["is_nice"] is True

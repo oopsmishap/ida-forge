@@ -31,6 +31,8 @@ __all__ = [
     "add_member",
     "apply_type",
     "auto_resolve",
+    "callees_of",
+    "callers_of",
     "clear_structures",
     "create_child_types",
     "create_field",
@@ -41,10 +43,12 @@ __all__ = [
     "duplicate_structure",
     "finalize",
     "finalize_all",
+    "function_info",
     "get_member",
     "get_structure",
     "guess_allocation",
     "help",
+    "imports",
     "inverse_if",
     "is_type",
     "link_child",
@@ -69,6 +73,8 @@ __all__ = [
     "to_usercall",
     "to_vtable",
     "type_of",
+    "vtable_entries",
+    "vtable_name",
 ]
 
 
@@ -480,6 +486,145 @@ def signature(ea: int) -> str | None:
     if result is None:
         return None
     return result["pseudocode"] or None
+
+
+@api(
+    group="decompile",
+    returns="list[int]",
+    example='sources = forge_api.callers_of(0x1400014F0, "data")',
+)
+def callers_of(ea: int, kind: str = "code") -> list[int]:
+    """List the functions whose code/data points at ``ea``.
+
+    ``kind="code"`` walks code xrefs (``get_first_cref_to``), ``"data"`` data
+    xrefs (``get_first_dref_to``); each source is resolved to its containing
+    function start so the result is a set of function EAs (vtable/RTTI
+    discovery uses ``kind="data"``). Sources outside any function report their
+    raw EA. Unknown kinds return ``[]``.
+
+    Returns:
+        sorted list of function-start EAs.
+    """
+    _require_ida()
+    import ida_funcs
+    import ida_idaapi
+    import ida_xref
+
+    if kind == "code":
+        get_first, get_next = ida_xref.get_first_cref_to, ida_xref.get_next_cref_to
+    elif kind == "data":
+        get_first, get_next = ida_xref.get_first_dref_to, ida_xref.get_next_dref_to
+    else:
+        return []
+
+    starts = []
+    seen = set()
+    source = get_first(ea)
+    while source not in (ida_idaapi.BADADDR, None) and source not in seen:
+        seen.add(source)
+        function = ida_funcs.get_func(source)
+        starts.append(function.start_ea if function is not None else source)
+        source = get_next(ea, source)
+    return sorted(set(starts))
+
+
+@api(
+    group="decompile",
+    returns="list[int]",
+    example='targets = forge_api.callees_of(0x1400014F0)',
+)
+def callees_of(ea: int) -> list[int]:
+    """List the functions called from the function containing ``ea``.
+
+    Reuses the decompiler's call-expression scan (``decompile(...).calls``).
+    Returns ``[]`` when ``ea`` is not in a function.
+
+    Returns:
+        sorted list of callee EAs.
+    """
+    result = decompile(ea)
+    return result["calls"] if result is not None else []
+
+
+@api(
+    group="decompile",
+    returns="dict | None",
+    example='info = forge_api.function_info(0x1400014F0); info["callers"]',
+)
+def function_info(ea: int) -> dict | None:
+    """Aggregate recon for the function containing ``ea``.
+
+    Returns ``None`` when ``ea`` is not in a function, else
+    ``{"name", "start_ea", "size", "prototype", "callers", "callees",
+    "refs"}`` — ``refs`` is the union of code and data xref sources (in
+    function-start terms, like :func:`callers_of`).
+
+    Returns:
+        dict or None.
+    """
+    _require_ida()
+    import ida_funcs
+
+    function = ida_funcs.get_func(ea)
+    if function is None:
+        return None
+    code_callers = callers_of(ea, "code")
+    data_callers = callers_of(ea, "data")
+    return {
+        "name": ida_funcs.get_func_name(ea),
+        "start_ea": function.start_ea,
+        "size": function.end_ea - function.start_ea,
+        "prototype": signature(ea),
+        "callers": code_callers,
+        "callees": callees_of(ea),
+        "refs": sorted(set(code_callers) | set(data_callers)),
+    }
+
+
+@api(
+    group="decompile",
+    returns="list[dict]",
+    example='imports = forge_api.imports("Validate")',
+)
+def imports(pattern: str | None = None) -> list[dict]:
+    """List the database's import table entries.
+
+    Walks ``idautils.Entries()`` (available in every supported IDA version —
+    ``idautils.imports`` does not exist in 9.4 and is never used), resolving
+    each entry's name and the module (segment) it landed in. With ``pattern``
+    given, rows are case-folded substring-filtered on the name; an empty list
+    is a valid result.
+
+    Returns:
+        ``[{"module", "ea", "name"}, ...]`` sorted by EA.
+    """
+    _require_ida()
+    import ida_name
+    import ida_segment
+    import idautils
+
+    rows = []
+    for entry in idautils.Entries():
+        # shape differs across IDA versions: (ea, ordinal, name) or
+        # (index, ordinal, ea, name) — normalize by length
+        if len(entry) == 3:
+            _ordinal, ea, name = entry
+        elif len(entry) == 4:
+            _index, _ordinal, ea, name = entry
+        else:
+            continue
+        resolved = name or ida_name.get_name(ea)
+        segment = ida_segment.getseg(ea)
+        module = (
+            ida_segment.get_segm_name(segment)
+            if segment is not None
+            else ""
+        )
+        rows.append({"module": module, "ea": ea, "name": resolved})
+    if pattern:
+        folded = pattern.casefold()
+        rows = [row for row in rows if folded in row["name"].casefold()]
+    return sorted(rows, key=lambda row: row["ea"])
 
 
 @api(
@@ -1332,6 +1477,65 @@ def to_vtable(structure: str | None = None, offset: int = 0, address: int = 0) -
     vtable.name = getattr(member, "name", "") or vtable.name
     target.add_member(vtable)
     return _to_member_dict(vtable)
+
+
+@api(
+    group="types",
+    returns="list[dict] | dict",
+    example='slots = forge_api.vtable_entries(0x140006358)',
+)
+def vtable_entries(address: int) -> list[dict] | dict:
+    """Read a vtable's function-pointer slots starting at ``address``.
+
+    Walks the pointer table like the GUI's vtable conversion: each
+    code/import pointer becomes a slot until the first non-function datum
+    (or a data xref marks the table end). Returns
+    ``[{"offset", "ea", "slot"}, ...]``; ``{"ok": False, "error": ...}`` when
+    ``address`` is not a plausible vtable (no name, unreadable pointer).
+
+    Returns:
+        list of slot dicts, or an error dict.
+    """
+    _require_ida()
+    from forge.api.members import VirtualTable
+
+    try:
+        vtable = VirtualTable(0, address, None, 0)
+        slots = [
+            {"offset": vf.offset, "ea": vf.address, "slot": index}
+            for index, vf in enumerate(vtable.virtual_functions)
+        ]
+    except (AssertionError, AttributeError, TypeError, ValueError) as exc:
+        return {"ok": False, "error": f"no vtable at {hex(address)}: {exc}"}
+    return slots
+
+
+@api(
+    group="types",
+    returns="dict",
+    example='vt = forge_api.vtable_name(0x140006358); vt["is_nice"]',
+)
+def vtable_name(address: int) -> dict:
+    """Resolve the display name IDA attaches to the vtable at ``address``.
+
+    Returns ``{"name": ..., "is_nice": bool}``, or
+    ``{"ok": False, "error": ...}`` when the address is not a vtable. A
+    ``name`` of ``""`` with no error means IDA had no name for it.
+
+    Returns:
+        dict.
+    """
+    _require_ida()
+    from forge.api.members import VirtualTable
+
+    try:
+        vtable = VirtualTable(0, address, None, 0)
+        return {
+            "name": vtable.vtable_name,
+            "is_nice": vtable.has_nice_vtable_name,
+        }
+    except (AssertionError, AttributeError, TypeError, ValueError) as exc:
+        return {"ok": False, "error": f"no vtable at {hex(address)}: {exc}"}
 
 
 # --------------------------------------------------------------------------- #
