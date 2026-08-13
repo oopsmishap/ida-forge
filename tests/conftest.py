@@ -149,7 +149,6 @@ _stub_module(
     BTF_UINT32=0,
     BTF_UINT64=0,
     get_idati=lambda: object(),
-    get_base_til=lambda: object(),
     get_ordinal_count=lambda idati: 0,
     get_numbered_type_name=lambda idati, ordinal: "",
     get_type_ordinal=lambda idati, name: -1,

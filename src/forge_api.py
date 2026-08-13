@@ -1580,24 +1580,6 @@ def _mirror_store():
     return Storage("TypeMirror")
 
 
-def _structure_member_hash(structure) -> str:
-    """sha1 over the store structure's sorted member rows (I.27 delta)."""
-    import hashlib as _hashlib
-
-    rows = []
-    for member in structure.members:
-        rows.append(
-            (
-                member.offset,
-                getattr(member, "name", ""),
-                _member_type_str(member) or "",
-                getattr(member, "size", None),
-                getattr(member, "enabled", True),
-            )
-        )
-    return _hashlib.sha1(repr(sorted(rows)).encode("utf-8")).hexdigest()  # noqa: S324 — change-detection digest, not security
-
-
 def _idb_udt_snapshot(name: str) -> tuple[str | None, list]:
     """The IDB named UDT's member rows as ``(hash, rows)``; ``(None, [])``
     when ``name`` is not a known UDT."""
@@ -1636,7 +1618,9 @@ def import_types(pattern: str | None = None) -> dict:
     til (system headers) and NOT auto-generated names (contain ``::``);
     each missing catalog entry becomes a store structure with members mapped
     from the IDB type (provenance ``kind="imported"``). Already-present
-    names are reported under ``skipped`` — importing never merges.
+    names are reported under ``skipped`` — importing never merges. Types
+    IDA synthesizes locally (e.g. ``UNWIND_INFO_HDR``, compiler scope
+    tables) live in no til, so they import like user types.
 
     Returns:
         ``{"imported": [names], "skipped": [names]}``.
@@ -1647,7 +1631,11 @@ def import_types(pattern: str | None = None) -> dict:
     from forge.api.structure import Structure
 
     idati = ida_typeinf.get_idati()
-    base_til = ida_typeinf.get_base_til()
+    base_til = None
+    try:
+        base_til = idati.base(0)
+    except Exception:  # noqa: BLE001 — base-til handle varies by IDA version
+        base_til = None
     imported = []
     skipped = []
     seen = set()
@@ -1664,7 +1652,7 @@ def import_types(pattern: str | None = None) -> dict:
         if not tinfo.get_numbered_type(idati, ordinal) or not tinfo.is_udt():
             continue
         base = ida_typeinf.tinfo_t()
-        if base is not None and base.get_named_type(base_til, name):
+        if base_til is not None and base.get_named_type(base_til, name):
             continue
         if name in catalog:
             skipped.append(name)
@@ -1714,7 +1702,6 @@ def push_type(name: str) -> bool:
     target = _resolve_structure(name, required=False)
     if target is None:
         return False
-    current_hash = _structure_member_hash(target)
     _, idb_rows = _idb_udt_snapshot(name)
     store_rows = [
         (member.offset, getattr(member, "name", ""), _member_type_str(member) or "")
@@ -1725,6 +1712,10 @@ def push_type(name: str) -> bool:
         result = create_type(name, overwrite=True)
         if not result.get("ok", False):
             return False
+    # Baseline is the IDB-side digest: refresh_types() compares against the
+    # same snapshot shape, so an unchanged IDB is a no-op and only real
+    # IDB edits surface as updates.
+    baseline_hash, _ = _idb_udt_snapshot(name)
     try:
         import ida_typeinf
 
@@ -1734,7 +1725,7 @@ def push_type(name: str) -> bool:
             provenance = _dataclasses.asdict(provenance)
         _mirror_store()[name] = {
             "ordinal": ordinal,
-            "hash": current_hash,
+            "hash": baseline_hash,
             "provenance": provenance,
         }
     except Exception as exc:  # noqa: BLE001 — mirror is a cache, never fatal

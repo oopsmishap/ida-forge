@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
 from typing import ClassVar
 
 import pytest
@@ -45,10 +46,11 @@ class _RegistryTInfo:
         self.name = None
 
     def get_named_type(self, til, name):
+        if til is _BASE_TIL:
+            udt = _UDTS.get(name)
+            return bool(udt and udt.in_base)
         udt = _UDTS.get(name)
         if udt is None:
-            return False
-        if til is _BASE_TIL and not udt.in_base:
             return False
         self.name = name
         return True
@@ -155,7 +157,11 @@ def _registry(monkeypatch):
 
     _UDTS.clear()
     monkeypatch.setattr(ida_typeinf, "tinfo_t", _RegistryTInfo)
-    monkeypatch.setattr(ida_typeinf, "get_base_til", lambda: _BASE_TIL)
+    monkeypatch.setattr(
+        ida_typeinf,
+        "get_idati",
+        lambda: SimpleNamespace(base=lambda n: _BASE_TIL),
+    )
     monkeypatch.setattr(
         ida_typeinf, "get_ordinal_count", lambda idati: len(_UDTS)
     )
@@ -316,6 +322,21 @@ def test_refresh_types_updates_members_keeping_names(_registry):
     assert member["name"] == "count"
     assert member["type"] == "u64"
     assert forge_api.get_structure("World")["members"][1]["name"] == "next"
+
+    result = forge_api.refresh_types()
+
+    assert result == {"updated": [], "unchanged": ["World"]}
+
+
+def test_push_then_refresh_is_noop(_registry):
+    """I.27 delta: the TypeMirror baseline is the IDB-side digest, so a push
+    followed immediately by refresh_types() reports the entry unchanged —
+    store/IDB row-tuple shapes must never produce hash churn."""
+    forge_api.create_structure("World")
+    forge_api.add_member("World", 0, "u32", name="x")
+    _registry["World"] = FakeUdt("World", [(0, "x", "u32")])
+
+    assert forge_api.push_type("World") is True
 
     result = forge_api.refresh_types()
 
