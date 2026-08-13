@@ -3,11 +3,14 @@
 Current state (2026-08-13): all planned work — the 2026-08-11 assessment
 wave, the forge-api plan (R10/R11, I.8–I.28, T3.3), the O1–O5
 verification/fix pass, the full-facade **evaluation review** (E section
-below), and the **E.1–E.11 bug fixes** (see note under E-bug) — is in.
-The commit-level record lives in `CHANGELOG.md`; this file holds findings,
-future ideas, and operational notes.
+below), the **E.1–E.11 bug fixes**, and the **round-2 review fixes**
+(`607c3ab`: rename_ea, templated args, create_field persistence, nudge
+loudness) — is in. Two evaluation rounds done; the round-2 review scored
+the facade 8/10 ("genuinely productive") with the pain concentrated in
+attribution depth + missing verbs — those are the open items below. The
+commit-level record lives in `CHANGELOG.md`.
 
-Baselines: `python -m pytest -q` → 566 passing; `python -m ruff check src
+Baselines: `python -m pytest -q` → 573 passing; `python -m ruff check src
 tests` → clean; branch `forge-api` clean working tree.
 
 ## Evaluation findings — forge_api review, 2026-08-13
@@ -64,12 +67,72 @@ the probes (clear_structures), so pre-decl_src entries (KV etc.) are no
 longer in the store; the ordinal heal covers them if they reappear via
 `import_types`.
 
-> Dropped 2026-08-13: E.12 (function/global renaming — a leaf
-> `ida_name.set_name` wrapper, added straight to `forge_api.py`) and
-> E.15 (plain scan loop; its real work is F.2). This section tracks only
-> items with real design/implementation.
+### Round-2 fixes — FIXED 2026-08-13 (commit `607c3ab`, live-verified)
 
-### E-feat — ranked
+- **`rename_ea(ea, name)`** — the naming-core verb (round-2 request #1):
+  `ida_name.set_name` + SN_NOCHECK, loud failure; registered in the
+  catalog + `__all__`. Live: rename stuck (`function_info` shows it).
+- **`create_field` persistence** (round-2 §3.2, top-5 #2) — IDA 9.x udt
+  offsets are BYTES; the old `×8` bit convention broke the gap math and
+  the `set_numbered_type` commit. Now byte-based + delete/re-file via
+  the live-proven `idc_set_local_type` path. Live: `type_of('Kid')`
+  shows the inserted `r2_pad` member.
+- **Templated multi-arg keys** (§3.5) — each template param formats TWO
+  TOML tokens (type + name suffix); the facade now synthesizes suffixes
+  (`_templated_args_with_suffixes`). Live: `std::vector<T>` and
+  `std::map<K,V>` resolve to full cdecls.
+- **`nudge_members` unknown offsets** (§3.7) — loud
+  `{"ok": False, "error": "no member at offset(s) 0x18"}` instead of a
+  silent no-op.
+
+> Dropped 2026-08-13: E.12 (function/global renaming — a leaf
+> `ida_name.set_name` wrapper — **implemented as `rename_ea` in
+> `607c3ab`, live-verified**) and E.15 (plain scan loop; its real work is
+> F.2). This section tracks only items with real design/implementation.
+
+### E.21–E.30 — round-2 review findings (2026-08-13, report: second half of
+`docs/forge_api_evaluation_output.md`)
+
+- **E.21 `deep_scan` merge hygiene — fresh vs accumulate mode.** Repeated
+  scans into one store structure accumulate hypotheses + byte-granular
+  junk (InlineParent 21 → 23 entries incl. offsets 1,5,6,7 from an
+  `_OWORD`-wide store; PointerParent picked 5 collision variants at
+  offset 0). Add `clear_first=True` kwarg (fresh mode) so re-scans
+  produce a stable member set. Round-2 top-5 #5.
+- **E.22 Helper-aware allocation tracking.** `v1 = grid_build(...)`
+  (body calls `calloc(1,0x28)`) — `guess_allocation`/`scan_from_allocation`
+  return []/error; the I.25 `callee` row exists for direct allocator
+  calls but the walker never enters the helper body. Recover
+  `GridNode` through wrappers. Round-2 top-5 #3.
+- **E.23 `callees_of` / `decompile()['calls']` IAT-slot resolution.**
+  Rows contain `.idata` slot addresses (`0x140004b98` = puts) — resolve
+  slots to import-target EAs (or mark them) so call-graph consumers
+  don't need the dereference.
+- **E.24 Duplicate-name member selection.** `member_name` disambiguates
+  first match only; two members with the same name at one offset (name
+  differs by type only) need `(offset, name, type)` matching or an
+  index. (E.11 follow-up.)
+- **E.25 `scan_global` exclusive-end span.** `DispatchTable.count` at
+  start+0x60 fell outside span=0x60; either include the trailing qword
+  when a data ref points there, or document exclusive-end in help().
+- **E.26 Bidirectional mirror.** `refresh_types` pulls layouts only
+  (no member-name renames); `import_types` skips store-known types with
+  no skip-reason report. Doc line + adoption report. Round-2 top-5 #4.
+- **E.27 `remove_type(name)`** — facade type deletion with the working
+  ordinal-delete path (`del_named_type` name-form returns False live on
+  9.4; `del_numbered_type(ordinal)` works). Placeholder materialization
+  makes stray types inevitable; cleanup needs this verb. (Round-1 E.19
+  first half — now with live evidence.)
+- **E.14 update — printf-literal member naming.** The fixture's own
+  format strings (`"first=%s id=%u flags=%u score=%u sample=%u"`) carry
+  exact member names; a heuristic naming scan members from the consuming
+  printf signature would collapse the manual naming step (round-2 top-5
+  #5b).
+- **E.16 update — array/stride evidence.** `Stack2[2]`, `u32[2]` dims
+  and `u8[16]`/`xmmword` blobs were all hand-fixed in round 2;
+  `scan_global` emitted the blobs, not the arrays.
+
+### E-feat — ranked (round 1)
 
 - **E.13 `recover()` end-to-end pipeline — highest-value orchestration
   gap** (postmortem verdict): store-struct allocate → scan → commit type
@@ -91,10 +154,10 @@ longer in the store; the ordinal heal covers them if they reappear via
 - **E.18 Bit/flag-field decode** — split a packed dword
   (`0x1300000012`, `0x4000`-family flags) into sized members at an
   offset; the store-struct analog of `create_field`.
-- **E.19 IDB-type hygiene** — no IDB-type delete, no "reapply named
-  type to its bound variables", no find-and-replace member names: the
-  cleanup pass is a manual raw-API grind. Add `remove_type(name)` +
-  reapply-all so a session can end clean.
+- **E.19 IDB-type hygiene** — no "reapply named type to its bound
+  variables", no find-and-replace member names: the cleanup pass is a
+  manual raw-API grind. Add reapply-all so a session can end clean.
+  (Type deletion itself is E.27.)
 - **E.20 Tweak batch** — `push_type` one-size error string (surface the
   underlying cause); `nudge_members` echo new offsets; `get_member`
   default `include_disabled=False`; `decompile(max_lines)` doc note that
