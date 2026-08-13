@@ -2,11 +2,12 @@
 
 Current state (2026-08-13): all planned work — the 2026-08-11 assessment
 wave, the forge-api plan (R10/R11, I.8–I.28, T3.3), the O1–O5
-verification/fix pass, and the full-facade **evaluation review** (E
-section below) — is in. The commit-level record lives in `CHANGELOG.md`;
-this file holds findings, future ideas, and operational notes.
+verification/fix pass, the full-facade **evaluation review** (E section
+below), and the **E.1–E.11 bug fixes** (see note under E-bug) — is in.
+The commit-level record lives in `CHANGELOG.md`; this file holds findings,
+future ideas, and operational notes.
 
-Baselines: `python -m pytest -q` → 554 passing; `python -m ruff check src
+Baselines: `python -m pytest -q` → 566 passing; `python -m ruff check src
 tests` → clean; branch `forge-api` clean working tree.
 
 ## Evaluation findings — forge_api review, 2026-08-13
@@ -18,60 +19,50 @@ roughly a third of the session spent on API drift and silent failures.
 The report's §7 priority: fix the IDA 9.x drift first, then renaming.
 Standalone bugs first — all live-reproduced:
 
-### E-bug — fix priority (live-reproduced headless)
+### E-bug — FIXED 2026-08-13 (commits `4372b94`, `97b9474`, `8d8bd3c`)
 
-- **E.1 IDA 9.x API drift — unblocks `set_func_proto` + `create_field`**.
-  `set_func_proto` always fails headless: `ida_typeinf.parse_decl(…,
-  PT_TYP|PT_SIL)` returns None on 9.4 (use `idc.parse_decl`); the success
-  path also calls removed `ida_funcs.set_ti` (use
-  `ida_typeinf.apply_tinfo`). `create_field` crashes the same way:
-  `ida_idaapi.idc_parse_decl` doesn't exist
-  (`create_new_field/create_new_field.py:104` — use `idc.parse_decl`).
-- **E.2 `to_vtable` asserts on unnamed tables** (`api/members.py:772`):
-  "Virtual table must have either a legal C++ type name or a mangled
-  name" on `to_vtable("HandlerObj", 0, 0x140006128)` for an unnamed data
-  pointer table. Fall back to `vtbl_<addr>` like `vtable_name`, or
-  return an error — never assert.
-- **E.3 `create_structure(members=[…])` silently drops the first
-  self/forward-`*` member** (KV `next`, ChainNode `next`): the lazy
-  placeholder for the struct's own name doesn't exist when the first
-  member parses; the parse failure is swallowed. Create the placeholder
-  before parsing members, or raise.
-- **E.4 `rename_structure` corrupts self-referencing member types** to
-  raw TIL ordinals (`KV`→`KeyValuePair` left `next` as `#53 *`; `push`
-  failed until `set_member(type="KeyValuePair *")`). Rewrite member type
-  strings that reference the old name on rename; never serialize `#N *`.
-- **E.5 `imports()` returns garbage** (one bogus `.text`/`start` row;
-  `imports("KERNEL32")` → `[]` despite a real IAT). Reimplement over
-  the IAT: `get_import_module_qty`/`get_import_module_name` +
-  `ida_nalt.get_import_ea_by_ordinal`, filter by module/name substring.
-- **E.6 `inverse_if` silently no-ops headless** (all 8 `chain_build`
-  jump sites + `chain_sum` null-check → False, no effect; decompile
-  works at those EAs). ctree→insn correlation or swap/storage path
-  fails headless — live-verify first, then fix.
-- **E.7 `templated_*` dead headless — `ModuleNotFoundError: No module
-  named 'toml'`** in the idalib env (no tomli either). The config
-  laziness didn't reach the templated subsystem; make it read via
-  tomllib + lazy toml write so the module imports standalone.
-- **E.8 `link_child` discards an existing typed member**:
-  `link_child("PointerParent", 0x10, "Kid")` replaced `Kid *first` with
-  a `u32_10` placeholder and linked the placeholder
-  (`parent_member_name: "u32_10"`); never retypes to `Kid *`. Preserve
-  the member (or refuse to link over a non-empty one) and set the type.
-- **E.9 `finalize_all` self-contradictory rows** (`{"ok": false,
-  "created": true}`); `ok` conflates "needs overwrite" with failure;
-  failures carry no reason ("see IDA log" — unreachable via facade).
-  Separate status from outcome; return the underlying exception text.
-- **E.10 `create_type(overwrite=False)` fails on its own lazy
-  placeholders** — after any `add_member(..., "Kid *")` the placeholder
-  exists in the IDB, so the first non-overwrite commit errors "type
-  already exists (overwrite disabled)" and the default scan→commit flow
-  breaks on self-referencing structs. Auto-overwrite placeholders (or
-  point the error at `overwrite=True`).
-- **E.11 collision-offset ambiguity** — `set_member`/`get_member` at an
-  offset with multiple members silently picks one. Accept a member name
-  in addition to offset (or return the member list for that offset).
-  Also blocks `deep_scan` merge cleanup.
+All eleven live-reproduced defects are fixed, unit-tested (14 new tests)
+and live-verified on the pure_c fixture worker:
+
+- **E.1** IDA 9.x drift — `ida_typeinf.parse_decl` cannot parse function
+  prototypes; `idc.parse_decl` is the legacy **2-arg** `(decl, flags)`
+  form returning `(ret, tp, fld)` → deserialize (live signature probe).
+  `set_func_proto` applies via `apply_tinfo` (set_ti removed). Fixes
+  `set_func_proto` (live: prototype applied) + `create_field` (no more
+  AttributeError). **Live caveat**: `create_field` returned False with no
+  reason on the fixture — the crash is gone, the silent-False needs a
+  reason string (fold into E.20 tweaks).
+- **E.2** unnamed tables → `vtbl_<addr>` fallback (live: to_vtable ok).
+- **E.3** `create_structure` seeds the own-name placeholder before the
+  member loop (live: `next/child/tag` all kept).
+- **E.4** decl_src tracked on every string-authored member
+  (add/set_member, link materialize); `rename_relationship_references`
+  rewrites texts referencing the old name; `Member._resolve_pack_tinfo`
+  re-parses fresh at pack, and **heals `#NN *` ordinal refs** from
+  pre-decl_src catalog entries by current type name (live: rename →
+  members show `EvalSelfRenamed *`, push ok).
+- **E.5** `imports()` walks the real IAT (`get_import_module_qty` +
+  `enum_import_names`), module+name filters (live: 50 rows, KERNEL32).
+- **E.6** `inverse_if` ctree walk + nearest-`cit_if` pick (live: True on
+  the fixture if). Also fixed the same `to_specific_type`-is-a-method
+  normalization trap in guess_allocation's treeitems fallbacks.
+- **E.7** templated types read via tomllib (lazy toml fallback) — no
+  `toml` package needed headless (live: templated_keys listed).
+- **E.8** `link_child` materializes the child pointer (decl_src set);
+  retype actually lands at finalize via `refresh_linked_member_types`
+  (a child must be committed first — that ordering is by design).
+- **E.10** `create_type(overwrite=False)` auto-replaces forge
+  placeholders (`_is_forge_placeholder_type`); a real pre-existing type
+  still errors (live-verified both sides).
+- **E.11** `get_member`/`set_member(member_name=…)` disambiguate
+  collision offsets (live: `b`/`u64` picked).
+- **E.9** `finalize_all` rows carry `created_names` + `error`
+  (`create_subtree_types_postorder` returns `(ok, created, error)`).
+
+Sandbox note: the pure_c fixture's shared catalog was refreshed during
+the probes (clear_structures), so pre-decl_src entries (KV etc.) are no
+longer in the store; the ordinal heal covers them if they reappear via
+`import_types`.
 
 > Dropped 2026-08-13: E.12 (function/global renaming — a leaf
 > `ida_name.set_name` wrapper, added straight to `forge_api.py`) and
