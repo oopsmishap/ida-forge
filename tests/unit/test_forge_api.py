@@ -258,7 +258,7 @@ def test_finalize_headless_commits_with_type_name(monkeypatch):
 
     result = forge_api.finalize("S")
 
-    assert result == {"ok": True, "type_name": "S"}
+    assert result == {"ok": True, "type_name": "S", "skipped": []}
 
 
 def test_finalize_reports_error_when_commit_fails(monkeypatch):
@@ -318,6 +318,297 @@ def test_finalize_all_runs_headless_subtree(monkeypatch):
     results = forge_api.finalize_all()
 
     assert results == [{"structure": "Root", "ok": True, "created": True}]
+
+
+# ---------------------------------------------------------------------------
+# I.22 set_func_proto
+# ---------------------------------------------------------------------------
+
+def test_set_func_proto_applies_parsed_type(monkeypatch, _real_hexrays):
+    """I.22: parses the declaration against the local til and applies via
+    set_ti; the result carries the re-decompiled first line."""
+    import ida_funcs
+    import ida_lines
+    import ida_typeinf
+
+    monkeypatch.setattr(ida_lines, "tag_remove", lambda s: s, raising=False)
+    monkeypatch.setattr(
+        _real_hexrays,
+        "decompile",
+        lambda ea: _pseudo_cfunc(["int __cdecl f(World *a1, char *a2)"]),
+        raising=False,
+    )
+    stored = []
+    monkeypatch.setattr(
+        ida_funcs, "set_ti", lambda ea, t: stored.append((ea, t)), raising=False
+    )
+    monkeypatch.setattr(
+        ida_typeinf,
+        "parse_decl",
+        lambda t, til, decl, flags: stored.append(decl) or "f",
+        raising=False,
+    )
+    monkeypatch.setattr(ida_typeinf, "PT_TYP", 0, raising=False)
+    monkeypatch.setattr(ida_typeinf, "PT_SIL", 1, raising=False)
+
+    result = forge_api.set_func_proto(
+        0x401000, "int __cdecl f(World *, char *)"
+    )
+
+    assert result["ok"] is True
+    assert result["ea"] == 0x401000
+    assert result["prototype"] == "int __cdecl f(World *a1, char *a2)"
+
+
+def test_set_func_proto_reports_parse_failure(monkeypatch):
+    import ida_typeinf
+
+    monkeypatch.setattr(
+        ida_typeinf, "parse_decl", lambda *a, **k: None, raising=False
+    )
+    result = forge_api.set_func_proto(0x401000, "not a decl")
+    assert result == {"ok": False, "error": "could not parse declaration 'not a decl'"}
+
+
+# ---------------------------------------------------------------------------
+# I.8 root-type hint / I.10 auto-create scan structure
+# ---------------------------------------------------------------------------
+
+class _ScanVisitorStub:
+    def __init__(self, *args, **kwargs):
+        self.kwargs = kwargs
+
+    def process(self):
+        pass
+
+
+def _scan_cfunc(root_name, root_type):
+    """Fake cfunc whose first lvar is ``root_name`` of ``root_type``."""
+    return SimpleNamespace(
+        entry_ea=0x401000,
+        argidx=(),
+        get_lvars=lambda: [
+            SimpleNamespace(
+                name=root_name,
+                type=lambda: FakeTinfo(root_type),
+                location=7,
+                defea=0x401010,
+            )
+        ],
+    )
+
+
+def test_deep_scan_auto_creates_structure_and_auto_retypes_root(monkeypatch, _real_hexrays):
+    """I.10/I.8: a bare deep_scan on an empty store auto-creates
+    ``Structure`` (then ``Structure Copy``) and an ``__int64`` root is
+    retyped to ``void *`` via modify_user_lvar_info before the visitor."""
+    import ida_hexrays
+
+    monkeypatch.setattr(_real_hexrays, "decompile", lambda ea: _scan_cfunc("a1", "__int64"), raising=False)
+    monkeypatch.setattr(ida_hexrays, "lvar_locator_t", lambda loc, defea: SimpleNamespace(location=loc, defea=defea), raising=False)
+    monkeypatch.setattr(ida_hexrays, "lvar_saved_info_t", type("S", (), {"__init__": lambda self: setattr(self, "ll", None) or setattr(self, "type", None)}), raising=False)
+    monkeypatch.setattr(ida_hexrays, "MLI_TYPE", 0x10, raising=False)
+    retyped = []
+    monkeypatch.setattr(
+        ida_hexrays,
+        "modify_user_lvar_info",
+        lambda ea, flags, lvi: retyped.append((flags, lvi.type.dstr())) or True,
+        raising=False,
+    )
+    monkeypatch.setattr(_real_hexrays, "mark_cfunc_dirty", lambda ea, close=False: None, raising=False)
+    monkeypatch.setattr(members_mod, "parse_user_tinfo", lambda decl: FakeTinfo(decl), raising=False)
+    from importlib import import_module as _import
+    scanner_mod = _import("forge.api.scanner")
+    monkeypatch.setattr(scanner_mod, "NewDeepScanVisitor", _ScanVisitorStub, raising=False)
+
+    first = forge_api.deep_scan(0x401000, var_name="a1")
+    second = forge_api.deep_scan(0x401000, var_name="a1")
+
+    assert first["structure"] == "Structure"
+    assert second["structure"] == "Structure Copy"
+    assert retyped, "root must be retyped"
+    assert retyped[0][0] == 0x10
+    assert retyped[0][1] == "void *"
+
+
+def test_deep_scan_root_type_hint_overrides_integral_auto(monkeypatch, _real_hexrays):
+    """I.8: an explicit root_type declaration wins over the auto void *."""
+    import ida_hexrays
+
+    monkeypatch.setattr(_real_hexrays, "decompile", lambda ea: _scan_cfunc("a1", "__int64"), raising=False)
+    monkeypatch.setattr(ida_hexrays, "lvar_locator_t", lambda loc, defea: SimpleNamespace(location=loc, defea=defea), raising=False)
+    monkeypatch.setattr(ida_hexrays, "lvar_saved_info_t", type("S", (), {"__init__": lambda self: setattr(self, "ll", None) or setattr(self, "type", None)}), raising=False)
+    monkeypatch.setattr(ida_hexrays, "MLI_TYPE", 0x10, raising=False)
+    retyped = []
+    monkeypatch.setattr(ida_hexrays, "modify_user_lvar_info", lambda ea, flags, lvi: retyped.append(lvi.type.dstr()) or True, raising=False)
+    monkeypatch.setattr(members_mod, "parse_user_tinfo", lambda decl: FakeTinfo(decl), raising=False)
+    from importlib import import_module as _import
+    scanner_mod = _import("forge.api.scanner")
+    monkeypatch.setattr(scanner_mod, "NewDeepScanVisitor", _ScanVisitorStub, raising=False)
+
+    forge_api.deep_scan(0x401000, var_name="a1", root_type="World *")
+
+    assert retyped == ["World *"]
+
+
+def test_deep_scan_skips_retype_for_pointer_root(monkeypatch, _real_hexrays):
+    """I.8: an already-pointer root needs no retype (no visitor churn)."""
+    monkeypatch.setattr(_real_hexrays, "decompile", lambda ea: _scan_cfunc("a1", "World *"), raising=False)
+    monkeypatch.setattr(members_mod, "parse_user_tinfo", lambda decl: FakeTinfo(decl), raising=False)
+    from importlib import import_module as _import
+    scanner_mod = _import("forge.api.scanner")
+    monkeypatch.setattr(scanner_mod, "NewDeepScanVisitor", _ScanVisitorStub, raising=False)
+
+    result = forge_api.deep_scan(0x401000, var_name="a1")
+
+    assert result["structure"] == "Structure"
+    assert result["members"] == []
+
+
+# ---------------------------------------------------------------------------
+# I.18 get_member / B11 collision reporting, I.21 link_child, I.9 to_vtable,
+# I.11 skipped members
+# ---------------------------------------------------------------------------
+
+def test_get_member_honors_include_disabled(monkeypatch):
+    forge_api.create_structure("S")
+    forge_api.add_member("S", 0, "u32", name="a")
+    forge_api.add_member("S", 0, "u64", name="b", enabled=False)
+    forge_api.add_member("S", 8, "u32", name="gone", enabled=False)
+
+    # the first match at offset 0 is the enabled member
+    assert forge_api.get_member("S", 0)["name"] == "a"
+    assert forge_api.get_member("S", 0, include_disabled=False)["name"] == "a"
+    # offset 8's only member is disabled: hidden when excluded, visible when
+    # include_disabled=True
+    assert forge_api.get_member("S", 8)["name"] == "gone"
+    assert forge_api.get_member("S", 8, include_disabled=False) is None
+
+
+def test_add_member_reports_collision(monkeypatch):
+    forge_api.create_structure("S")
+    first = forge_api.add_member("S", 0, "u32", name="a")
+    assert first["collision"] is False
+    second = forge_api.add_member("S", 2, "u32", name="b")
+    assert second["collision"] is True
+
+
+def test_link_child_creates_relationship_and_placeholder(monkeypatch):
+    forge_api.create_structure("Parent")
+    forge_api.create_structure("Child")
+
+    linked = forge_api.link_child("Parent", 0x10, "Child")
+
+    assert linked["offset"] == 0x10
+    parent = forge_api._resolve_structure("Parent")
+    child = forge_api._resolve_structure("Child")
+    assert parent.child_relationships[0].child_structure_name == "Child"
+    assert child.parent_relationships[0].parent_structure_name == "Parent"
+    member = parent.get_member_by_offset(0x10)
+    assert member.linked_child_structure_name == "Child"
+    assert member.child_relation_kind == "pointer"
+
+
+def test_link_child_rejects_unknown_child(monkeypatch):
+    forge_api.create_structure("Parent")
+    with pytest.raises(forge_api.ForgeApiError):
+        forge_api.link_child("Parent", 0x10, "Missing")
+
+
+def test_to_vtable_creates_placeholder_when_no_member(monkeypatch):
+    """I.9: an offset with no members converts to a vtable row via a
+    placeholder instead of raising."""
+    from forge.api import members as members_api
+
+    forge_api.create_structure("S")
+    monkeypatch.setattr(
+        members_api.VirtualTable,
+        "populate_virtual_functions",
+        lambda self: None,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        members_api.ida_name, "get_name", lambda ea: "vftable_140006358", raising=False
+    )
+
+    result = forge_api.to_vtable("S", 0x0, 0x140006358)
+
+    assert result["offset"] == 0
+    # the row is a vtable now (its name carries the parsed vtable name)
+    from forge.api.members import VirtualTable
+
+    converted = forge_api._resolve_structure("S").get_member_by_offset(0)
+    assert isinstance(converted, VirtualTable)
+    assert converted.address == 0x140006358
+
+
+def test_to_vtable_preserves_disabled_member_name(monkeypatch):
+    """I.9: converting an existing (disabled, named) member keeps its name."""
+    from forge.api import members as members_api
+
+    forge_api.create_structure("S")
+    forge_api.add_member("S", 0, "u32", name="type_id", enabled=False)
+    monkeypatch.setattr(
+        members_api.VirtualTable,
+        "populate_virtual_functions",
+        lambda self: None,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        members_api.ida_name, "get_name", lambda ea: "vftable_140006358", raising=False
+    )
+
+    result = forge_api.to_vtable("S", 0x0, 0x140006358)
+
+    assert result["name"] == "type_id"
+
+
+def test_create_type_lists_skipped_disabled_members(monkeypatch):
+    """I.11: committed types surface collision-disabled members under
+    ``skipped``; enabling them clears the list."""
+    import ida_typeinf
+
+    from forge.api import structure as structure_mod
+
+    forge_api.create_structure("S")
+    forge_api.add_member("S", 0, "u32", name="curated")
+    forge_api.add_member("S", 0, "u64", name="shadowed", enabled=False)
+
+    monkeypatch.setattr(
+        structure_mod.Structure,
+        "build_cdecl",
+        lambda self, start=None, end=None: (self.name, f"struct {self.name} {{ int x; }};"),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        structure_mod.Structure,
+        "set_cdecl",
+        lambda self, cdecl, origin=0, *, overwrite=None: (
+            self.__setattr__("created_type_name", self.name) or object()
+        ),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        ida_typeinf.tinfo_t, "get_named_type", lambda self, *a, **k: False, raising=False
+    )
+    monkeypatch.setattr(
+        structure_mod.ida_typeinf, "parse_decl", lambda *a, **k: "S", raising=False
+    )
+
+    result = forge_api.create_type("S")
+    assert result["skipped"] == ["shadowed"]
+
+    result = forge_api.create_type("S", overwrite=True)
+    assert result["skipped"] == ["shadowed"]
+
+    s = forge_api._resolve_structure("S")
+    for member in s.members:
+        if not member.enabled:
+            member.set_enabled(True)
+    s.refresh_collisions()
+
+    result = forge_api.create_type("S", overwrite=True)
+    assert result["skipped"] == []
 
 
 def test_api_returns_only_json_types():

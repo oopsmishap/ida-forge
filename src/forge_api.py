@@ -41,11 +41,13 @@ __all__ = [
     "duplicate_structure",
     "finalize",
     "finalize_all",
+    "get_member",
     "get_structure",
     "guess_allocation",
     "help",
     "inverse_if",
     "is_type",
+    "link_child",
     "named_types",
     "nudge_members",
     "remove_members",
@@ -54,6 +56,7 @@ __all__ = [
     "rename_structure",
     "scan_global",
     "set_current",
+    "set_func_proto",
     "set_lvar_types",
     "set_member",
     "shallow_scan",
@@ -550,6 +553,39 @@ def set_lvar_types(ea: int, types, *, scope: str = "arg") -> dict:
 
 
 @api(
+    group="types",
+    returns="dict",
+    example='r = forge_api.set_func_proto(0x1400014F0, "int __cdecl f(World *, char *)")',
+)
+def set_func_proto(ea: int, declaration: str) -> dict:
+    """Set a function's prototype in the IDB.
+
+    Parses ``declaration`` as a function type (the til must be the local
+    til — ``None`` silently fails) and applies it via ``ida_funcs.set_ti``.
+    The result's ``prototype`` is the re-decompiled first line.
+
+    Returns:
+        ``{"ok": True, "ea": int, "prototype": str}`` or
+        ``{"ok": False, "error": str}``.
+    """
+    _require_ida()
+    import ida_funcs
+    import ida_typeinf
+
+    t = ida_typeinf.tinfo_t()
+    parsed_name = ida_typeinf.parse_decl(
+        t,
+        ida_typeinf.get_idati(),
+        declaration,
+        ida_typeinf.PT_TYP | ida_typeinf.PT_SIL,
+    )
+    if parsed_name is None:
+        return {"ok": False, "error": f"could not parse declaration {declaration!r}"}
+    ida_funcs.set_ti(ea, t)
+    return {"ok": True, "ea": ea, "prototype": signature(ea)}
+
+
+@api(
     group="decompile",
     returns="bool",
     example='renamed = forge_api.rename_local(0x1400014F0, "a1", "world")',
@@ -837,6 +873,39 @@ def get_structure(name: str | None = None) -> dict | None:
 
 @api(
     group="structures",
+    returns="dict | None",
+    example='m = forge_api.get_member("Recovered", 0x10)',
+)
+def get_member(
+    structure: str | None = None,
+    offset: int = 0,
+    *,
+    include_disabled: bool = True,
+) -> dict | None:
+    """Return the first member dict at ``offset``.
+
+    Unlike :meth:`Structure.get_member_by_offset`, ``include_disabled=False``
+    skips collision-disabled members. Returns ``None`` when no structure is
+    selected/resolvable or no member matches (read-side convention matches
+    :func:`get_structure`).
+
+    Returns:
+        member dict or None.
+    """
+    target = _resolve_structure(structure, required=False)
+    if target is None:
+        return None
+    for member in target.members:
+        if member.offset != offset:
+            continue
+        if not include_disabled and not member.enabled:
+            continue
+        return _to_member_dict(member)
+    return None
+
+
+@api(
+    group="structures",
     returns="dict",
     example='s = forge_api.create_structure("Recovered")',
 )
@@ -900,6 +969,13 @@ def remove_structure(name: str | None = None) -> bool:
     return True
 
 
+def _declaration_base_name(declaration: str) -> str:
+    """Strip trailing pointer/array suffixes: ``"GridNode *"`` -> ``"GridNode"``."""
+    import re as _re
+
+    return _re.sub(r"(?:\s*\*+\s*|\s*\[[^\]]*\]\s*)+$", "", declaration.strip())
+
+
 @api(
     group="structures",
     returns="dict",
@@ -918,8 +994,11 @@ def add_member(
     """Add a member at ``offset`` with the given type to a store structure.
 
     ``type`` is a C type declaration parsed the same way the GUI accepts it
-    (e.g. ``"u32"``, ``"MyStruct *"``, ``"__int64[8]"``). Returns the new
-    member dict, or ``{"ok": False, "error": ...}`` when the type does not parse.
+    (e.g. ``"u32"``, ``"MyStruct *"``, ``"__int64[8]"``). Store-structure
+    names (``"GridNode *"`` for a store ``GridNode``) resolve via a lazy
+    placeholder IDB type, so self/forward references parse before the real
+    type exists. Returns the new member dict, or
+    ``{"ok": False, "error": ...}`` when the type does not parse.
 
     Returns:
         member dict (see member fields on :func:`get_structure`).
@@ -928,6 +1007,10 @@ def add_member(
 
     target = _resolve_structure(structure)
     tinfo = parse_user_tinfo(type)
+    if tinfo is None:
+        base_name = _declaration_base_name(type)
+        if base_name in _structures and _ensure_placeholder_type(base_name):
+            tinfo = parse_user_tinfo(type)
     if tinfo is None:
         return {"ok": False, "error": f"could not parse type {type!r}"}
     member = Member(offset, tinfo, None, origin)
@@ -938,7 +1021,9 @@ def add_member(
     if not enabled:
         member.set_enabled(False)
     target.add_member(member)
-    return _to_member_dict(member)
+    result = _to_member_dict(member)
+    result["collision"] = target.has_collision(target.members.index(member))
+    return result
 
 
 @api(
@@ -995,6 +1080,10 @@ def set_member(
     if type is not None:
         tinfo = parse_user_tinfo(type)
         if tinfo is None:
+            base_name = _declaration_base_name(type)
+            if base_name in _structures and _ensure_placeholder_type(base_name):
+                tinfo = parse_user_tinfo(type)
+        if tinfo is None:
             return {"ok": False, "error": f"could not parse type {type!r}"}
         member.tinfo = tinfo
         member.is_array = False
@@ -1009,6 +1098,56 @@ def set_member(
     if enabled is not None and hasattr(member, "set_enabled"):
         member.set_enabled(bool(enabled))
     target.refresh_collisions()
+    result = _to_member_dict(member)
+    result["collision"] = target.has_collision(target.members.index(member))
+    return result
+
+
+@api(
+    group="structures",
+    returns="dict",
+    example='m = forge_api.link_child("Parent", 0x10, "Child")',
+)
+def link_child(
+    structure: str | None = None,
+    offset: int = 0,
+    child_name: str = "",
+) -> dict:
+    """Link a store member to another store structure (child relationship).
+
+    ``child_name`` must be in the store (else :class:`ForgeApiError`). If no
+    member exists at ``offset`` a placeholder ``u32`` member is created
+    first. The member becomes the parent pointer: ``linked_child_structure_name``
+    + ``child_relation_kind="pointer"``, and the child/parent relationship
+    records are kept on both structures so :func:`create_child_types` /
+    :func:`finalize` child machinery works for hand-built structures.
+
+    Returns:
+        the (linked) member dict.
+    """
+    target = _resolve_structure(structure)
+    if child_name not in _structures:
+        raise ForgeApiError(
+            f"no structure named {child_name!r} in the forge_api store"
+        )
+    child = _structures[child_name]
+    member = target.get_member_by_offset(offset)
+    if member is None:
+        created = add_member(target.name, offset, "u32")
+        if created.get("ok") is False:
+            raise ForgeApiError(
+                f"could not create placeholder member at 0x{offset:x}"
+            )
+        member = target.get_member_by_offset(offset)
+    member.linked_child_structure_name = child_name
+    member.child_relation_kind = "pointer"
+    relationship = target.add_child_relationship(
+        child_structure_name=child_name,
+        parent_member_offset=offset,
+        parent_member_name=member.name,
+        relation_kind="pointer",
+    )
+    child.add_parent_relationship(relationship)
     return _to_member_dict(member)
 
 
@@ -1164,24 +1303,33 @@ def to_vtable(structure: str | None = None, offset: int = 0, address: int = 0) -
     """Convert the member at ``offset`` into a vtable row at ``address``.
 
     Reads the vtable pointer table at ``address`` (IDA functions) and replaces
-    the member with a :class:`VirtualTable`; the member's scanned variables and
-    comment carry over. Raises :class:`ForgeApiError` when there is no member at
-    ``offset``.
+    the member with a :class:`VirtualTable`; the member's name, scanned
+    variables and comment carry over. When no member exists at the offset
+    (rows whose members are all collision-disabled) an enabled placeholder is
+    created first, so the vtable row is never lost.
 
     Returns:
         the new vtable member dict.
     """
     _require_ida()
-    from forge.api.members import VirtualTable
+    from forge.api.members import Member, VirtualTable, parse_user_tinfo
 
     target = _resolve_structure(structure)
     member = target.get_member_by_offset(offset)
     if member is None:
-        raise ForgeApiError(f"no member at offset 0x{offset:x}")
+        # No member at all (offsets whose rows are all collision-disabled):
+        # build an enabled placeholder so the row still converts without
+        # silently losing the vtable.
+        tinfo = parse_user_tinfo("u32")
+        if tinfo is None:
+            raise ForgeApiError(f"no member at offset 0x{offset:x}")
+        member = Member(offset, tinfo, None, 0)
+        target.add_member(member)
     target.members.remove(member)
     vtable = VirtualTable(offset, address, None, member.origin)
     vtable.scanned_variables = getattr(member, "scanned_variables", set())
     vtable.comment = getattr(member, "comment", "")
+    vtable.name = getattr(member, "name", "") or vtable.name
     target.add_member(vtable)
     return _to_member_dict(vtable)
 
@@ -1195,6 +1343,95 @@ def _make_var_root(cfunc, lvars, index):
     obj = VariableObject(lvars[index], index)
     obj.func_ea = cfunc.entry_ea
     return obj
+
+
+_INTEGRAL_SCALARS = {
+    "int",
+    "unsigned int",
+    "long",
+    "unsigned long",
+    "long long",
+    "unsigned long long",
+    "__int64",
+    "unsigned __int64",
+    "char",
+    "unsigned char",
+    "short",
+    "unsigned short",
+}
+
+
+def _target_scan_structure(structure: str | None):
+    """Resolve the scan's target structure, auto-creating one when needed.
+
+    With ``structure`` given, behaves exactly like ``_resolve_structure``.
+    With ``structure=None`` creates a fresh auto-named structure
+    (``Structure``, ``Structure Copy``, ...) and selects it, so a bare scan
+    never raises ``no structure named ... in the forge_api store``.
+    """
+    from forge.api.structure import Structure
+
+    if structure is not None:
+        return _resolve_structure(structure)
+    name = _unique_structure_name("Structure")
+    target = Structure(name)
+    _structures[name] = target
+    _state.current = name
+    return target
+
+
+def _root_retype_target(obj, root_type: str | None) -> str | None:
+    """The effective root type to commit, or None when no retype is wanted.
+
+    ``root_type`` wins when given. Otherwise an integral-scalar root is
+    auto-retyped to ``void *`` (pointer arithmetic is what makes
+    ``memptr`` shapes — an ``__int64`` root yields 2 members where the same
+    function retyped ``void *`` yields the full set).
+    """
+    if root_type is not None:
+        return root_type
+    tinfo = getattr(obj, "tinfo", None)
+    if tinfo is None:
+        return None
+    try:
+        dstr = tinfo.dstr()
+    except Exception:  # noqa: BLE001 — broken tinfo degrades to no retype
+        return None
+    if dstr in _INTEGRAL_SCALARS:
+        return "void *"
+    return None
+
+
+def _apply_root_retype(cfunc, obj, target_decl: str):
+    """Retype the scan root lvar when the type actually changes.
+
+    Returns a freshly decompiled cfunc when a retype was committed, else
+    None. Persists via ``set_lvar_type`` (``MLI_TYPE``), then marks the
+    function dirty so the visitor rescans with the retyped root.
+    """
+    from forge.api.hexrays import decompile as _decompile
+    from forge.api.hexrays import mark_cfunc_dirty as _mark_dirty
+    from forge.api.hexrays import set_lvar_type
+    from forge.api.members import parse_user_tinfo
+
+    lvar = getattr(obj, "lvar", None)
+    if lvar is None:
+        return None
+    try:
+        current = lvar.type()
+        if current is not None and current.dstr() == target_decl:
+            return None
+    except Exception as exc:  # noqa: BLE001 — unqueryable lvar type: retype anyway
+        from forge.util.logging import log_debug
+
+        log_debug(f"Could not read current lvar type for retype: {exc}")
+    tinfo = parse_user_tinfo(target_decl)
+    if tinfo is None:
+        return None
+    if not set_lvar_type(cfunc, lvar, tinfo):
+        return None
+    _mark_dirty(getattr(cfunc, "entry_ea", None) or 0)
+    return _decompile(getattr(cfunc, "entry_ea", None) or 0)
 
 
 def _resolve_scan_root(
@@ -1255,6 +1492,7 @@ def deep_scan(
     recurse_calls: bool = False,
     max_depth: int | None = None,
     structure: str | None = None,
+    root_type: str | None = None,
 ) -> dict:
     """Recover the structure's members by deep-scanning a decompiled function.
 
@@ -1266,6 +1504,13 @@ def deep_scan(
     caps recursion (None = unlimited). On an unresolvable root returns
     ``{"ok": False, "error": ...}``.
 
+    With ``structure`` None a fresh auto-named store structure is created
+    (``Structure``, then ``Structure Copy``, ...). ``root_type`` retypes the
+    root lvar first (persisted via ``modify_user_lvar_info``); an integral
+    scalar root (``__int64``/``int``/...) is auto-retyped to ``void *`` so
+    pointer arithmetic produces ``memptr`` shapes — the fully-populated
+    member set without caller-side retyping.
+
     Returns:
         ``{"structure": name, "members": [member dicts]}`` or an ok:False dict.
     """
@@ -1273,13 +1518,26 @@ def deep_scan(
     from forge.api.hexrays import decompile as _decompile
     from forge.api.scanner import NewDeepScanVisitor
 
-    target = _resolve_structure(structure)
+    target = _target_scan_structure(structure)
     cfunc = _decompile(ea)
     if cfunc is None:
         return {"ok": False, "error": f"could not decompile {hex(ea)}"}
     obj = _resolve_scan_root(cfunc, var_name=var_name, var_index=var_index, item_ea=item_ea)
     if obj is None:
         return {"ok": False, "error": "could not resolve a scan root (default: first argument)"}
+    root_decl = _root_retype_target(obj, root_type)
+    if root_decl is not None:
+        refreshed = _apply_root_retype(cfunc, obj, root_decl)
+        if refreshed is not None:
+            cfunc = refreshed
+            obj = _resolve_scan_root(
+                cfunc, var_name=var_name, var_index=var_index, item_ea=item_ea
+            )
+            if obj is None:
+                return {
+                    "ok": False,
+                    "error": "could not resolve a scan root after retype",
+                }
     visitor = NewDeepScanVisitor(
         cfunc,
         target.main_offset,
@@ -1304,12 +1562,13 @@ def shallow_scan(
     var_index: int | None = None,
     item_ea: int | None = None,
     structure: str | None = None,
+    root_type: str | None = None,
 ) -> dict:
     """Recover a structure's members with a single-pass shallow scan.
 
     Runs ``NewShallowScanVisitor`` over the chosen root variable (same root
-    resolution as :func:`deep_scan` but without recursing into called
-    functions).
+    resolution and ``root_type`` retype semantics as :func:`deep_scan`;
+    with ``structure`` None a fresh auto-named structure is created).
 
     Returns:
         ``{"structure": name, "members": [member dicts]}`` or an ok:False dict.
@@ -1318,13 +1577,26 @@ def shallow_scan(
     from forge.api.hexrays import decompile as _decompile
     from forge.api.scanner import NewShallowScanVisitor
 
-    target = _resolve_structure(structure)
+    target = _target_scan_structure(structure)
     cfunc = _decompile(ea)
     if cfunc is None:
         return {"ok": False, "error": f"could not decompile {hex(ea)}"}
     obj = _resolve_scan_root(cfunc, var_name=var_name, var_index=var_index, item_ea=item_ea)
     if obj is None:
         return {"ok": False, "error": "could not resolve a scan root (default: first argument)"}
+    root_decl = _root_retype_target(obj, root_type)
+    if root_decl is not None:
+        refreshed = _apply_root_retype(cfunc, obj, root_decl)
+        if refreshed is not None:
+            cfunc = refreshed
+            obj = _resolve_scan_root(
+                cfunc, var_name=var_name, var_index=var_index, item_ea=item_ea
+            )
+            if obj is None:
+                return {
+                    "ok": False,
+                    "error": "could not resolve a scan root after retype",
+                }
     visitor = NewShallowScanVisitor(cfunc, target.main_offset, obj, target)
     visitor.process()
     return _scan_result(target)
@@ -1441,7 +1713,12 @@ def create_type(name: str | None = None, *, overwrite: bool = False) -> dict:
                 "error": "failed to recreate type after delete (see IDA log)",
             }
         return {"ok": False, "error": "type already exists (overwrite disabled)"}
-    return {"ok": True, "type_name": target.created_type_name, "declaration": cdecl}
+    return {
+        "ok": True,
+        "type_name": target.created_type_name,
+        "declaration": cdecl,
+        "skipped": [m.name for m in target.members if not m.enabled],
+    }
 
 
 @api(
@@ -1503,7 +1780,11 @@ def finalize(name: str | None = None) -> dict:
         if unresolved:
             return {"ok": False, "unresolved": unresolved}
         return {"ok": False, "error": "failed to create type (see IDA log for reason)"}
-    return {"ok": True, "type_name": target.created_type_name}
+    return {
+        "ok": True,
+        "type_name": target.created_type_name,
+        "skipped": [m.name for m in target.members if not m.enabled],
+    }
 
 
 @api(
