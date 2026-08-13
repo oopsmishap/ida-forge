@@ -731,3 +731,190 @@ def test_recursive_upwards_check_call_only_tracks_matched_argument(monkeypatch):
 
     assert recorded_visits == [(0x401000, 0)]
     assert recorded_tree_edges == [(0x402000, 0)]
+
+
+class _ScanT:
+    def __init__(self, name: str):
+        self._name = name
+
+    def __repr__(self):
+        return self._name
+
+    def clone(self):
+        return _ScanT(self._name)
+
+
+def test_memory_writer_synthesizes_field_member(monkeypatch):
+    """E1/I.20: strcpy(root + 0x10, ...) synthesizes a member at 0x10; the
+    writer name comes from ida_name."""
+    visitor_module = _load_visitor_module()
+    import ida_name as _ida_name
+
+    monkeypatch.setattr(_ida_name, "get_name", lambda ea: "strcpy", raising=False)
+
+    class _TypesStub:
+        width = 8
+
+        def __getitem__(self, key):
+            return SimpleNamespace(type=_ScanT(key))
+
+        @staticmethod
+        def convert_to_simple_type(t):
+            return t
+
+    monkeypatch.setattr(visitor_module, "types", _TypesStub(), raising=False)
+    monkeypatch.setattr(
+        visitor_module.ida_typeinf,
+        "tinfo_t",
+        lambda value=None: SimpleNamespace(_name=getattr(value, "_name", "?")),
+        raising=False,
+    )
+
+    added = []
+    calls = {}
+
+    class _WriterVisitor(visitor_module.RecursiveDownwardsObjectVisitor):
+        def __init__(self):
+            self._structure = SimpleNamespace(add_member=added.append)
+            self._callee_base_offset = 0
+            self.crippled = False
+            self._origin = 0
+            self._objects = [
+                SimpleNamespace(
+                    is_target=lambda e: getattr(e, "op", None) == visitor_module.ctype.var,
+                    name="root",
+                )
+            ]
+            self._get_member = self._fake_get_member
+
+        # pylint: disable-next=arguments-differ
+        def _fake_get_member(self, offset, cexpr, obj, tinfo, obj_ea=None):
+            calls["get_member"] = (offset, obj.name)
+            return SimpleNamespace(name="synth")
+
+    v = _WriterVisitor()
+    dest = SimpleNamespace(
+        op=visitor_module.ctype.add,
+        x=SimpleNamespace(op=visitor_module.ctype.var),
+        y=SimpleNamespace(op=visitor_module.ctype.num, numval=lambda: 0x10),
+        type=SimpleNamespace(get_ptrarr_objsize=lambda: 1),
+    )
+    call = SimpleNamespace(
+        x=SimpleNamespace(obj_ea=0x5000),
+        a=[dest, SimpleNamespace(op=visitor_module.ctype.var)],
+    )
+
+    v._maybe_add_memory_writer_member(call, dest)
+
+    assert calls["get_member"] == (0x10, "root")
+    assert len(added) == 1
+
+
+def test_memory_writer_literal_source_sizes_char_array(monkeypatch):
+    """E1/I.20: a string-literal source gives char[len+1] for the member."""
+    visitor_module = _load_visitor_module()
+    import ida_name as _ida_name
+
+    monkeypatch.setattr(_ida_name, "get_name", lambda ea: "strcpy", raising=False)
+
+    class _TypesStub:
+        width = 8
+
+        def __getitem__(self, key):
+            return SimpleNamespace(type=_ScanT(key))
+
+        @staticmethod
+        def convert_to_simple_type(t):
+            return t
+
+    monkeypatch.setattr(visitor_module, "types", _TypesStub(), raising=False)
+    made = {}
+    monkeypatch.setattr(
+        visitor_module.ida_typeinf,
+        "array_type_data_t",
+        lambda: SimpleNamespace(base=0),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        visitor_module.ida_typeinf,
+        "tinfo_t",
+        lambda value=None: SimpleNamespace(
+            _name=getattr(value, "_name", "char"),
+            create_array=lambda data: made.update(nelems=data.nelems),
+        ),
+        raising=False,
+    )
+    added = []
+
+    class _WriterVisitor(visitor_module.RecursiveDownwardsObjectVisitor):
+        def __init__(self):
+            self._structure = SimpleNamespace(add_member=added.append)
+            self._callee_base_offset = 0
+            self.crippled = False
+            self._origin = 0
+            self._objects = [
+                SimpleNamespace(
+                    is_target=lambda e: getattr(e, "op", None) == visitor_module.ctype.var,
+                    name="root",
+                )
+            ]
+            self._get_member = lambda offset, cexpr, obj, tinfo, obj_ea=None: tinfo
+
+    v = _WriterVisitor()
+    # the source literal is detected via a `str` op in the ctype namespace:
+    # patch ctype onto the module-global binding
+    monkeypatch.setattr(visitor_module, "ctype", SimpleNamespace(**vars(visitor_module.ctype), str=99), raising=False)
+    dest = SimpleNamespace(
+        op=visitor_module.ctype.add,
+        x=SimpleNamespace(op=visitor_module.ctype.var),
+        y=SimpleNamespace(op=visitor_module.ctype.num, numval=lambda: 0),
+        type=SimpleNamespace(get_ptrarr_objsize=lambda: 1),
+    )
+    call = SimpleNamespace(
+        x=SimpleNamespace(obj_ea=0x5000),
+        a=[dest, SimpleNamespace(op=visitor_module.ctype.str, string="literal")],
+    )
+    v._maybe_add_memory_writer_member(call, dest)
+
+    assert made == {"nelems": 8}  # 7 chars + NUL
+    assert len(added) == 1
+
+
+def test_memory_writer_allowlist_excludes_printf(monkeypatch):
+    """E1/I.20: printf-style calls are not memory writers — no member."""
+    visitor_module = _load_visitor_module()
+    import ida_name as _ida_name
+
+    monkeypatch.setattr(_ida_name, "get_name", lambda ea: "printf", raising=False)
+    added = []
+    calls = []
+
+    class _WriterVisitor(visitor_module.RecursiveDownwardsObjectVisitor):
+        def __init__(self):
+            self._structure = SimpleNamespace(add_member=added.append)
+            self._callee_base_offset = 0
+            self.crippled = False
+            self._origin = 0
+            self._objects = [
+                SimpleNamespace(
+                    is_target=lambda e: getattr(e, "op", None) == visitor_module.ctype.var,
+                    name="root",
+                )
+            ]
+            self._get_member = lambda offset, cexpr, obj, tinfo, obj_ea=None: calls.append(
+                (offset, tinfo)
+            ) or SimpleNamespace(name="m")
+
+    v = _WriterVisitor()
+    dest = SimpleNamespace(
+        op=visitor_module.ctype.add,
+        x=SimpleNamespace(op=visitor_module.ctype.var),
+        y=SimpleNamespace(op=visitor_module.ctype.num, numval=lambda: 0),
+        type=SimpleNamespace(get_ptrarr_objsize=lambda: 1),
+    )
+    call = SimpleNamespace(x=SimpleNamespace(obj_ea=0x6000), a=[dest])
+
+    v._maybe_add_memory_writer_member(call, dest)
+
+    assert added == []
+    assert calls == []

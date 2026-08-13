@@ -1812,17 +1812,24 @@ def shallow_scan(
     returns="dict",
     example='r = forge_api.scan_global(0x1400A4000)',
 )
-def scan_global(ea: int, *, max_depth: int | None = None) -> dict:
+def scan_global(ea: int, *, max_depth: int | None = None, span: int | None = None) -> dict:
     """Deep-scan a global object from every function that references it.
 
     Creates a store structure named ``global_<short_name>`` and runs a deep scan
     (with call recursion, like the GUI's global scan) per referring function.
-    Returns ``{"ok": False, "error": ...}`` when the address has no references.
+    Additionally (I.20), every named sub-head inside the object's byte range
+    ``[ea, ea + span)`` becomes a member — stored pointers like
+    ``qword_140006128`` that the visitor alone cannot attribute become
+    deterministic members. ``span`` defaults to the size of the item at
+    ``ea``. Returns ``{"ok": False, "error": ...}`` when the address has no
+    references.
 
     Returns:
         ``{"structure": name, "functions_scanned": int, "members": [...]}``.
     """
     _require_ida()
+
+    import ida_bytes
     import ida_name
 
     from forge.api.hexrays import decompile as _decompile
@@ -1859,11 +1866,58 @@ def scan_global(ea: int, *, max_depth: int | None = None) -> dict:
         ).process()
         scanned += 1
 
+    _add_named_sub_heads(
+        target,
+        ea,
+        span if span is not None else ida_bytes.get_item_size(ea),
+    )
+
     return {
         "structure": struct_name,
         "functions_scanned": scanned,
         "members": [_to_member_dict(member) for member in target.members],
     }
+
+
+def _head_name_without_address(name: str) -> str:
+    """``qword_140006128`` -> ``qword``; other names stay as-is."""
+    import re as _re
+
+    match = _re.match(r"^(.+?)_[0-9A-Fa-f]{4,}$", name)
+    return match.group(1) if match else name
+
+
+def _add_named_sub_heads(target, ea: int, span: int):
+    """I.20: synthesize members for named sub-heads inside a global span.
+
+    Every named item in ``[ea, ea + span)`` (excluding the base itself) that
+    has no member yet becomes a ``u8``/``u16``/``u32``/``u64`` (or
+    ``u8[N]``) member named after the head's short name without its address
+    prefix. Deterministic superset of the GUI's stored-address handling.
+    """
+    import ida_bytes
+    import ida_idaapi
+    import ida_name
+
+    sizes = {1: "u8", 2: "u16", 4: "u32", 8: "u64"}
+    end = ea + span
+    head = ea
+    while True:
+        head = ida_bytes.next_head(head, end)
+        if head in (ida_idaapi.BADADDR, None) or head >= end:
+            break
+        name = ida_name.get_name(head)
+        if not name:
+            continue
+        item_size = ida_bytes.get_item_size(head)
+        size_type = sizes.get(item_size, f"u8[{item_size}]")
+        if target.get_member_by_offset(head - ea) is None:
+            add_member(
+                target.name,
+                head - ea,
+                size_type,
+                name=_head_name_without_address(name),
+            )
 
 
 # --------------------------------------------------------------------------- #

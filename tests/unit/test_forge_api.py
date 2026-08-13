@@ -1071,6 +1071,130 @@ def test_scan_from_allocation_auto_names_and_skips_commit(monkeypatch):
     assert calls == []
 
 
+def test_scan_global_adds_named_sub_heads(monkeypatch, _real_hexrays):
+    """I.20: named sub-heads inside the global's span become members with
+    u8/u16/u32/u64 types derived from their item size."""
+    import sys as _sys
+
+    import ida_bytes
+    import ida_name
+
+    heads = {
+        0x1400A4040: ("qword_1400a4040", 8),
+        0x1400A4060: ("dword_1400a4060", 4),
+    }
+
+    def _item_size(h):
+        if h in heads:
+            return heads[h][1]
+        if h == 0x1400A4000:
+            return 0x140
+        return 0
+
+    def _next_head(ea, end):
+        candidates = sorted(h for h in heads if ea < h < end)
+        return candidates[0] if candidates else -1
+
+    monkeypatch.setattr(ida_bytes, "get_item_size", _item_size, raising=False)
+    monkeypatch.setattr(ida_bytes, "next_head", _next_head, raising=False)
+    monkeypatch.setattr(
+        ida_name, "get_short_name", lambda ea: "obj_1400a4000", raising=False
+    )
+    monkeypatch.setattr(
+        ida_name, "get_name", lambda h: heads.get(h, ("", 0))[0], raising=False
+    )
+    monkeypatch.setattr(
+        _real_hexrays,
+        "get_funcs_referencing_address",
+        lambda ea: [0x401000],
+        raising=False,
+    )
+    monkeypatch.setattr(
+        _real_hexrays,
+        "decompile",
+        lambda ea: SimpleNamespace(entry_ea=0x401000),
+        raising=False,
+    )
+
+    class _FakeVisitor:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def process(self):
+            pass
+
+    scanner_module = _sys.modules.get("forge.api.scanner")
+    monkeypatch.setattr(
+        scanner_module, "NewDeepScanVisitor", _FakeVisitor, raising=False
+    )
+    # GlobalVariableObject needs no on-disk flags; the conftest flag stubs
+    # cover is_code etc. — just ensure the real class constructs
+    from forge.api.scan_object import GlobalVariableObject as _GVO
+
+    assert _GVO(0x1400A4000).object_ea == 0x1400A4000
+
+    result = forge_api.scan_global(0x1400A4000)
+
+    members = {m["name"]: m for m in result["members"]}
+    assert result["structure"] == "global_obj_1400a4000"
+    assert members["qword"]["offset"] == 0x40
+    assert members["qword"]["type"] == "u64"
+    assert members["dword"]["offset"] == 0x60
+    assert members["dword"]["type"] == "u32"
+
+
+def test_scan_global_sub_heads_skip_existing_member(monkeypatch, _real_hexrays):
+    """I.20: an offset that already has a member is not overwritten."""
+    import sys as _sys
+
+    import ida_bytes
+    import ida_name
+
+    monkeypatch.setattr(ida_bytes, "get_item_size", lambda h: 0x80 if h == 0x1400A4000 else 8, raising=False)
+
+    def _next_head(ea, end):
+        return 0x1400A4020 if ea < 0x1400A4020 < end else -1
+
+    monkeypatch.setattr(ida_bytes, "next_head", _next_head, raising=False)
+    monkeypatch.setattr(
+        ida_name, "get_short_name", lambda ea: "obj_1400a4000", raising=False
+    )
+    monkeypatch.setattr(
+        ida_name, "get_name", lambda h: "qword_1400a4020" if h == 0x1400A4020 else "", raising=False
+    )
+    monkeypatch.setattr(
+        _real_hexrays,
+        "get_funcs_referencing_address",
+        lambda ea: [0x401000],
+        raising=False,
+    )
+    monkeypatch.setattr(
+        _real_hexrays,
+        "decompile",
+        lambda ea: SimpleNamespace(entry_ea=0x401000),
+        raising=False,
+    )
+
+    class _FakeVisitor:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def process(self):
+            pass
+
+    monkeypatch.setattr(
+        _sys.modules.get("forge.api.scanner"), "NewDeepScanVisitor", _FakeVisitor, raising=False
+    )
+
+    forge_api.create_structure("global_obj_1400a4000")
+    forge_api.add_member("global_obj_1400a4000", 0x20, "u32", name="existing")
+
+    result = forge_api.scan_global(0x1400A4000)
+
+    assert [m["name"] for m in result["members"]] == ["existing"]
+    assert result["members"][0]["type"] == "u32"
+
+
 def test_apply_type_store_fallback_creates_placeholder_first(monkeypatch):
     """I.19: a store-structure declaration parses via the lazy placeholder
     (B8) — the placeholder is created before the re-parse."""

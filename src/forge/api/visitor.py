@@ -3,6 +3,8 @@ from __future__ import annotations
 import ida_funcs
 import ida_hexrays
 import ida_idaapi
+import ida_name
+import ida_typeinf
 
 from forge.api import hexrays as hexrays_api
 from forge.api.hexrays import (
@@ -25,6 +27,7 @@ from forge.api.scan_object import (
     _extract_offset_expression,
     _make_offset_scan_object,
 )
+from forge.api.types import types
 from forge.util.logging import log_debug, log_info, log_trace, log_warning
 
 
@@ -438,14 +441,20 @@ class RecursiveDownwardsObjectVisitor(RecursiveObjectVisitor, DownwardsObjectVis
         self._visit_base_offsets: dict[tuple[int, int], int] = {}
 
 
-    def _expression_references_object(self, cexpr) -> bool:
+    def _referenced_object(self, cexpr):
+        """The first scan object the expression subtree references, or None."""
         work: list[tuple[object, bool]] = [(cexpr, False)]
         while work:
             expr, addr_ctx = work.pop()
             if expr is None:
                 continue
-            if not addr_ctx and any(self._matches_object(obj, expr) for obj in self._objects):
-                return True
+            if not addr_ctx:
+                for obj in self._objects:
+                    try:
+                        if self._matches_object(obj, expr):
+                            return obj
+                    except Exception as exc:  # noqa: BLE001 — per-object matching is best-effort
+                        log_debug(f"Ignoring object match failure for {getattr(obj, 'name', obj)!r}: {exc}")
             op = getattr(expr, "op", None)
             if op == ctype.cast:
                 work.append((getattr(expr, "x", None), addr_ctx))
@@ -459,7 +468,68 @@ class RecursiveDownwardsObjectVisitor(RecursiveObjectVisitor, DownwardsObjectVis
                     work.append((getattr(expr, "x", None), False))
             elif op == ctype.memref and addr_ctx:
                 work.append((getattr(expr, "x", None), True))
-        return False
+        return None
+
+    def _expression_references_object(self, cexpr) -> bool:
+        return self._referenced_object(cexpr) is not None
+
+    _MEMORY_WRITER_CALLS = frozenset(
+        {"strcpy", "strncpy", "strcat", "memcpy", "memmove", "memset"}
+    )
+
+    def _string_writer_tinfo(self, source_arg):
+        """Member type for a memory-writer site: ``char[N+1]`` when the
+        source is a string literal, plain ``char`` otherwise."""
+        str_op = getattr(ctype, "str", None)
+        if str_op is not None and getattr(source_arg, "op", None) == str_op:
+            text = getattr(source_arg, "string", "") or ""
+            array_data = ida_typeinf.array_type_data_t()
+            array_data.base = 0
+            array_data.elem_type = ida_typeinf.tinfo_t(types["char"].type)
+            array_data.nelems = len(text) + 1  # NUL terminator
+            array_tinfo = ida_typeinf.tinfo_t()
+            array_tinfo.create_array(array_data)
+            return array_tinfo
+        return ida_typeinf.tinfo_t(types["char"].type)
+
+    def _maybe_add_memory_writer_member(self, call_cexpr, dest_arg):
+        """I.20: a write through a known memory helper into the scanned
+        object's buffer is evidence of a named field.
+
+        ``strcpy(root + 0x10, src)`` synthesizes a member at ``0x10``. Only
+        the fixed six writers are allowlisted — that list is the guard
+        against varargs-style functions (``printf``) framing unrelated
+        strings as writes.
+        """
+        if not (hasattr(self, "_get_member") and hasattr(self, "_structure")):
+            return
+        writer_ea = getattr(getattr(call_cexpr, "x", None), "obj_ea", None)
+        if writer_ea in (None, ida_idaapi.BADADDR):
+            return
+        canonical = (ida_name.get_name(writer_ea) or "").split("@")[0].lower()
+        if canonical not in self._MEMORY_WRITER_CALLS:
+            return
+        if not self._expression_references_object(dest_arg):
+            return
+        _base, offset = _extract_offset_expression(dest_arg)
+        if offset is None:
+            return
+        source_arg = None
+        call_args = getattr(call_cexpr, "a", ()) or ()
+        if len(call_args) >= 2:
+            source_arg = call_args[1]
+        obj = self._referenced_object(dest_arg)
+        if obj is None:
+            return
+        try:
+            member = self._get_member(
+                offset, dest_arg, obj, self._string_writer_tinfo(source_arg)
+            )
+        except Exception:  # noqa: BLE001 — writer synthesis is best-effort
+            return
+        if member is not None:
+            log_debug(f"[I.20] memory-writer member at 0x{offset:x} via {canonical}")
+            self._structure.add_member(member)
 
     def _check_call(self, cexpr: ida_hexrays.cexpr_t):
         parent: ida_hexrays.cexpr_t | None = self.parent_expr()
@@ -488,6 +558,11 @@ class RecursiveDownwardsObjectVisitor(RecursiveObjectVisitor, DownwardsObjectVis
         func_ea = call_cexpr.x.obj_ea
         if func_ea == ida_idaapi.BADADDR:
             return
+        # I.20: the checked expression being the destination (arg 0) of a
+        # memory helper is a write into the object's buffer — synthesize a
+        # member for it before the ordinary argument-tracking path.
+        if idx == 0:
+            self._maybe_add_memory_writer_member(call_cexpr, arg_cexpr)
         if self._add_visit(func_ea, idx):
             self._visit_base_offsets[(func_ea, idx)] = arg_offset
             self._add_scan_tree_info(func_ea, idx)
