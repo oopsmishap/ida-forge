@@ -41,7 +41,7 @@ def _stubs(monkeypatch):
 def test_parse_declaration_happy_path(_stubs, monkeypatch):
     monkeypatch.setattr(
         "idc.parse_decl",
-        lambda til, decl, flags: _FakeTInfo(),
+        lambda decl, flags: _FakeTInfo(),
         raising=False,
     )
     tinfo, name = CreateNewField.parse_declaration("int my_field")
@@ -52,7 +52,7 @@ def test_parse_declaration_happy_path(_stubs, monkeypatch):
 def test_parse_declaration_array_size(_stubs, monkeypatch):
     monkeypatch.setattr(
         "idc.parse_decl",
-        lambda til, decl, flags: _FakeTInfo(),
+        lambda decl, flags: _FakeTInfo(),
         raising=False,
     )
     _tinfo, name = CreateNewField.parse_declaration("char buffer[16]")
@@ -63,7 +63,7 @@ def test_parse_declaration_array_size(_stubs, monkeypatch):
 def test_parse_declaration_array_optional(_stubs, monkeypatch):
     monkeypatch.setattr(
         "idc.parse_decl",
-        lambda til, decl, flags: _FakeTInfo(),
+        lambda decl, flags: _FakeTInfo(),
         raising=False,
     )
     _tinfo, name = CreateNewField.parse_declaration("char *pointer")

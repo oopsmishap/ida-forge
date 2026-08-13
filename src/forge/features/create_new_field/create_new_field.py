@@ -102,17 +102,22 @@ class CreateNewField(HexRaysPopupAction):
             log_error("Bad field name", True)
             return None, None
 
-        # E1 (eval review 2026-08-13): ``ida_idaapi.idc_parse_decl`` does
-        # not exist on IDA 9.4 (AttributeError); the idc-module wrapper is
-        # the working path and returns the tinfo directly.
-        result = idc.parse_decl(
-            ida_typeinf.get_idati(), type_name, ida_typeinf.PT_TYP
-        )
-        if result is None:
+        # E1 (eval review 2026-08-13): ``ida_idaapi.idc_parse_decl`` does not
+        # exist on IDA 9.4 and ``idc.parse_decl`` is the legacy 2-arg
+        # (decl, flags) form returning (ret, tp, fld) — deserialize the
+        # type bytes; accept a direct tinfo return on newer builds too.
+        result = idc.parse_decl(type_name, ida_typeinf.PT_TYP)
+        if isinstance(result, tuple):
+            _, tp, fld = result
+            tinfo = ida_typeinf.tinfo_t()
+            if not tinfo.deserialize(ida_typeinf.get_idati(), tp, fld, None):
+                log_error("Failed to parse member type.", True)
+                return None, None
+        else:
+            tinfo = result
+        if tinfo is None:
             log_error("Failed to parse member type.", True)
             return None, None
-
-        tinfo = result
         if arr_size:
             tinfo.create_array(tinfo, int(arr_size))
         return tinfo, field_name

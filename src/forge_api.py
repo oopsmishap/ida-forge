@@ -234,6 +234,8 @@ def _resolve_structure(structure_name: str | None = None, *, required: bool = Tr
 
 
 def _member_type_str(member):
+    import re as _re
+
     tinfo = getattr(member, "tinfo", None)
     dstr = getattr(tinfo, "dstr", None)
     if callable(dstr):
@@ -241,6 +243,20 @@ def _member_type_str(member):
             raw = dstr()
         except Exception:  # noqa: BLE001 — stub tinfos may lack anything
             return None
+        # E4 (eval review 2026-08-13): a tinfo whose type was deleted and
+        # re-filed renders as an ordinal ref (``#102 *``) — when the member
+        # still has its authored declaration string, that is the honest
+        # display (and the pack path re-parses it fresh).
+        if (
+            _re.match(r"#\d+", raw or "")
+            and getattr(member, "decl_src", None) is not None
+        ):
+            try:
+                from forge.api.members import normalize_type_display
+
+                return normalize_type_display(member.decl_src)
+            except Exception:  # noqa: BLE001 — facade import is best-effort
+                return member.decl_src
         if raw:
             try:
                 from forge.api.members import normalize_type_display
@@ -829,14 +845,12 @@ def _parse_function_decl(declaration: str):
             log_debug(f"parse_decl({til!r}) failed for {declaration!r}: {exc}")
             continue
     try:
-        import idc
+        from forge.api.members import _parse_idc_decl_attempt
 
-        tinfo = idc.parse_decl(
-            ida_typeinf.get_idati(), declaration, ida_typeinf.PT_TYP
-        )
+        tinfo = _parse_idc_decl_attempt(declaration)
         if tinfo is not None:
             return tinfo
-    except Exception as exc:  # noqa: BLE001 — idc.parse_decl shape varies by version
+    except Exception as exc:  # noqa: BLE001 — idc wrapper shape varies by version
         from forge.util.logging import log_debug
 
         log_debug(f"idc.parse_decl failed for {declaration!r}: {exc}")
@@ -1325,6 +1339,7 @@ def add_member(
     if tinfo is None:
         return {"ok": False, "error": f"could not parse type {type!r}"}
     member = Member(offset, tinfo, None, origin)
+    member.decl_src = type
     if name is not None:
         member.name = name
     member.comment = comment

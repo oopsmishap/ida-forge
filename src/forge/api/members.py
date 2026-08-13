@@ -92,14 +92,37 @@ def _parse_decl_attempt(declaration: str) -> ida_typeinf.tinfo_t | None:
 
 
 def _parse_idc_decl_attempt(declaration: str) -> ida_typeinf.tinfo_t | None:
-    # ``idaapi.idc_parse_decl`` does not exist on IDA 9.4 (AttributeError);
-    # the idc-module wrapper is the working path (eval review E.1, 2026-08-13).
+    """Decl parse via the idc wrapper (E1 live finding, 2026-08-13).
+
+    On the 9.4 build ``idc.parse_decl`` is the legacy 2-argument form
+    ``(decl, flags) -> (ret, type_bytes, field_bytes)`` (the 3-arg til
+    form raises TypeError), and ``ida_typeinf.parse_decl`` returns None
+    for function prototypes. Prefer the 2-arg form, fall back to the
+    3-arg shape on older builds, and accept either return kind.
+    """
     import idc as _idc
 
-    tinfo = _idc.parse_decl(ida_typeinf.get_idati(), declaration, idaapi.PT_TYP)
-    if tinfo is None:
+    result = None
+    try:
+        result = _idc.parse_decl(declaration, idaapi.PT_TYP)
+    except TypeError:
+        try:
+            result = _idc.parse_decl(
+                ida_typeinf.get_idati(), declaration, idaapi.PT_TYP
+            )
+        except Exception:  # noqa: BLE001 — parse failure degrades to None
+            return None
+    if result is None:
         return None
-    return tinfo
+    if isinstance(result, tuple):
+        _, type_bytes, field_bytes = result
+        tinfo = ida_typeinf.tinfo_t()
+        if not tinfo.deserialize(
+            ida_typeinf.get_idati(), type_bytes, field_bytes, None
+        ):
+            return None
+        return tinfo
+    return result
 
 
 def _build_pointer_tinfo(base_declaration: str, pointer_depth: int) -> ida_typeinf.tinfo_t | None:
