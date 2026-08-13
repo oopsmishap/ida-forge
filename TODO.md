@@ -73,12 +73,13 @@ Standalone bugs first — all live-reproduced:
   in addition to offset (or return the member list for that offset).
   Also blocks `deep_scan` merge cleanup.
 
+> Dropped 2026-08-13: E.12 (function/global renaming — a leaf
+> `ida_name.set_name` wrapper, added straight to `forge_api.py`) and
+> E.15 (plain scan loop; its real work is F.2). This section tracks only
+> items with real design/implementation.
+
 ### E-feat — ranked
 
-- **E.12 Function/global renaming facade** — the biggest gap: 15
-  function renames + the dispatch-table name required raw
-  `ida_name.set_name`. Add `rename_function(ea, name)` /
-  `rename_global(ea, name)` (SN_NOCHECK semantics).
 - **E.13 `recover()` end-to-end pipeline — highest-value orchestration
   gap** (postmortem verdict): store-struct allocate → scan → commit type
   → re-scan with the fresh type → **rebind every recorded lvar/global to
@@ -90,9 +91,6 @@ Standalone bugs first — all live-reproduced:
   (`1347703345`, `0x1300000012`) and `strcpy` targets are the strongest
   naming evidence the scanner ignores; everything lands `u32_10`/
   `u64_15`. Surface string-arg/store evidence as suggested names.
-- **E.15 Batching** — `scan_function_list([(ea, var, struct), …])` /
-  `decompile_all`: ~12 separate `deep_scan` calls this session, each
-  needing the store pre-created; halve the round trips (see F.2).
 - **E.16 Array/stride detection** — `scan_from_allocation` on
   `calloc(9, 0xC)` returned 33 flat stride-12 members; propose `Cell[9]`
   from the element stride (visible in `cells + 12*(grid-1) + 8`).
