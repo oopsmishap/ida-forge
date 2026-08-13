@@ -495,11 +495,6 @@ class ScanVisitor(ObjectVisitor):
         """Extract a member from a non-pointer expression."""
         context = self._get_parent_context()
 
-        log_debug(
-            "Extracting member from expression: "
-            f"{obj.name}, parents: '{ctype_to_str(context.ops)}'"
-        )
-
         first_parent = context.expr_at(0)
         if first_parent is not None and first_parent.op == ctype.memptr:
             # `obj->member` outside an explicit pointer context (plain value

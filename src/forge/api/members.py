@@ -60,6 +60,29 @@ def normalize_type_declaration(declaration: str) -> str:
     return normalized
 
 
+# O2: signed 8-bit spellings that must display as a single canonical name so
+# the same semantic field never shows as both "char *" and "i8 *".
+_SIGNED_8_TOKENS = frozenset({"i8", "char", "signed char", "__int8", "signed __int8"})
+
+
+def normalize_type_display(name: str) -> str:
+    """Canonical display for an IDA type string (signed-8 → ``char``).
+
+    Only the leading type token is rewritten, so pointer/array forms
+    (``i8 *``, ``signed __int8 [4]``) normalize without touching the rest.
+    """
+    if not name:
+        return name
+    head, sep, tail = name.partition("[")
+    had_space = head.endswith(" ")
+    core = head.rstrip()
+    if core in _SIGNED_8_TOKENS:
+        core = "char"
+    elif core.endswith(" *") and core[:-2].rstrip() in _SIGNED_8_TOKENS:
+        core = "char *"
+    return core + (" " if had_space and not core.endswith(" ") else "") + (sep + tail if sep else "")
+
+
 def _parse_decl_attempt(declaration: str) -> ida_typeinf.tinfo_t | None:
     tinfo = ida_typeinf.tinfo_t()
     flags = ida_typeinf.PT_TYP | ida_typeinf.PT_SIL

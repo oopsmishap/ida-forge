@@ -606,6 +606,19 @@ class RecursiveDownwardsObjectVisitor(RecursiveObjectVisitor, DownwardsObjectVis
         if cfunc is None:
             return None
 
+        # O2: varargs callees (printf-style loggers, formatting helpers) can
+        # never frame the scanned object as a member — their bodies treat
+        # every argument list as format input and pollute the scan with
+        # bogus members (the 2026-08-11 format-string pollution). Drop the
+        # visit instead of scanning them.
+        func_type = getattr(cfunc, "type", None)
+        is_vararg_cc = getattr(func_type, "is_vararg_cc", None)
+        if callable(is_vararg_cc) and is_vararg_cc():
+            log_debug(
+                f"Skipping varargs callee {to_hex(func_ea)} - format-style body"
+            )
+            return None
+
         argidx = getattr(cfunc, "argidx", ())
         if arg_idx is None or arg_idx < 0 or arg_idx >= len(argidx):
             return self._VISIT_DEFERRED

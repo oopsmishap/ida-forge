@@ -52,6 +52,41 @@ def test_recursive_downwards_object_visitor_skips_missing_parent(monkeypatch):
     visitor._check_call(SimpleNamespace(op=visitor_module.ctype.var))
 
 
+
+def test_execute_visit_drops_varargs_callees(monkeypatch):
+    """Varargs callees (printf-style loggers) must not be scanned: their
+    bodies frame every argument list as format input and pollute members
+    (2026-08-11 format-string pollution regression guard)."""
+    visitor_module = _load_visitor_module()
+    visitor = visitor_module.RecursiveDownwardsObjectVisitor.__new__(
+        visitor_module.RecursiveDownwardsObjectVisitor
+    )
+    visitor._cfunc = SimpleNamespace(entry_ea=0x401000)
+    visitor._max_depth = None
+    visitor._current_depth = 0
+    varargs_callee = SimpleNamespace(
+        entry_ea=0x402000,
+        argidx=[0],
+        type=SimpleNamespace(is_vararg_cc=lambda: True),
+        get_lvars=lambda: [SimpleNamespace(name="fmt")],
+    )
+    monkeypatch.setattr(
+        visitor_module, "decompile", lambda _ea: varargs_callee, raising=False
+    )
+    monkeypatch.setattr(
+        visitor, "_refresh_decompilation_tree", lambda c: c, raising=False
+    )
+    argument_queries = []
+    monkeypatch.setattr(
+        visitor_module,
+        "get_argument",
+        lambda *args, **kwargs: argument_queries.append(args) or (None, None),
+        raising=False,
+    )
+    result = visitor._execute_visit(0x402000, 0, 0)
+    assert result is None
+    assert argument_queries == []
+
 def test_recursive_downwards_object_visitor_skips_invalid_callee_ordinal(monkeypatch):
     visitor_module = _load_visitor_module()
     visitor = visitor_module.RecursiveDownwardsObjectVisitor.__new__(

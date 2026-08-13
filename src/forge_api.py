@@ -199,9 +199,17 @@ def _member_type_str(member):
     dstr = getattr(tinfo, "dstr", None)
     if callable(dstr):
         try:
-            return dstr()
+            raw = dstr()
         except Exception:  # noqa: BLE001 — stub tinfos may lack anything
             return None
+        if raw:
+            try:
+                from forge.api.members import normalize_type_display
+
+                return normalize_type_display(raw)
+            except Exception:  # noqa: BLE001 — facade import is best-effort
+                return raw
+        return raw
     return None
 
 
