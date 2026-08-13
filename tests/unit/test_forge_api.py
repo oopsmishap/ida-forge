@@ -1050,6 +1050,72 @@ def test_scan_from_allocation_reports_missing_heap(monkeypatch):
     assert forge_api.structures() == []
 
 
+def test_scan_from_allocation_retypes_typed_roots_and_restores(monkeypatch):
+    """O1: a struct-pointer-typed root (e.g. ``ArrayCell *cells``) scans as
+    colliding offset-0 noise; scan_from_allocation transparently retypes to
+    void * for the scan and restores the analyst's type afterwards."""
+    rows = [{
+        "ea": 0x401000, "var": "a1", "line": "a1 = calloc(9u, 0xCu)",
+        "kind": "HEAP", "size_hint": 108, "callee": None,
+    }]
+    monkeypatch.setattr(forge_api, "guess_allocation", lambda *a, **k: rows)
+    monkeypatch.setattr(
+        forge_api,
+        "_allocation_root_prior_type",
+        lambda ea, var: "ArrayCell *",
+        raising=False,
+    )
+    scanned = {}
+    restored = []
+    monkeypatch.setattr(
+        forge_api,
+        "deep_scan",
+        lambda ea, *, var_name, structure, recurse_calls, root_type, **k:
+            scanned.update(root_type=root_type) or {"structure": structure, "members": []},
+    )
+    monkeypatch.setattr(
+        forge_api, "set_lvar_types",
+        lambda ea, types: restored.append(types), raising=False,
+    )
+    monkeypatch.setattr(forge_api, "to_vtable", lambda *a, **k: {}, raising=False)
+
+    result = forge_api.scan_from_allocation(0x401000, var_name="a1")
+
+    assert result["ok"] is True
+    assert scanned["root_type"] == "void *"
+    assert restored == [{"a1": "ArrayCell *"}]
+
+
+def test_scan_from_allocation_keeps_explicit_root_type(monkeypatch):
+    """O1: an explicit root_type wins — no auto-retype, no restore."""
+    monkeypatch.setattr(
+        forge_api, "guess_allocation", lambda *a, **k: [{
+            "ea": 0x401000, "var": "a1", "line": "", "kind": "HEAP",
+            "size_hint": None, "callee": None,
+        }]
+    )
+    monkeypatch.setattr(
+        forge_api, "_allocation_root_prior_type",
+        lambda ea, var: (_ for _ in ()).throw(AssertionError("auto-retype must be skipped")),
+        raising=False,
+    )
+    scanned = {}
+    calls = []
+    monkeypatch.setattr(
+        forge_api,
+        "deep_scan",
+        lambda ea, *, root_type=None, structure="", **k:
+            scanned.update(root_type=root_type) or {"structure": structure, "members": []},
+    )
+    monkeypatch.setattr(forge_api, "to_vtable", lambda *a, **k: {}, raising=False)
+    monkeypatch.setattr(forge_api, "set_lvar_types", lambda *a, **k: calls.append(1), raising=False)
+
+    forge_api.scan_from_allocation(0x401000, var_name="a1", root_type="char *")
+
+    assert scanned["root_type"] == "char *"
+    assert calls == []
+
+
 def test_scan_from_allocation_auto_names_and_skips_commit(monkeypatch):
     """I.23: unnamed scans get an Allocation auto-name; commit=False leaves
     the type uncommitted."""
@@ -1069,6 +1135,63 @@ def test_scan_from_allocation_auto_names_and_skips_commit(monkeypatch):
     assert result["structure"] == "Allocation"
     assert result["ok"] is True
     assert calls == []
+
+
+def test_import_types_excludes_system_and_template_names(monkeypatch):
+    """I.27 (O1 deviation): names in the base til, compiler-generated locals
+    (UNWIND_INFO_HDR/C_SCOPE_TABLE), and :: names never import."""
+    import ida_typeinf
+
+    names = {
+        0: "PointerParent",
+        1: "CellMeta",
+        2: "UNWIND_INFO_HDR",
+        3: "C_SCOPE_TABLE",
+        4: "BYTE",
+        5: "NS::Member",
+    }
+
+    class FakeTinfo:
+        def __init__(self, *a, **k):
+            self._name = None
+        def get_numbered_type(self, til, ordinal):
+            return ordinal in names
+        def get_named_type(self, til, name):
+            return name == "BYTE"
+        def is_udt(self):
+            return True
+        def get_udt_details(self, udt):
+            udt.extend(
+                [
+                    SimpleNamespace(offset=0, name="a", type=SimpleNamespace(dstr=lambda: "u32")),
+                    SimpleNamespace(offset=4, name="b", type=SimpleNamespace(dstr=lambda: "u64")),
+                ]
+            )
+            return True
+
+    class FakeBaseTil:
+        @staticmethod
+        def get_named_type(t, name):
+            return name == "BYTE"
+
+    class FakeIdati:
+        @staticmethod
+        def base(_n):
+            return FakeBaseTil()
+
+    monkeypatch.setattr(ida_typeinf, "get_idati", lambda: FakeIdati())
+    monkeypatch.setattr(ida_typeinf, "get_ordinal_count", lambda til: len(names))
+    monkeypatch.setattr(ida_typeinf, "get_numbered_type_name", lambda til, ord: names.get(ord))
+    monkeypatch.setattr(ida_typeinf, "tinfo_t", FakeTinfo)
+    added = []
+    monkeypatch.setattr(forge_api, "add_member", lambda *a, **k: added.append((a[0], a[1], k.get("name"))))
+
+    forge_api.clear_structures()
+    result = forge_api.import_types()
+
+    assert sorted(result["imported"]) == ["CellMeta", "PointerParent"]
+    assert forge_api.structures() == ["CellMeta", "PointerParent"]
+    assert ("PointerParent", 4, "b") in [(n, off, nm) for n, off, nm in added]
 
 
 def test_scan_global_adds_named_sub_heads(monkeypatch, _real_hexrays):

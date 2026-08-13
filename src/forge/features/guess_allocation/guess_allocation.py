@@ -94,10 +94,7 @@ class GuessAllocationVisitor(RecursiveUpwardsObjectVisitor):
                 returned = getattr(specific, "x", None)
                 if returned is None:
                     continue
-                returned_ea = getattr(returned, "ea", None)
-                if returned_ea is None:
-                    continue
-                alloc_obj = self._find_allocator_assignment(cfunc, returned_ea, asg_op)
+                alloc_obj = self._find_allocator_assignment(cfunc, returned, asg_op)
                 if alloc_obj is not None:
                     return [
                         alloc_obj.ea,
@@ -111,15 +108,29 @@ class GuessAllocationVisitor(RecursiveUpwardsObjectVisitor):
             return None
         return None
 
-    def _find_allocator_assignment(self, cfunc, returned_ea, asg_op):
-        """The ``var = allocator(...)`` assignment whose var node carries
-        ``returned_ea``; its RHS is a call, first hit wins."""
+    def _find_allocator_assignment(self, cfunc, returned, asg_op):
+        """The ``var = allocator(...)`` assignment feeding the returned value.
+
+        Matches the returned expression to an assignment target by **lvar
+        index** (``v.idx``), falling back to expression EAs — the EA of the
+        ``return node`` use differs from the EA of ``node = calloc(...)``
+        (O1 live finding, 2026-08-13), so EA-only matching misses the common
+        define-then-return shape. First hit wins.
+        """
+        returned_idx = getattr(getattr(returned, "v", None), "idx", None)
+        returned_ea = getattr(returned, "ea", None)
         for item in getattr(cfunc, "treeitems", []) or []:
             specific = getattr(item, "to_specific_type", None) or item
             if getattr(specific, "op", None) != asg_op:
                 continue
             target = getattr(specific, "x", None)
-            if target is None or getattr(target, "ea", None) != returned_ea:
+            if target is None:
+                continue
+            target_idx = getattr(getattr(target, "v", None), "idx", None)
+            if target_idx is not None and returned_idx is not None:
+                if target_idx != returned_idx:
+                    continue
+            elif returned_ea is not None and getattr(target, "ea", None) != returned_ea:
                 continue
             alloc_obj = MemoryAllocationObject.create(cfunc, getattr(specific, "y", None))
             if alloc_obj is not None:

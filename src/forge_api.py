@@ -20,6 +20,7 @@ for the exact return shape; the ``example`` field in ``help()`` shows a concrete
 
 from __future__ import annotations
 
+import contextlib
 import importlib
 import importlib.util
 import inspect
@@ -170,6 +171,38 @@ class _State:
 
 _state = _State()
 _structures = _state.structures
+
+
+def _allocation_root_prior_type(ea: int, var_name: str) -> str | None:
+    """The lvar's current type string when it is a pointer to a UDT.
+
+    Returns ``None`` for untyped/integral/char-like roots — those already
+    scan with byte semantics (O1: only struct-pointer-typed roots regress).
+    """
+    from forge.api.hexrays import decompile as _decompile
+
+    cfunc = _decompile(ea)
+    if cfunc is None:
+        return None
+    for lvar in list(cfunc.get_lvars()):
+        if getattr(lvar, "name", None) != var_name:
+            continue
+        var_type = getattr(lvar, "type", None)
+        is_ptr = getattr(var_type, "is_ptr", None)
+        get_pointed = getattr(var_type, "get_pointed_object", None)
+        get_dstr = getattr(var_type, "dstr", None)
+        if not (callable(is_ptr) and callable(get_pointed) and callable(get_dstr)):
+            return None
+        if not is_ptr():
+            return None
+        pointee = get_pointed()
+        if callable(getattr(pointee, "is_udt", None)) and pointee.is_udt():
+            try:
+                return get_dstr()
+            except Exception:  # noqa: BLE001 — degraded tinfo
+                return None
+        return None
+    return None
 
 
 def _mark_dirty() -> None:
@@ -1588,6 +1621,32 @@ def _mirror_store():
     return Storage("TypeMirror")
 
 
+_SYSTEM_TYPE_NAMES = frozenset(
+    {
+        # IDA compiler-generated locals (not in the base til).
+        "C_SCOPE_TABLE",
+        "UNWIND_INFO_HDR",
+        "UNWIND_CODE",
+        "XMM_SAVE_AREA32",
+        "XSAVE_FORMAT",
+        "RUNTIME_FUNCTION",
+        "SCOPE_TABLE",
+        "M128A",
+        "LARGE_INTEGER",
+        "ULARGE_INTEGER",
+        "_FILETIME",
+        "FILETIME",
+        "_LARGE_INTEGER",
+        "_ULARGE_INTEGER",
+        "_M128A",
+        "_XSAVE_FORMAT",
+        "_SCOPE_TABLE",
+        "SYSTEM_SERVICE_TABLE",
+        "OBJECT_DIRECTORY_INFORMATION",
+    }
+)
+
+
 def _idb_udt_snapshot(name: str) -> tuple[str | None, list]:
     """The IDB named UDT's member rows as ``(hash, rows)``; ``(None, [])``
     when ``name`` is not a known UDT."""
@@ -1653,6 +1712,11 @@ def import_types(pattern: str | None = None) -> dict:
             continue
         seen.add(name)
         if "::" in name:
+            continue
+        # Compiler-generated locals live in the local til, not the base til,
+        # so only a name-based denylist can exclude them (O1 live pass,
+        # 2026-08-13: UNWIND_INFO_HDR/C_SCOPE_TABLE imported otherwise).
+        if name in _SYSTEM_TYPE_NAMES or name.startswith("_$"):
             continue
         if pattern and pattern.casefold() not in name.casefold():
             continue
@@ -2600,6 +2664,16 @@ def scan_from_allocation(
 
     struct_name = name or _unique_structure_name("Allocation")
     create_structure(struct_name)
+    # O1: heap buffers whose root variable is already typed as a struct
+    # pointer (e.g. ``ArrayCell *cells``) scan as typed memptr chains and
+    # collapse to offset-0 noise; a byte-semantic void * root recovers the
+    # element lattice. Retype only when no explicit root_type was given,
+    # and restore the analyst's type afterwards.
+    restore_type = None
+    if root_type is None:
+        restore_type = _allocation_root_prior_type(ea, allocation["var"])
+        if restore_type:
+            root_type = "void *"
     scan_result = deep_scan(
         ea,
         var_name=allocation["var"],
@@ -2607,6 +2681,9 @@ def scan_from_allocation(
         recurse_calls=True,
         root_type=root_type,
     )
+    if restore_type:
+        with contextlib.suppress(Exception):  # noqa: BLE001 — restore is best-effort
+            set_lvar_types(ea, {allocation["var"]: restore_type})
     members = scan_result.get("members", [])
 
     if vtable_addr is not None:

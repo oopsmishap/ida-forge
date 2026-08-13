@@ -197,6 +197,79 @@ def test_guess_allocation_follows_helper_callee_for_allocation(monkeypatch, _rea
     ]
 
 
+def test_guess_allocation_callee_matches_define_then_return_by_var_index(monkeypatch, _real_hexrays):
+    """O1: ``node = calloc(...); ...; return node;`` — the return and the
+    assignment are different instructions with different EAs; lvar-index
+    matching finds the allocation (EA-only matching returned no row live)."""
+    import ida_funcs
+
+    cfunc = SimpleNamespace(
+        entry_ea=0x401000,
+        body=SimpleNamespace(find_parent_of=lambda expr: None),
+    )
+    obj = SimpleNamespace(id=ObjectType.local_variable, ea=0x5000, name="grid")
+
+    visitor = guess_allocation_module.GuessAllocationVisitor(cfunc, obj)
+    monkeypatch.setattr(
+        guess_allocation_module,
+        "ctype",
+        SimpleNamespace(asg=1, ref=2, ret=3, call=5),
+    )
+    monkeypatch.setattr(
+        visitor,
+        "parent_expr",
+        lambda: SimpleNamespace(op=1, y=SimpleNamespace(op=5, x=SimpleNamespace(obj_ea=0x402000))),
+    )
+    monkeypatch.setattr(visitor, "get_line", lambda: "grid = MakeGrid(...)")
+
+    def _fake_create(_cfunc, _expr):
+        called_for = getattr(getattr(_expr, "x", None), "obj_ea", None)
+        if called_for == 0x402000:  # MakeGrid is not an allocator
+            return None
+        return SimpleNamespace(ea=0x401200, size=76)
+
+    v = SimpleNamespace(idx=7)
+    monkeypatch.setattr(
+        guess_allocation_module.MemoryAllocationObject, "create", _fake_create
+    )
+    monkeypatch.setattr(
+        ida_funcs, "get_func", lambda ea: SimpleNamespace(start_ea=0x402000), raising=False
+    )
+    monkeypatch.setattr(
+        _real_hexrays,
+        "decompile",
+        lambda ea: SimpleNamespace(
+            treeitems=[
+                # unrelated return first (different var index)
+                SimpleNamespace(
+                    to_specific_type=None,
+                    op=3,
+                    x=SimpleNamespace(ea=0x403000, v=SimpleNamespace(idx=9)),
+                ),
+                # the defining assignment: EA differs from the return's
+                SimpleNamespace(
+                    to_specific_type=None,
+                    op=1,
+                    x=SimpleNamespace(ea=0x404040, v=v),
+                    y=SimpleNamespace(op=5, x=SimpleNamespace(obj_ea=0x5000)),
+                ),
+                # the actual return: `return node;`
+                SimpleNamespace(
+                    to_specific_type=None,
+                    op=3,
+                    x=SimpleNamespace(ea=0x404048, v=v),
+                ),
+            ]
+        ),
+    )
+
+    visitor._manipulate(SimpleNamespace(), obj)
+
+    assert visitor._data == [
+        [0x401200, "grid", "grid = MakeGrid(...)", "HEAP", 76, 0x402000]
+    ]
+
+
 def test_guess_allocation_callee_descent_failure_degrades_to_no_row(monkeypatch, _real_hexrays):
     """I.25: a broken callee decompile must not crash the visitor."""
     import ida_funcs
