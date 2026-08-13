@@ -63,6 +63,7 @@ __all__ = [
     "refresh_types",
     "remove_members",
     "remove_structure",
+    "rename_ea",
     "rename_local",
     "rename_structure",
     "scan_from_allocation",
@@ -1527,7 +1528,13 @@ def nudge_members(
     target = _resolve_structure(structure)
     members = [m for m in target.members if m.offset in offsets]
     if not members:
-        return {"ok": True}
+        # Eval review round 2 §3.7: a silent ok:True no-op for unknown
+        # offsets hides typos — say so.
+        return {
+            "ok": False,
+            "error": "no member at offset(s) "
+            + ", ".join(f"0x{o:x}" for o in offsets),
+        }
     if any(member.offset + delta < 0 for member in members):
         return {"ok": False, "error": "cannot move rows to a negative offset"}
 
@@ -2613,6 +2620,36 @@ def finalize_all() -> list:
 
 
 # --------------------------------------------------------------------------- #
+# naming
+# --------------------------------------------------------------------------- #
+@api(
+    group="naming",
+    returns="dict",
+    example='r = forge_api.rename_ea(0x140001000, "run_struct_sections"); r["name"]',
+)
+def rename_ea(ea: int, name: str) -> dict:
+    """Rename a function or global at ``ea`` (naming-core verb).
+
+    Eval review round 2, request #1: the one mandatory workflow verb with
+    no forge path — 14 function renames plus the dispatch-table name all
+    had to escape to raw ``ida_name``. Wraps ``ida_name.set_name`` with
+    ``SN_NOCHECK`` (never silently auto-uniqueifies); a rename that IDA
+    rejects fails loudly.
+
+    Returns:
+        ``{"ok": True, "ea": int, "name": str}`` or
+        ``{"ok": False, "error": str}``.
+    """
+    _require_ida()
+    import ida_name
+
+    sno_check = getattr(ida_name, "SN_NOCHECK", 0)
+    if ida_name.set_name(ea, name, sno_check):
+        return {"ok": True, "ea": ea, "name": name}
+    return {"ok": False, "error": f"could not set name {name!r} at {hex(ea)}"}
+
+
+# --------------------------------------------------------------------------- #
 # templated types
 # --------------------------------------------------------------------------- #
 def _templated_instance():
@@ -2621,6 +2658,24 @@ def _templated_instance():
 
         _state.templated = TemplatedTypes()
     return _state.templated
+
+
+def _templated_args_with_suffixes(args: list) -> list:
+    """Expand facade type args to the TOML format-token pairs.
+
+    Each template parameter consumes TWO format tokens in the template
+    table (the C type + a name suffix, per ``templated_types.toml``).
+    The facade contract takes plain type arguments (``["u32"]``), so the
+    suffix is synthesized from the type — otherwise every multi-arg key
+    fails on the ``2N == len(args)`` guard (eval review round 2 §3.5).
+    """
+    import re as _re
+
+    expanded = []
+    for arg in args:
+        expanded.append(arg)
+        expanded.append(_re.sub(r"[^A-Za-z0-9_]", "_", str(arg)))
+    return expanded
 
 
 @api(
@@ -2646,15 +2701,18 @@ def templated_keys() -> list:
 def templated_decl(key: str, args: list) -> dict | None:
     """Resolve a templated type's declaration for the given type arguments.
 
-    ``args`` are the template type arguments (each key expects a fixed count;
-    the templated-types TOML formats the struct/name with them). Returns
-    ``None`` when the key is unknown or the argument count is wrong.
+    ``args`` are the template type arguments; name suffixes are derived
+    automatically (each template parameter also formats a suffix token).
+    Returns ``None`` when the key is unknown or the argument count is
+    wrong.
 
     Returns:
         ``{"name": str, "cdecl": str}`` or None.
     """
     _require_ida()
-    result = _templated_instance().get_decl_str(key, list(args))
+    result = _templated_instance().get_decl_str(
+        key, _templated_args_with_suffixes(list(args))
+    )
     if result is None:
         return None
     name, cdecl = result
@@ -2677,9 +2735,10 @@ def templated_apply(key: str, args: list) -> bool:
     """
     _require_ida()
     template = _templated_instance()
-    if template.get_decl_str(key, list(args)) is None:
+    expanded = _templated_args_with_suffixes(list(args))
+    if template.get_decl_str(key, expanded) is None:
         return False
-    template.set_type(key, list(args))
+    template.set_type(key, expanded)
     return True
 
 

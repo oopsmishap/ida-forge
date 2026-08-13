@@ -144,9 +144,15 @@ def apply_new_field(struct_tinfo, offset: int, idx: int, declaration: str) -> bo
     udt_member = ida_typeinf.udt_member_t()
 
     struct_tinfo.get_udt_details(udt_data)
-    udt_member.offset = offset * 8
+    struct_name = struct_tinfo.get_type_name() or struct_tinfo.dstr()
+
+    # IDA 9.x keeps udt member offsets in BYTES (the pre-9 bit convention
+    # lands every member 8x out and silently fails the gap math — eval
+    # review round 2 §3.2: create_field returned True/False with no
+    # persisted change).
+    udt_member.offset = offset
     struct_tinfo.find_udt_member(udt_member, ida_typeinf.STRMEM_OFFSET)
-    gap_size = udt_member.size // 8
+    gap_size = udt_member.size
 
     gap_leftover = gap_size - idx - field_size
 
@@ -166,7 +172,7 @@ def apply_new_field(struct_tinfo, offset: int, idx: int, declaration: str) -> bo
         )
 
     udt_member = ida_typeinf.udt_member_t()
-    udt_member.offset = offset * 8 + idx
+    udt_member.offset = offset + idx
     udt_member.name = field_name
     udt_member.type = field_tinfo
     udt_member.size = field_size
@@ -177,10 +183,32 @@ def apply_new_field(struct_tinfo, offset: int, idx: int, declaration: str) -> bo
         udt_data.insert(iterator, create_udt_padding_member(offset, idx))
 
     struct_tinfo.create_udt(udt_data, ida_typeinf.BTF_STRUCT)
-    struct_tinfo.set_numbered_type(
-        ida_typeinf.get_idati(),
-        struct_tinfo.get_ordinal(),
-        ida_typeinf.BTF_STRUCT,
-        struct_tinfo.dstr(),
+
+    # Commit through the same delete+re-file path the vtable importer uses
+    # (members.py import_to_structures — live-proven on 9.4);
+    # ``set_numbered_type``'s argument shape drifted across versions, so
+    # the in-memory udt is serialized to a full cdecl instead.
+    import idaapi as _idaapi
+
+    cdecl = _idaapi.print_tinfo(
+        None,
+        4,
+        5,
+        _idaapi.PRTYPE_MULTI | _idaapi.PRTYPE_TYPE | _idaapi.PRTYPE_SEMI,
+        struct_tinfo,
+        struct_name,
+        None,
     )
+    if not cdecl:
+        log_error("Failed to serialize the updated struct declaration", True)
+        return False
+    previous_ordinal = _idaapi.get_type_ordinal(_idaapi.cvar.idati, struct_name)
+    if previous_ordinal:
+        _idaapi.del_numbered_type(_idaapi.cvar.idati, previous_ordinal)
+        ordinal = _idaapi.idc_set_local_type(previous_ordinal, cdecl, _idaapi.PT_TYP)
+    else:
+        ordinal = _idaapi.idc_set_local_type(-1, cdecl, _idaapi.PT_TYP)
+    if not ordinal:
+        log_error(f"Failed to re-file {struct_name} after field insert", True)
+        return False
     return True

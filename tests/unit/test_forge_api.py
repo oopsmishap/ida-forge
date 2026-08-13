@@ -1832,3 +1832,83 @@ def test_e6_inverse_if_skips_else_less_ifs(monkeypatch):
     monkeypatch.setattr(hexrays_mod, "decompile", fake_decompile, raising=False)
 
     assert forge_api.inverse_if(0x140001000, 0x4010) is False
+
+
+# ---------------------------------------------------------------------------
+# Round-2 review regressions (2026-08-13)
+# ---------------------------------------------------------------------------
+
+def test_rename_ea_renames_function_or_global(monkeypatch):
+    """Round-2 request #1: the naming-core verb — ida_name.set_name with
+    SN_NOCHECK semantics, loud failure."""
+    import ida_name
+
+    calls = []
+    monkeypatch.setattr(
+        ida_name,
+        "set_name",
+        lambda ea, name, flags: calls.append((ea, name, flags)) or True,
+        raising=False,
+    )
+    monkeypatch.setattr(ida_name, "SN_NOCHECK", 0x10, raising=False)
+
+    result = forge_api.rename_ea(0x140001000, "run_struct_sections")
+
+    assert result == {"ok": True, "ea": 0x140001000, "name": "run_struct_sections"}
+    assert calls == [(0x140001000, "run_struct_sections", 0x10)]
+
+
+def test_rename_ea_fails_loudly(monkeypatch):
+    import ida_name
+
+    monkeypatch.setattr(ida_name, "set_name", lambda *args: False, raising=False)
+    monkeypatch.setattr(ida_name, "SN_NOCHECK", 0x10, raising=False)
+
+    result = forge_api.rename_ea(0x140001000, "dup_name")
+
+    assert result["ok"] is False
+    assert "dup_name" in result["error"]
+
+
+def test_templated_args_with_suffixes_synthesize_names():
+    assert forge_api._templated_args_with_suffixes(["u32"]) == ["u32", "u32"]
+    assert forge_api._templated_args_with_suffixes(["char *", "u32"]) == [
+        "char *",
+        "char__",
+        "u32",
+        "u32",
+    ]
+    assert forge_api._templated_args_with_suffixes([]) == []
+
+
+def test_templated_decl_expands_args_for_multi_token_keys(monkeypatch):
+    """Round-2 §3.5: std::vector<T> needs (type, suffix) pairs; the facade
+    accepts plain type args and synthesizes the suffix."""
+    from forge.features.templated_types.templated_types import TemplatedTypes
+
+    seen = []
+
+    class _FakeTemplate(TemplatedTypes):
+        def get_decl_str(self, key, args):
+            seen.append((key, args))
+            return ("std_vector_u32", "struct std_vector_u32 { u32 *_Myfirst; };")
+
+    monkeypatch.setattr(forge_api, "_templated_instance", lambda: _FakeTemplate())
+
+    result = forge_api.templated_decl("std::vector<T>", ["u32"])
+
+    assert result == {
+        "name": "std_vector_u32",
+        "cdecl": "struct std_vector_u32 { u32 *_Myfirst; };",
+    }
+    assert seen == [("std::vector<T>", ["u32", "u32"])]
+
+
+def test_nudge_members_unknown_offsets_are_loud(monkeypatch):
+    forge_api.create_structure("DemoNode")
+    forge_api.add_member("DemoNode", 0x0, "u32", name="tag")
+
+    result = forge_api.nudge_members("DemoNode", [0x18], -0x20)
+
+    assert result["ok"] is False
+    assert "0x18" in result["error"]
