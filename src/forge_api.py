@@ -25,6 +25,8 @@ import importlib.util
 import inspect
 import sys
 
+from forge.api.store import catalog
+
 __version__ = "0.1.0"
 
 __all__ = [
@@ -48,12 +50,16 @@ __all__ = [
     "get_structure",
     "guess_allocation",
     "help",
+    "import_types",
     "imports",
     "inverse_if",
     "is_type",
     "link_child",
     "named_types",
     "nudge_members",
+    "push_all",
+    "push_type",
+    "refresh_types",
     "remove_members",
     "remove_structure",
     "rename_local",
@@ -142,16 +148,35 @@ def api(*, group: str, returns: str, example: str):
 # headless structure store (mirrors structure_form.structures, isolated)
 # --------------------------------------------------------------------------- #
 class _State:
-    """Mutable holder for the headless store (functions never need `global`)."""
+    """Mutable holder for the headless store (functions never need `global`).
+
+    ``structures`` is the shared :class:`StructureCatalog` (I.28) — the same
+    objects the GUI Structure Builder form sees. ``current`` delegates to the
+    catalog's current selection so persisted selections survive reloads.
+    """
 
     def __init__(self):
-        self.structures: dict = {}
-        self.current: str | None = None
+        self.structures = catalog
         self.templated = None
+
+    @property
+    def current(self) -> str | None:
+        return catalog.current
+
+    @current.setter
+    def current(self, value: str | None) -> None:
+        catalog.current = value
 
 
 _state = _State()
 _structures = _state.structures
+
+
+def _mark_dirty() -> None:
+    """Persist the shared catalog after an in-place store mutation."""
+    from forge.api.store import catalog
+
+    catalog._mark_dirty()
 
 
 def _resolve_structure(structure_name: str | None = None, *, required: bool = True):
@@ -276,14 +301,7 @@ def _copy_duplicate_child_relationships(source, duplicate, structures: dict) -> 
 
 
 def _unique_structure_name(base_name: str) -> str:
-    if base_name not in _structures:
-        return base_name
-    copy_index = 2
-    candidate = f"{base_name} Copy"
-    while candidate in _structures:
-        candidate = f"{base_name} Copy {copy_index}"
-        copy_index += 1
-    return candidate
+    return catalog.unique_name(base_name)
 
 
 def _ensure_placeholder_type(store_name: str) -> bool:
@@ -987,13 +1005,20 @@ def structures() -> list[str]:
     example="forge_api.clear_structures()",
 )
 def clear_structures() -> None:
-    """Remove every structure from the headless store (not from the IDB).
+    """Remove every structure from the shared store (not from the IDB).
 
-    Returns:
-        None.
+    Also drops the persisted catalog so a cleared session does not resurrect
+    stale structures on the next load. Returns None.
     """
-    _structures.clear()
-    _state.current = None
+    catalog.clear()
+    try:
+        from forge.api.storage import Storage
+
+        Storage("Structures").kill()
+    except Exception as exc:  # noqa: BLE001 — storage may be unavailable headless
+        from forge.util.logging import log_warning
+
+        log_warning(f"could not drop persisted structure catalog: {exc}")
 
 
 @api(
@@ -1169,6 +1194,7 @@ def add_member(
     target.add_member(member)
     result = _to_member_dict(member)
     result["collision"] = target.has_collision(target.members.index(member))
+    _mark_dirty()
     return result
 
 
@@ -1191,6 +1217,7 @@ def remove_members(structure: str | None = None, offsets: list = ()) -> None:
         if member.offset in offsets:
             indices.append(index)
     target.remove_members(indices)
+    _mark_dirty()
 
 
 @api(
@@ -1246,13 +1273,14 @@ def set_member(
     target.refresh_collisions()
     result = _to_member_dict(member)
     result["collision"] = target.has_collision(target.members.index(member))
+    _mark_dirty()
     return result
 
 
 @api(
     group="structures",
     returns="dict",
-    example='m = forge_api.link_child("Parent", 0x10, "Child")',
+    example='l = forge_api.link_child("Recovered", 0x10, "ChildStruct")',
 )
 def link_child(
     structure: str | None = None,
@@ -1294,6 +1322,7 @@ def link_child(
         relation_kind="pointer",
     )
     child.add_parent_relationship(relationship)
+    _mark_dirty()
     return _to_member_dict(member)
 
 
@@ -1348,6 +1377,7 @@ def nudge_members(
         target.refresh_collisions()
         return {"ok": False, "error": "would overlap a non-selected member"}
 
+    _mark_dirty()
     return {"ok": True}
 
 
@@ -1368,6 +1398,7 @@ def auto_resolve(structure: str | None = None) -> dict:
     """
     target = _resolve_structure(structure)
     disabled = target.auto_resolve()
+    _mark_dirty()
     return {"ok": True, "disabled": [_to_member_dict(m) for m in disabled]}
 
 
@@ -1477,6 +1508,7 @@ def to_vtable(structure: str | None = None, offset: int = 0, address: int = 0) -
     vtable.comment = getattr(member, "comment", "")
     vtable.name = getattr(member, "name", "") or vtable.name
     target.add_member(vtable)
+    _mark_dirty()
     return _to_member_dict(vtable)
 
 
@@ -1537,6 +1569,267 @@ def vtable_name(address: int) -> dict:
         }
     except (AssertionError, AttributeError, TypeError, ValueError) as exc:
         return {"ok": False, "error": f"no vtable at {hex(address)}: {exc}"}
+
+
+# --------------------------------------------------------------------------- #
+# type-library mirror (I.27)
+# --------------------------------------------------------------------------- #
+def _mirror_store():
+    from forge.api.storage import Storage
+
+    return Storage("TypeMirror")
+
+
+def _structure_member_hash(structure) -> str:
+    """sha1 over the store structure's sorted member rows (I.27 delta)."""
+    import hashlib as _hashlib
+
+    rows = []
+    for member in structure.members:
+        rows.append(
+            (
+                member.offset,
+                getattr(member, "name", ""),
+                _member_type_str(member) or "",
+                getattr(member, "size", None),
+                getattr(member, "enabled", True),
+            )
+        )
+    return _hashlib.sha1(repr(sorted(rows)).encode("utf-8")).hexdigest()  # noqa: S324 — change-detection digest, not security
+
+
+def _idb_udt_snapshot(name: str) -> tuple[str | None, list]:
+    """The IDB named UDT's member rows as ``(hash, rows)``; ``(None, [])``
+    when ``name`` is not a known UDT."""
+    import hashlib as _hashlib
+
+    import ida_typeinf
+
+    idati = ida_typeinf.get_idati()
+    tinfo = ida_typeinf.tinfo_t()
+    if not tinfo.get_named_type(idati, name) or not tinfo.is_udt():
+        return None, []
+    udt = ida_typeinf.udt_type_data_t()
+    if not tinfo.get_udt_details(udt):
+        return None, []
+    rows = []
+    for member in udt:
+        member_type = None
+        try:
+            member_type = member.type.dstr()
+        except Exception:  # noqa: BLE001 — degraded udt handles
+            member_type = ""
+        rows.append((member.offset, getattr(member, "name", ""), member_type))
+    digest = _hashlib.sha1(repr(sorted(rows)).encode("utf-8")).hexdigest()  # noqa: S324 — change-detection digest, not security
+    return digest, rows
+
+
+@api(
+    group="types",
+    returns="dict",
+    example='r = forge_api.import_types("World"); r["imported"]',
+)
+def import_types(pattern: str | None = None) -> dict:
+    """Import the database's local (non-lib) UDTs into the shared catalog.
+
+    Scans the local til for struct-like types that are NOT part of the base
+    til (system headers) and NOT auto-generated names (contain ``::``);
+    each missing catalog entry becomes a store structure with members mapped
+    from the IDB type (provenance ``kind="imported"``). Already-present
+    names are reported under ``skipped`` — importing never merges.
+
+    Returns:
+        ``{"imported": [names], "skipped": [names]}``.
+    """
+    _require_ida()
+    import ida_typeinf
+
+    from forge.api.structure import Structure
+
+    idati = ida_typeinf.get_idati()
+    base_til = ida_typeinf.get_base_til()
+    imported = []
+    skipped = []
+    seen = set()
+    for ordinal in range(ida_typeinf.get_ordinal_count(idati)):
+        name = ida_typeinf.get_numbered_type_name(idati, ordinal)
+        if not name or name in seen:
+            continue
+        seen.add(name)
+        if "::" in name:
+            continue
+        if pattern and pattern.casefold() not in name.casefold():
+            continue
+        tinfo = ida_typeinf.tinfo_t()
+        if not tinfo.get_numbered_type(idati, ordinal) or not tinfo.is_udt():
+            continue
+        base = ida_typeinf.tinfo_t()
+        if base is not None and base.get_named_type(base_til, name):
+            continue
+        if name in catalog:
+            skipped.append(name)
+            continue
+
+        structure = Structure(name)
+        structure.set_provenance(kind="imported")
+        catalog[name] = structure
+        udt = ida_typeinf.udt_type_data_t()
+        if tinfo.get_udt_details(udt):
+            for member in sorted(udt, key=lambda m: getattr(m, "offset", 0)):
+                member_type = ""
+                try:
+                    member_type = member.type.dstr()
+                except Exception:  # noqa: BLE001 — degraded udt handles
+                    member_type = "u64"
+                add_member(
+                    name,
+                    getattr(member, "offset", 0),
+                    member_type or "u64",
+                    name=getattr(member, "name", "") or None,
+                )
+        imported.append(name)
+    return {"imported": imported, "skipped": skipped}
+
+
+@api(
+    group="types",
+    returns="bool",
+    example='ok = forge_api.push_type("World")',
+)
+def push_type(name: str) -> bool:
+    """Push one store structure into the IDB as a type (delta sync).
+
+    Recreates the IDB type (``create_type(..., overwrite=True)``) when it is
+    missing or its members differ from the store structure, then records
+    ``{ordinal, hash, provenance}`` in the ``TypeMirror`` baseline. A
+    structure already in sync is a no-op. Returns False when the structure is
+    unknown or the type write failed.
+
+    Returns:
+        bool.
+    """
+    import dataclasses as _dataclasses
+
+    _require_ida()
+    target = _resolve_structure(name, required=False)
+    if target is None:
+        return False
+    current_hash = _structure_member_hash(target)
+    _, idb_rows = _idb_udt_snapshot(name)
+    store_rows = [
+        (member.offset, getattr(member, "name", ""), _member_type_str(member) or "")
+        for member in target.members
+        if getattr(member, "enabled", True)
+    ]
+    if sorted(idb_rows) != sorted(store_rows):
+        result = create_type(name, overwrite=True)
+        if not result.get("ok", False):
+            return False
+    try:
+        import ida_typeinf
+
+        ordinal = ida_typeinf.get_type_ordinal(ida_typeinf.get_idati(), name)
+        provenance = target.provenance
+        if not isinstance(provenance, dict):
+            provenance = _dataclasses.asdict(provenance)
+        _mirror_store()[name] = {
+            "ordinal": ordinal,
+            "hash": current_hash,
+            "provenance": provenance,
+        }
+    except Exception as exc:  # noqa: BLE001 — mirror is a cache, never fatal
+        from forge.util.logging import log_warning
+
+        log_warning(f"could not update TypeMirror baseline for {name}: {exc}")
+    return True
+
+
+@api(
+    group="types",
+    returns="dict",
+    example='r = forge_api.push_all(); r["pushed"]',
+)
+def push_all() -> dict:
+    """Push every catalog structure into the IDB (see :func:`push_type`).
+
+    Returns:
+        ``{"pushed": [names], "failed": {name: error}}``.
+    """
+    _require_ida()
+    pushed = []
+    failed = {}
+    for name in list(catalog):
+        try:
+            if push_type(name):
+                pushed.append(name)
+            else:
+                failed[name] = "type write failed or unknown structure"
+        except Exception as exc:  # noqa: BLE001 — one bad type must not stop the rest
+            failed[name] = str(exc)
+    return {"pushed": pushed, "failed": failed}
+
+
+@api(
+    group="types",
+    returns="dict",
+    example='r = forge_api.refresh_types(); r["updated"]',
+)
+def refresh_types() -> dict:
+    """Pull IDB changes back into catalog structures (type-library mirror).
+
+    For every baseline entry whose current IDB member layout differs,
+    re-import members into the store structure: update the types of members
+    whose offset matches (keeping their names), add new members, never
+    delete. Updates the baseline hash afterwards.
+
+    Returns:
+        ``{"updated": [names], "unchanged": [names]}``.
+    """
+    _require_ida()
+    from forge.api.members import Member, parse_user_tinfo
+    from forge.api.structure import Structure
+
+    updated = []
+    unchanged = []
+    baseline = {}
+    try:
+        baseline = dict(_mirror_store().items())
+    except Exception as exc:  # noqa: BLE001 — empty baseline on storage failure
+        from forge.util.logging import log_warning
+
+        log_warning(f"could not read TypeMirror baseline: {exc}")
+    for name, entry in baseline.items():
+        idb_hash, idb_rows = _idb_udt_snapshot(name)
+        if idb_hash is None or idb_hash == entry.get("hash"):
+            unchanged.append(name)
+            continue
+        structure = catalog.get(name)
+        if structure is None:
+            structure = Structure(name)
+            catalog[name] = structure
+        for offset, _member_name, member_type in idb_rows:
+            existing = structure.get_member_by_offset(offset)
+            tinfo = parse_user_tinfo(member_type or "u64")
+            if tinfo is None:
+                tinfo = parse_user_tinfo("u64")
+            if existing is not None:
+                # update the type in place; keep the store's name
+                existing.tinfo = tinfo
+            else:
+                structure.add_member(
+                    Member(offset, tinfo, None, 0)
+                )
+        structure.refresh_collisions()
+        entry["hash"] = idb_hash
+        try:
+            _mirror_store()[name] = entry
+        except Exception as exc:  # noqa: BLE001 — cache write is best-effort
+            from forge.util.logging import log_warning
+
+            log_warning(f"could not refresh TypeMirror baseline for {name}: {exc}")
+        updated.append(name)
+    _mark_dirty()
+    return {"updated": updated, "unchanged": unchanged}
 
 
 # --------------------------------------------------------------------------- #
@@ -1752,6 +2045,7 @@ def deep_scan(
         max_depth=max_depth,
     )
     visitor.process()
+    _mark_dirty()
     return _scan_result(target)
 
 
@@ -1804,6 +2098,7 @@ def shallow_scan(
                 }
     visitor = NewShallowScanVisitor(cfunc, target.main_offset, obj, target)
     visitor.process()
+    _mark_dirty()
     return _scan_result(target)
 
 
@@ -2259,7 +2554,9 @@ def create_field(
     tinfo = ida_typeinf.tinfo_t()
     if not tinfo.get_named_type(ida_typeinf.get_idati(), struct_name):
         raise ForgeApiError(f"no type {struct_name}")
-    return apply_new_field(tinfo, offset, idx, declaration)
+    result = apply_new_field(tinfo, offset, idx, declaration)
+    _mark_dirty()
+    return result
 
 
 @api(

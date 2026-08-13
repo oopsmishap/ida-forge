@@ -77,6 +77,15 @@ class _DummyTInfo:
     def get_named_type(self, *args, **kwargs):
         return True
 
+    def get_numbered_type(self, *args, **kwargs):
+        return False
+
+    def is_udt(self):
+        return False
+
+    def get_udt_details(self, *args, **kwargs):
+        return False
+
     def dstr(self):
         return self._name
 
@@ -140,6 +149,14 @@ _stub_module(
     BTF_UINT32=0,
     BTF_UINT64=0,
     get_idati=lambda: object(),
+    get_base_til=lambda: object(),
+    get_ordinal_count=lambda idati: 0,
+    get_numbered_type_name=lambda idati, ordinal: "",
+    get_type_ordinal=lambda idati, name: -1,
+    print_tinfo=lambda *args, **kwargs: 0,
+    PRTYPE_MULTI=0,
+    PRTYPE_TYPE=0,
+    PRTYPE_SEMI=0,
     parse_decl=lambda *args, **kwargs: False,
     import_type=lambda *args, **kwargs: 0,
     PT_TYP=0,

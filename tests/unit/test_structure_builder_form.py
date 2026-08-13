@@ -5,6 +5,8 @@ import io
 from importlib import import_module
 from types import SimpleNamespace
 
+import pytest
+
 from forge.api.structure import Structure
 
 hexrays_api = import_module("forge.api.hexrays")
@@ -16,6 +18,19 @@ scanner_api.NewShallowScanVisitor = type("NewShallowScanVisitor", (), {})
 form_module = import_module("forge.features.structure_builder.form")
 child_scan_module = import_module("forge.features.structure_builder.child_scan")
 structure_module = import_module("forge.api.structure")
+
+
+@pytest.fixture(autouse=True)
+def _fresh_catalog():
+    """The form now shares the process-wide catalog (I.28); each test starts
+    from an empty, event-free catalog."""
+    from forge.api.store import catalog
+
+    catalog.events.clear()
+    catalog.clear()
+    yield
+    catalog.events.clear()
+    catalog.clear()
 
 
 class _FakeLineEdit:
@@ -671,7 +686,7 @@ def test_create_structure_treats_none_as_cancel(monkeypatch):
     created = structure_form.create_structure(None)
 
     assert created is None
-    assert structure_form.structures == {}
+    assert list(structure_form.structures) == []
     assert structure_form.current_structure is None
 
 
@@ -695,7 +710,7 @@ def test_prompt_create_structure_treats_none_as_cancel(monkeypatch):
     created = structure_form.prompt_create_structure()
 
     assert created is None
-    assert structure_form.structures == {}
+    assert list(structure_form.structures) == []
     assert structure_form.current_structure is None
 
 
@@ -709,24 +724,24 @@ def test_prompt_create_structure_auto_names_blank_and_whitespace(monkeypatch):
     second = structure_form.prompt_create_structure()
 
     assert first is not None
-    assert first.name == "auto_struct_001"
+    assert first.name == "Structure"
     assert first.is_auto_named is True
     assert second is not None
-    assert second.name == "auto_struct_002"
+    assert second.name == "Structure Copy"
     assert second.is_auto_named is True
-    assert list(structure_form.structures) == ["auto_struct_001", "auto_struct_002"]
+    assert list(structure_form.structures) == ["Structure", "Structure Copy"]
     assert structure_form.current_structure is second
 
 
 def test_create_structure_skips_taken_auto_names_deterministically(monkeypatch):
     structure_form = _make_form(monkeypatch)
-    structure_form.create_structure("auto_struct_001")
+    structure_form.create_structure("Structure")
     structure_form.create_structure("manual")
 
     created = structure_form.create_structure("  ")
 
     assert created is not None
-    assert created.name == "auto_struct_002"
+    assert created.name == "Structure Copy"
     assert created.is_auto_named is True
     assert structure_form.structures["manual"].is_auto_named is False
 
@@ -747,7 +762,7 @@ def test_structure_renamed_clears_auto_named_flag(monkeypatch):
 
     assert auto_named.name == "Inventory"
     assert auto_named.is_auto_named is False
-    assert "auto_struct_001" not in structure_form.structures
+    assert "Structure" not in structure_form.structures
     assert structure_form.structures["Inventory"] is auto_named
     assert fake_filter.cleared is True
 
@@ -1172,7 +1187,7 @@ def test_scan_child_structure_auto_creates_child_and_records_metadata(monkeypatc
 
     structure_form.scan_child_structure()
 
-    child = structure_form.structures["auto_struct_001"]
+    child = structure_form.structures["Structure"]
     assert structure_form.current_structure is child
     assert child.is_auto_named is True
     assert child.main_offset == 0x30
@@ -1536,7 +1551,7 @@ def test_scan_child_structure_rolls_back_new_child_when_scan_finds_nothing(
 
     structure_form.scan_child_structure()
 
-    assert "auto_struct_001" not in structure_form.structures
+    assert "Structure" not in structure_form.structures
     assert structure_form.current_structure is parent
     assert parent.child_relationships == []
     assert member.linked_child_structure_name is None
@@ -2632,7 +2647,7 @@ def test_scan_child_structure_uses_absolute_member_origin(monkeypatch):
 
     structure_form.scan_child_structure()
 
-    child = structure_form.structures["auto_struct_001"]
+    child = structure_form.structures["Structure"]
     assert child.main_offset == 0xD08
 
 
@@ -3029,16 +3044,19 @@ def test_member_child_link_normalization_clears_stale_links(monkeypatch):
 
 
 def test_make_unique_structure_name_copy_collision_loop(monkeypatch):
-    """G10: 'Copy N' naming increments past every existing collision."""
+    """G10/I.28: catalog.unique_name 'Copy N' naming increments past every
+    existing collision."""
+    from forge.api.store import catalog as _catalog
+
     structure_form = _make_form(monkeypatch)
     for name in ("Foo", "Foo Copy", "Foo Copy 2", "Foo Copy 3"):
         structure_form.create_structure(name)
 
-    assert structure_form._make_unique_structure_name("Foo") == "Foo Copy 4"
-    assert structure_form._make_unique_structure_name("Bar") == "Bar"
+    assert _catalog.unique_name("Foo") == "Foo Copy 4"
+    assert _catalog.unique_name("Bar") == "Bar"
 
     structure_form.create_structure("Foo Copy 5")
-    assert structure_form._make_unique_structure_name("Foo") == "Foo Copy 4"
+    assert _catalog.unique_name("Foo") == "Foo Copy 4"
 
 
 def test_propagate_child_scan_seed_unresolvable_parent_arg_is_noop(monkeypatch):
@@ -3205,15 +3223,20 @@ def test_nudge_into_collision_with_unselected_member_is_rejected(monkeypatch):
 
 
 def test_on_close_clears_structure_models(monkeypatch):
-    """T4.4: closing the form drops the in-memory scan models."""
+    """T4.4/I.28: closing the form drops the cached UI/scan state but keeps
+    the shared catalog — headless structures outlive the form."""
     structure_form = _make_form(monkeypatch)
     structure_form.create_structure("Foo")
     structure_form.current_structure = structure_form.structures["Foo"]
+    structure_form.parent = object()
+    structure_form.ui = SimpleNamespace(tbl_structure=object(), tree_structures=object())
 
     structure_form.OnClose(None)
 
-    assert structure_form.structures == {}
+    assert list(structure_form.structures) == ["Foo"]
     assert structure_form.current_structure is None
+    assert structure_form.ui is None
+    assert structure_form.parent is None
 
 
 def test_configure_table_edit_triggers_combine_int_values(monkeypatch):

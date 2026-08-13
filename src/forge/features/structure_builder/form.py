@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import copy
 import csv
 import io
@@ -18,6 +19,7 @@ from forge.api.hexrays import (
 )
 from forge.api.members import AbstractMember, Member, VirtualTable, parse_user_tinfo
 from forge.api.scan_object import ScanObject
+from forge.api.store import catalog
 from forge.api.structure import Structure, StructureRelationship
 from forge.api.ui import set_row_background_color, set_row_foreground_color
 from forge.features.structure_builder.child_scan import ChildScanMixin
@@ -61,11 +63,14 @@ class StructureBuilderForm(ChildScanMixin, ida_kernwin.PluginForm):
         super().__init__()
         self.parent = None
         self.ui = None
-        self.structures: dict[str, Structure] = {}
+        # I.28: the GUI form and the headless forge_api share one catalog —
+        # a structure created headless shows up in the form and vice versa.
+        self.structures = catalog
         self.current_structure: Structure | None = None
         self.layout = None
         self._shortcut_actions: list[QtGui.QAction] = []
         self._last_table_selection_signature: tuple | None = None
+        catalog.events.append(self.reload_structure_list)
     def show(self):
         if self.ui is not None and not self._qt_widget_alive(self.ui):
             self._reset_ui_state()
@@ -92,10 +97,13 @@ class StructureBuilderForm(ChildScanMixin, ida_kernwin.PluginForm):
 
         Stale structures from a previous DB session must not survive a close
         or plugin reload — the relaunched form starts from an empty scanner.
+        The shared catalog is deliberately NOT cleared: headless structures
+        outlive the form (I.28).
         """
-        self.structures.clear()
         self.current_structure = None
         self._reset_ui_state()
+        with contextlib.suppress(ValueError):
+            catalog.events.remove(self.reload_structure_list)
 
     def _reset_ui_state(self) -> None:
         self.parent = None
@@ -702,24 +710,8 @@ class StructureBuilderForm(ChildScanMixin, ida_kernwin.PluginForm):
         name = ida_kernwin.ask_str("", ida_kernwin.HIST_IDENT, "Enter structure name:")
         self.create_structure(name)
 
-    def _make_unique_structure_name(self, base_name: str) -> str:
-        if base_name not in self.structures:
-            return base_name
-
-        copy_index = 2
-        candidate = f"{base_name} Copy"
-        while candidate in self.structures:
-            candidate = f"{base_name} Copy {copy_index}"
-            copy_index += 1
-        return candidate
-
     def _next_auto_structure_name(self) -> str:
-        index = 1
-        while True:
-            candidate = f"auto_struct_{index:03d}"
-            if candidate not in self.structures:
-                return candidate
-            index += 1
+        return catalog.unique_name("Structure")
 
     def _clone_member(self, member: AbstractMember):
         cloned_member = copy.copy(member)
@@ -813,7 +805,7 @@ class StructureBuilderForm(ChildScanMixin, ida_kernwin.PluginForm):
             return
 
         source_structure = self.current_structure
-        new_name = self._make_unique_structure_name(source_structure.name)
+        new_name = catalog.unique_name(source_structure.name)
         cloned_structure = Structure(new_name)
         cloned_structure.main_offset = source_structure.main_offset
         cloned_structure.members = [
@@ -1624,6 +1616,10 @@ class StructureBuilderForm(ChildScanMixin, ida_kernwin.PluginForm):
         if not self.current_structure.rename_created_type(old_name, name):
             return
 
+        # clear the filter before the catalog mutations: each one fires the
+        # reload callback, which re-reads the (possibly reset) UI state
+        if self.ui is not None:
+            self.ui.input_filter.clear()
         self.structures[name] = self.current_structure
         del self.structures[old_name]
         self.current_structure.name = name
@@ -1631,7 +1627,6 @@ class StructureBuilderForm(ChildScanMixin, ida_kernwin.PluginForm):
         for structure in self.structures.values():
             structure.rename_relationship_references(old_name, name)
 
-        self.ui.input_filter.clear()
         self.reload_structure_list()
         if not self._select_structure_in_tree(name):
             self.set_structure(name)
