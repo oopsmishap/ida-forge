@@ -400,21 +400,41 @@ class Member(AbstractMember):
     def _resolve_pack_tinfo(self) -> ida_typeinf.tinfo_t | None:
         """The tinfo to serialize for this member at pack time.
 
-        E4 (eval review 2026-08-13): members created from a declaratio
+        E4 (eval review 2026-08-13): members created from a declaration
         string re-parse it fresh on every pack. The overwrite flow (and
         the vtable importer) deletes + recreates types, freeing the ordinal
         a stored tinfo points at — a stale handle then serializes as a
         bare ``#NN *`` in the committed cdecl and breaks ``push_type``.
         Re-parsing keeps the member's self/cross references on the current
-        type table. Returns None when the stored tinfo must be used.
+        type table. Members persisted before ``decl_src`` existed (no
+        source string) heal through the ordinal: ``#NN *`` resolves to the
+        ordinal's current name and re-parses. Returns None when the stored
+        tinfo must be used as-is.
         """
         decl_src = getattr(self, "decl_src", None)
-        if not decl_src:
-            return None
+        if decl_src:
+            try:
+                fresh = parse_user_tinfo(decl_src)
+                if fresh is not None:
+                    return fresh
+            except Exception as exc:  # noqa: BLE001 — degraded tils degrade to the stored handle
+                log_debug(f"decl_src re-parse failed for {decl_src!r}: {exc}")
         try:
-            return parse_user_tinfo(decl_src)
-        except Exception:  # noqa: BLE001 — degraded tils degrade to the stored handle
+            raw = self.tinfo.dstr()
+        except Exception:  # noqa: BLE001 — stub/degraded tinfo
             return None
+        ordinal_match = re.match(r"#(\d+)(?:\s+(.*))?$", raw or "")
+        if ordinal_match:
+            ordinal = int(ordinal_match.group(1))
+            suffix = ordinal_match.group(2) or ""
+            type_name = ida_typeinf.get_numbered_type_name(
+                ida_typeinf.get_idati(), ordinal
+            )
+            if type_name:
+                rebuilt = parse_user_tinfo(f"{type_name} {suffix}".rstrip())
+                if rebuilt is not None:
+                    return rebuilt
+        return None
 
     def get_udt_member(self, array_size: int = 0, offset: int = 0):
         udt_member = ida_typeinf.udt_member_t()

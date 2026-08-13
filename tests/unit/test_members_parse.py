@@ -191,6 +191,58 @@ def test_parse_vtable_name_falls_back_to_hex_name_when_unnamed(monkeypatch):
     assert name == "vtbl_140006128"
 
 
+def test_resolve_pack_tinfo_heals_ordinal_refs_without_decl_src(monkeypatch):
+    """E4 (2026-08-13): a member persisted before decl_src existed renders
+    as ``#NN *`` after the type table re-files — packing resolves the
+    ordinal to its current name and re-parses instead of serializing the
+    stale ref."""
+    from types import SimpleNamespace
+
+    healed = []
+
+    def _fake_parse(decl):
+        healed.append(decl)
+        return SimpleNamespace(dstr=lambda: decl)
+
+    monkeypatch.setattr(members, "parse_user_tinfo", _fake_parse, raising=False)
+    monkeypatch.setattr(
+        members.ida_typeinf,
+        "get_numbered_type_name",
+        lambda _til, ordinal: "KeyValuePair" if ordinal == 53 else "",
+        raising=False,
+    )
+
+    stale = members.Member.__new__(members.Member)
+    stale.offset = 0x10
+    stale.tinfo = SimpleNamespace(dstr=lambda: "#53 *")
+    resolved = stale._resolve_pack_tinfo()
+
+    assert healed == ["KeyValuePair *"]
+    assert resolved.dstr() == "KeyValuePair *"
+
+
+def test_resolve_pack_tinfo_prefers_decl_src(monkeypatch):
+    """E4: a fresh decl_src wins over the stored (possibly stale) tinfo."""
+    from types import SimpleNamespace
+
+    healed = []
+
+    def _fake_parse(decl):
+        healed.append(decl)
+        return SimpleNamespace(dstr=lambda: decl)
+
+    monkeypatch.setattr(members, "parse_user_tinfo", _fake_parse, raising=False)
+
+    stale = members.Member.__new__(members.Member)
+    stale.offset = 0x10
+    stale.tinfo = SimpleNamespace(dstr=lambda: "#53 *")
+    stale.decl_src = "KV *"
+    resolved = stale._resolve_pack_tinfo()
+
+    assert healed == ["KV *"]
+    assert resolved.dstr() == "KV *"
+
+
 def test_virtual_table_init_wires_origin_and_scanned_variable(monkeypatch):
     monkeypatch.setattr(
         members.VirtualTable, "populate_virtual_functions", lambda self: None
