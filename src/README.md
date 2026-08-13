@@ -1,16 +1,23 @@
-# ida-forge source package
+# forge
 
-The plugin's Python package, importable as `forge`.
+IDA Forge — decompiler-driven structure recovery for IDA Pro ≥ 9.0.
 
-- `api/` — IDA API wrappers, scan objects, structure model, decompiler
-  visitors/scanners.
-- `features/` — user-facing features (structure_builder, create_new_field,
-  convert_to_usercall, guess_allocation, swap_if, templated_types, menu).
-- `util/` — logging, reload, itanium mangling, C++ name sanitization, Qt
-  binding detection, config plumbing.
+Package layout:
 
-Entry point: `src/ida_forge_plugin.py` (registers `ida_forge_plugin_t`,
-exposes IDC accessors `forge_get_state` / `forge_set_state`).
+- `forge.plugin` — IDA plugin entry (`ida_forge_plugin.py`), IDC helpers,
+  action registry.
+- `forge.api` — engine: `structure.py` (Structure model + commit),
+  `store.py` (shared, netnode-persisted `StructureCatalog`), `storage.py`
+  (JSON+zlib netnodes), `scanner.py`/`visitor.py` (member extraction),
+  `scan_object.py`, `hexrays.py` (ctree helpers), `types.py`/`members.py`
+  (type mapping), `config.py`.
+- `forge.features` — feature modules (structure builder form/actions,
+  child scanning, guess allocation, templated types, swap_if,
+  create_new_field, convert_to_usercall).
+- `forge.util` — logging, Qt shims, naming helpers.
+- `forge_api.py` — flat headless facade over the above
+  (`forge_api.help()` lists every call; the catalog it writes is the same
+  one the structure-builder form reads).
 
-See the repo root `README.md` for feature list, install, and development
-instructions.
+Development: `python -m pytest -q` (suite stubs the `ida_*` modules) and
+`python -m ruff check src tests` must stay green.

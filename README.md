@@ -33,6 +33,25 @@ pointer members.
   family).
 - **Guess allocation** helpers, **Swap if/else** inversions, and
   **Templated types** generation.
+- **Headless forge_api facade** (2026-08) — a flat, self-describing API for
+  automation/LLM use (`forge_api.help()` catalogs every call):
+  - store + persistence: structures live in one shared
+    `StructureCatalog` (used by the GUI form and the facade alike) and are
+    written through to IDB netnodes (`Storage("Structures")`), so recovered
+    models survive plugin reloads and worker restarts;
+  - scanning: `deep_scan`/`shallow_scan`/`scan_global` with auto-created
+    store structures, root-type retyping (`root_type=`), and
+    `scan_from_allocation` — find the heap allocation feeding a variable
+    (`guess_allocation`, sizes folded from allocator args) and recover the
+    element layout in one call;
+  - type mirror: `import_types` / `push_type` / `push_all` /
+    `refresh_types` keep the store and IDA's local structs in sync
+    (custom structs only; baseline tracked in `Storage("TypeMirror")`);
+  - recon + edits: `function_info`/`callers_of`/`callees_of`,
+    `vtable_entries`/`vtable_name`, `imports`, `is_type`, `type_of`,
+    `apply_type(ea, decl)`, `set_func_proto`, `set_lvar_types`/
+    `rename_local`, `to_vtable`, `create_type(overwrite=True)` (ordinal
+    delete, distinct error strings), headless `finalize`.
 
 ## Installation
 

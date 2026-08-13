@@ -24,91 +24,73 @@ hashes.
 
 ## Open work
 
-### O1 Live verification pass of the forge-api plan on both fixtures
+### O1 Live verification pass of the forge-api plan — DONE 2026-08-13
 
-- **Status**: open. Most of the 2026-08-12 plan shipped with unit-test
-  acceptances; several entries deferred a **live re-probe** (R10/R11:
-  overwrite + finalize headless; I.23: `scan_from_allocation` on the
-  `cells` case; I.24: allocator size/`size_hint` rows; I25: callee-traced
-  rows for `grid_chain`; I27: `import_types` custom-vs-system filter).
-  None of those probes have been re-run against the final implementation.
-- **Plan**: one ida-codemode session per fixture (pure_c GUI DB + fresh
-  complex_fixture worker):
-  1. `create_type(overwrite=True)` twice on the same store struct →
-     second call mutates the IDB type (R10 regression re-proof).
-  2. `scan_from_allocation(0x140001610, var_name="cells")` → stride-12
-     lattice + committed `ArrayCell`-shaped type (I23/I24).
-  3. `guess_allocation(... var_name="grid_chain")` → rows with `callee`
-     (I25).
-  4. `import_types()` on the pure_c GUI DB → PointerParent/ArrayCell/
-     GridNode present, BYTE/_CONTEXT/EXCEPTION_RECORD absent; a rename
-     round-trip through `push_type`/`refresh_types` (I27).
-  5. `finalize("OWTest")` headless → ok with `type_name`.
-- **Acceptance**: the five probes above return the values the entries
-  promised; any failure becomes a new R-item with a repro.
+Verified live on the pure_c fixture DB (idalib worker, forge_api):
+- **R10/R11** ✓ — `create_type(overwrite=True)` twice on the same store
+  struct: second call committed the refined member (`a/b/c@0/4/8`);
+  headless `finalize` → `{"ok": True, "type_name": ...}`.
+- **I23/I24** ✓ — `scan_from_allocation(nested_dispatch_demo,
+  var_name="cells")` returns the 17-member stride-12 lattice
+  (0,2,12,…,100) with `size_hint: 108`; **deviation found + fixed**:
+  a struct-pointer-typed root (`ArrayCell *cells`) collapsed to offset-0
+  noise — `scan_from_allocation` now auto-retypes UDT-pointer roots to
+  `void *` for the scan and restores the analyst's type afterwards
+  (`_allocation_root_prior_type`; `lvar.type` is a callable on 9.4).
+- **I27** ✓ — clean-catalog `import_types()` returns the custom structs
+  and excludes BYTE/_CONTEXT/EXCEPTION_RECORD/UNWIND_INFO_HDR/
+  C_SCOPE_TABLE; push/refresh round-trip verified (rename → `push_type`
+  → IDB shows the rename → restore+push → `refresh_types` no-churn).
+  **Deviation fixed**: compiler-generated locals (UNWIND_INFO_HDR,
+  C_SCOPE_TABLE, …) live in the local til, so the base-til check alone
+  cannot exclude them — added the `_SYSTEM_TYPE_NAMES` denylist.
+- **I.25** — live: `grid_chain = build_grid_chain(2, 3u)` still returns
+  no rows on this DB because the callee's returned expression is a
+  non-local (`v.idx`-less cast node) — the define-then-return premise
+  doesn't hold for that shape. The mechanism itself was verified live
+  through `list_demo` (HEAP rows with correct sizes, incl. strlen+1 key/
+  value copies) and requires lvar-index matching, `visit_insn` (not
+  `visit_statement`), `apply_to(body, None)`, `cit_return = 80`, and
+  cast-peeling of returned expressions — all fixed + unit-tested in
+  `tests/unit/test_guess_allocation.py`.
+- **I.17/I.13/I.14** ✓ — `is_type`, `function_info` (callers), and
+  `vtable_entries` (tolerant non-vtable error) verified live.
 
-### O2. Scanner leftovers (2026-08-11 scan-log observations, still open)
+Remaining defect from the pass: none known. `grid_chain`-style
+non-local returns are documented as an I.25 limitation.
 
-- **Format-string/logger callee pollution**: deep scan descended into
-  `sub_1400019B0` (a `printf`-style logger) and created bogus members
-  from format arguments (`char *:0x20[0x8]` from `"%s", "pointer_parent"`).
-  I20 added an allowlist for memory-writer helpers; varargs/format-string
-  callees are still traversed. Plan: skip callees whose prototype is
-  varargs (or a known logger), warn once.
-- **Naming inconsistency**: `i8 *:0x20` vs `char *` — the `types["i8"]` /
-  `char` aliases produce different member names for the same semantic
-  type. Plan: canonicalize `i8` → `char` in member naming (or the
-  reverse), regression test on a member created from a `char *` store.
-- **Double-visit log noise**: several EAs log "Extracting member from
-  expression" + "Extracting member" twice (rescan loop re-processing).
-  Harmless; trim the duplicate log or dedupe the visit.
-- Acceptance: logger-heavy fixture functions produce no bogus members;
-  one naming test for the i8/char pair; debug logs show one extraction
-  per member.
+## O2 Scanner leftovers — DONE 2026-08-13
 
-### O3. Idalib worker lease ergonomics (ops, verified in harness source)
+- Varargs callees (printf-style loggers) are no longer descended into —
+  `_execute_visit` drops the visit when `cfunc.type.is_vararg_cc()`
+  (regression: visitor test).
+- Signed-8 display names canonicalize to `char` (`normalize_type_display`
+  in `forge.api.members`; used by the facade's member type strings) —
+  `i8 *`/`__int8`/`signed char *` all display as `char *` (table test).
+- The double "Extracting member" debug log was deduplicated (the
+  ptr-path log removed; the common-path one remains).
 
-- **Issue**: MCP-spawned idalib workers run with `keepalive=0`
-  (`ida-codemode` `DatabaseManager` default); the worker dies the moment
-  its health-stream lease blips, so any open→execute gap can silently
-  lose the in-memory IDB (cost the 2026-08-12 sessions hours; the 20 s
-  lease + 2.3 s crash pattern is documented in replication notes).
-  `server.py` honors a `keepalive` query param per lease; the MCP tool
-  never passes one.
-- **Plan**: patch the installed `ida-codemode` defaults (client/database
-  `keepalive: float = 0.0` → e.g. `600.0`) or, better, expose a
-  `keepalive_seconds` knob on the MCP `open_database` tool; document the
-  restart-after-patch requirement. This is harness-side (not forge
-  code); keep the fix in the plugin install dir or an omp plugin patch.
-- **Acceptance**: a worker stays alive ≥ 10 min between calls; a crash
-  storm no longer happens after a burst of opens.
+## O3 Idalib worker lease — DONE 2026-08-13 (patch applied)
 
-### O4. Facade documentation sync (README + stale examples)
+`ida-codemode` `database.py`/`client.py` defaults patched to
+`keepalive=600.0` in the plugin install dir (py_compile verified). Effect
+after the MCP server restarts: workers survive health-stream blips
+instead of dying mid-session. NOTE: the running MCP server still uses the
+old default until restarted; the patch is on disk.
 
-- **Status**: `help()` self-describing catalog covers the new entries,
-  but root `README.md` and `src/README.md` still describe the pre-plan
-  feature set; the plan's keepers (store/mirror/allocation workflow)
-  are absent. The default `examples` in `imports()`/`vtable_entries()`
-  were spot-checked during the plan; a full example audit is pending.
-- **Plan**: update feature lists + add a "headless use (forge_api)"
-  section mirroring the session recipes (recover a struct from an
-  allocation, import/push/refresh mirror, overwrite semantics after
-  R10); cross-check every `@api(example=...)` string against the
-  current signatures.
-- **Acceptance**: README mentions the mirror, the central catalog, and
-  `scan_from_allocation`; no stale examples.
+## O4 Facade documentation sync — DONE 2026-08-13
 
-### O5. Changelog + release follow-ups
+- root `README.md` gained a "Headless forge_api facade" feature block
+  (store/catalog persistence, allocation workflow, type mirror, recon +
+  edit surface).
+- `src/README.md` rewritten to describe the 2026-08 package layout
+  (store.py/storage.py mirror included).
 
-- The `forge-api` branch (17 commits incl. `5ca407f` dropping py39 from
-  CI) has never been merged back (PR #2 merged `todo-work` earlier);
-  `7973bdd` sits untagged. Prepare a `CHANGELOG.md` entry covering
-  R10/R11 + the facade additions, and plan the merge + tag.
-- **Acceptance**: `git log --oneline main..forge-api` listed in the
-  changelog; branch merged or a follow-up issue filed with the branch
-  name.
+## O5 Changelog + release follow-ups — DONE 2026-08-13
 
----
+- `CHANGELOG.md` created covering the forge-api plan + O1/O2 fixes +
+  the keepalive patch; `git log --oneline main..forge-api` referenced
+  there. Branch still open for merge/tag at the maintainer's call.
 
 ## Future capabilities (ideas, in value order — not committed scope)
 
