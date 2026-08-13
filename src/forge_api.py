@@ -188,6 +188,12 @@ def _allocation_root_prior_type(ea: int, var_name: str) -> str | None:
         if getattr(lvar, "name", None) != var_name:
             continue
         var_type = getattr(lvar, "type", None)
+        if callable(var_type):
+            # 9.4 exposes lvar_t.type as a method (O1 live finding).
+            try:
+                var_type = var_type()
+            except Exception:  # noqa: BLE001 — degraded tinfo
+                return None
         is_ptr = getattr(var_type, "is_ptr", None)
         get_pointed = getattr(var_type, "get_pointed_object", None)
         get_dstr = getattr(var_type, "dstr", None)
@@ -2682,7 +2688,7 @@ def scan_from_allocation(
         root_type=root_type,
     )
     if restore_type:
-        with contextlib.suppress(Exception):  # noqa: BLE001 — restore is best-effort
+        with contextlib.suppress(Exception):
             set_lvar_types(ea, {allocation["var"]: restore_type})
     members = scan_result.get("members", [])
 

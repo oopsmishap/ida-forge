@@ -85,13 +85,8 @@ class GuessAllocationVisitor(RecursiveUpwardsObjectVisitor):
 
             # match the ctree's return expressions to the var nodes they
             # return, then find the defining allocation assignment
-            ret_op = getattr(ctype, "ret", None)
             asg_op = getattr(ctype, "asg", None)
-            for item in getattr(cfunc, "treeitems", []) or []:
-                specific = getattr(item, "to_specific_type", None) or item
-                if ret_op is not None and getattr(specific, "op", None) != ret_op:
-                    continue
-                returned = getattr(specific, "x", None)
+            for returned in self._iter_returned_exprs(cfunc):
                 if returned is None:
                     continue
                 alloc_obj = self._find_allocator_assignment(cfunc, returned, asg_op)
@@ -108,6 +103,58 @@ class GuessAllocationVisitor(RecursiveUpwardsObjectVisitor):
             return None
         return None
 
+    @staticmethod
+    def _iter_returned_exprs(cfunc):
+        """Yield the expression of every ``return <expr>`` statement.
+
+        Same treeitems → ctree-visitor fallback as
+        :meth:`_iter_assignment_sites` (treeitems is empty on the live
+        9.4 build, O1 finding 2026-08-13).
+        """
+        # Returns are statements — the forge enum spells it ``cit_return``
+        # (80 on this build; older SDK docs say 78 — never hardcode, O1
+        # live finding 2026-08-13).
+        ret_op = (
+            getattr(ctype, "ret", None)
+            or getattr(ctype, "cit_ret", None)
+            or getattr(ctype, "cit_return", None)
+        )
+        treeitems = getattr(cfunc, "treeitems", None)
+        if treeitems:
+            for item in treeitems:
+                specific = getattr(item, "to_specific_type", None) or item
+                if ret_op is not None and getattr(specific, "op", None) == ret_op:
+                    yield getattr(specific, "x", None)
+            return
+
+        walker_cls = getattr(ida_hexrays, "ctree_visitor_t", None)
+        if walker_cls is None or ret_op is None:
+            return
+
+        class _ReturnWalker(walker_cls):
+            def __init__(self):
+                try:
+                    walker_cls.__init__(self, 0)
+                except TypeError:
+                    walker_cls.__init__(self, None)  # pragma: no cover — binding drift
+                self.returned = []
+
+            def visit_insn(self, insn):
+                # the binding hook for statements is visit_insn, not
+                # visit_statement (O1 live finding, 2026-08-13)
+                if getattr(insn, "op", None) == ret_op:
+                    self.returned.append(getattr(insn, "x", None))
+                return 0
+
+        walker = _ReturnWalker()
+        body = getattr(cfunc, "body", None)
+        if body is not None:
+            try:
+                walker.apply_to(body, None)
+            except Exception:  # noqa: BLE001 — walk is best-effort
+                return
+        yield from walker.returned
+
     def _find_allocator_assignment(self, cfunc, returned, asg_op):
         """The ``var = allocator(...)`` assignment feeding the returned value.
 
@@ -119,23 +166,71 @@ class GuessAllocationVisitor(RecursiveUpwardsObjectVisitor):
         """
         returned_idx = getattr(getattr(returned, "v", None), "idx", None)
         returned_ea = getattr(returned, "ea", None)
-        for item in getattr(cfunc, "treeitems", []) or []:
-            specific = getattr(item, "to_specific_type", None) or item
-            if getattr(specific, "op", None) != asg_op:
-                continue
-            target = getattr(specific, "x", None)
+        # `return (T *)root;` surfaces a cast node (v=None, ea=0) — peel so
+        # the var identity under the cast drives the match (O1 live, 2026-08-13).
+        while (
+            getattr(returned, "op", None) == getattr(ctype, "cast", None)
+            and getattr(returned, "x", None) is not None
+        ):
+            returned = returned.x
+            returned_idx = getattr(getattr(returned, "v", None), "idx", None)
+            returned_ea = getattr(returned, "ea", None) or returned_ea
+        for target, rhs in self._iter_assignment_sites(cfunc):
             if target is None:
                 continue
             target_idx = getattr(getattr(target, "v", None), "idx", None)
             if target_idx is not None and returned_idx is not None:
                 if target_idx != returned_idx:
                     continue
-            elif returned_ea is not None and getattr(target, "ea", None) != returned_ea:
+            elif returned_ea not in (None, 0) and getattr(target, "ea", None) != returned_ea:
                 continue
-            alloc_obj = MemoryAllocationObject.create(cfunc, getattr(specific, "y", None))
+            alloc_obj = MemoryAllocationObject.create(cfunc, rhs)
             if alloc_obj is not None:
                 return alloc_obj
         return None
+
+    @staticmethod
+    def _iter_assignment_sites(cfunc):
+        """Yield ``(target, rhs)`` for every assignment expression.
+
+        Prefers ``cfunc.treeitems``; when that is empty — which is the live
+        case on this build (O1 finding: freshly decompiled functions report
+        no tree items) — falls back to a ctree visitor walk over the body.
+        """
+        asg_op = getattr(ctype, "asg", None)
+        treeitems = getattr(cfunc, "treeitems", None)
+        if treeitems:
+            for item in treeitems:
+                specific = getattr(item, "to_specific_type", None) or item
+                if asg_op is not None and getattr(specific, "op", None) == asg_op:
+                    yield getattr(specific, "x", None), getattr(specific, "y", None)
+            return
+
+        walker_cls = getattr(ida_hexrays, "ctree_visitor_t", None)
+        if walker_cls is None or asg_op is None:
+            return
+
+        class _AssignmentWalker(walker_cls):
+            def __init__(self):
+                try:
+                    walker_cls.__init__(self, 0)
+                except TypeError:
+                    walker_cls.__init__(self, None)  # pragma: no cover — binding drift
+                self.sites = []
+
+            def visit_expr(self, expr):
+                if getattr(expr, "op", None) == asg_op:
+                    self.sites.append((getattr(expr, "x", None), getattr(expr, "y", None)))
+                return 0
+
+        walker = _AssignmentWalker()
+        body = getattr(cfunc, "body", None)
+        if body is not None:
+            try:
+                walker.apply_to(body, None)
+            except Exception:  # noqa: BLE001 — walk is best-effort
+                return
+        yield from walker.sites
 
     def _manipulate(self, cexpr, obj: ScanObject):
         if obj.id == ObjectType.local_variable:
