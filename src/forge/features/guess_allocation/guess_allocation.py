@@ -30,7 +30,7 @@ def _make_allocation_chooser(items):
             ida_kernwin.jumpto(self.items[n][0])
 
         def OnGetLine(self, n):
-            func_ea, var, line, alloc_type = self.items[n]
+            func_ea, var, line, alloc_type = self.items[n][:4]
             return [to_function_offset_str(func_ea), var, line, alloc_type]
 
     return StructureAllocationChoose(items)
@@ -57,6 +57,75 @@ class GuessAllocationVisitor(RecursiveUpwardsObjectVisitor):
 
         return obj_ea == find_expr_address(cexpr, getattr(self, "parents", []))
     
+    def _discover_allocation_via_callee(self, call_expr, obj):
+        """Cross-function allocation discovery (I.25).
+
+        ``parent.y = AllocHelper(args)`` where ``AllocHelper`` is not itself an
+        allocator: decompile the callee one level (hard cap, never recursed)
+        and look for a ``return X`` where ``X`` is a local assigned from a
+        real allocator call. First hit wins; any failure degrades to no row.
+
+        Returns a ``[ea, var, line, kind, size_hint, callee_ea]`` row or
+        ``None``.
+        """
+        import ida_funcs
+
+        from forge.api.hexrays import decompile as _decompile
+
+        try:
+            callee_ea = getattr(getattr(call_expr, "x", None), "obj_ea", None)
+            if callee_ea is None or callee_ea == ida_idaapi.BADADDR:
+                return None
+            function = ida_funcs.get_func(callee_ea)
+            if function is None:
+                return None
+            cfunc = _decompile(getattr(function, "start_ea", callee_ea))
+            if cfunc is None:
+                return None
+
+            # match the ctree's return expressions to the var nodes they
+            # return, then find the defining allocation assignment
+            ret_op = getattr(ctype, "ret", None)
+            asg_op = getattr(ctype, "asg", None)
+            for item in getattr(cfunc, "treeitems", []) or []:
+                specific = getattr(item, "to_specific_type", None) or item
+                if ret_op is not None and getattr(specific, "op", None) != ret_op:
+                    continue
+                returned = getattr(specific, "x", None)
+                if returned is None:
+                    continue
+                returned_ea = getattr(returned, "ea", None)
+                if returned_ea is None:
+                    continue
+                alloc_obj = self._find_allocator_assignment(cfunc, returned_ea, asg_op)
+                if alloc_obj is not None:
+                    return [
+                        alloc_obj.ea,
+                        obj.name,
+                        self.get_line(),
+                        "HEAP",
+                        alloc_obj.size,
+                        callee_ea,
+                    ]
+        except Exception:  # noqa: BLE001 — cross-function recon is best-effort
+            return None
+        return None
+
+    def _find_allocator_assignment(self, cfunc, returned_ea, asg_op):
+        """The ``var = allocator(...)`` assignment whose var node carries
+        ``returned_ea``; its RHS is a call, first hit wins."""
+        for item in getattr(cfunc, "treeitems", []) or []:
+            specific = getattr(item, "to_specific_type", None) or item
+            if getattr(specific, "op", None) != asg_op:
+                continue
+            target = getattr(specific, "x", None)
+            if target is None or getattr(target, "ea", None) != returned_ea:
+                continue
+            alloc_obj = MemoryAllocationObject.create(cfunc, getattr(specific, "y", None))
+            if alloc_obj is not None:
+                return alloc_obj
+        return None
+
     def _manipulate(self, cexpr, obj: ScanObject):
         if obj.id == ObjectType.local_variable:
             parent = self.parent_expr()
@@ -65,7 +134,13 @@ class GuessAllocationVisitor(RecursiveUpwardsObjectVisitor):
             if parent.op == ctype.asg:
                 alloc_obj = MemoryAllocationObject.create(self._cfunc, parent.y)
                 if alloc_obj:
-                    self._data.append([alloc_obj.ea, obj.name, self.get_line(), "HEAP"])
+                    self._data.append(
+                        [alloc_obj.ea, obj.name, self.get_line(), "HEAP", alloc_obj.size, None]
+                    )
+                else:
+                    callee_row = self._discover_allocation_via_callee(parent.y, obj)
+                    if callee_row is not None:
+                        self._data.append(callee_row)
             elif parent.op == ctype.ref:
                 self._data.append(
                     [
@@ -73,6 +148,8 @@ class GuessAllocationVisitor(RecursiveUpwardsObjectVisitor):
                         obj.name,
                         self.get_line(),
                         "STACK",
+                        None,
+                        None,
                     ]
                 )
         elif obj.id == ObjectType.global_object:
@@ -82,6 +159,8 @@ class GuessAllocationVisitor(RecursiveUpwardsObjectVisitor):
                     obj.name,
                     self.get_line(),
                     "GLOBAL",
+                    None,
+                    None,
                 ]
             )
 

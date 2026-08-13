@@ -450,6 +450,64 @@ def test_memory_allocation_object_create_multiplies_calloc_size(monkeypatch):
     assert obj.size == 0x2C
 
 
+def test_extract_numeric_argument_folds_constant_arithmetic(monkeypatch):
+    """I.24: mul/add/sub fold when both operands are constant; a variable
+    operand makes the whole expression unknown (None)."""
+    monkeypatch.setattr(ctype, "mul", 30, raising=False)
+    monkeypatch.setattr(ctype, "add", 31, raising=False)
+    monkeypatch.setattr(ctype, "sub", 32, raising=False)
+
+    prod = FakeExpr(ctype.mul, x=FakeNumberExpr(4), y=FakeNumberExpr(8))
+    assert MemoryAllocationObject._extract_numeric_argument([prod], 0) == 32
+
+    total = FakeExpr(ctype.add, x=FakeNumberExpr(10), y=FakeNumberExpr(44))
+    assert MemoryAllocationObject._extract_numeric_argument([total], 0) == 54
+
+    diff = FakeExpr(ctype.sub, x=FakeNumberExpr(64), y=FakeNumberExpr(8))
+    assert MemoryAllocationObject._extract_numeric_argument([diff], 0) == 56
+
+    # nested: (2 + 6) * 3
+    inner = FakeExpr(ctype.add, x=FakeNumberExpr(2), y=FakeNumberExpr(6))
+    outer = FakeExpr(ctype.mul, x=inner, y=FakeNumberExpr(3))
+    assert MemoryAllocationObject._extract_numeric_argument([outer], 0) == 24
+
+    # a variable operand poisons the fold
+    partial = FakeExpr(ctype.mul, x=FakeExpr(ctype.var), y=FakeNumberExpr(12))
+    assert MemoryAllocationObject._extract_numeric_argument([partial], 0) is None
+    assert MemoryAllocationObject._extract_numeric_argument([], 0) is None
+
+
+def test_memory_allocation_object_size_hint_unknown_vs_real_zero(monkeypatch):
+    """I.24: calloc(w*h, 12) — non-constant first operand — still creates a
+    row with size None; calloc(4, 8) folds to 32."""
+    import ida_name
+
+    monkeypatch.setattr(ida_name, "get_short_name", lambda _ea: "calloc")
+    monkeypatch.setattr(
+        ScanObject,
+        "get_expression_address",
+        staticmethod(lambda _cfunc, expr: expr.ea),
+    )
+
+    known = FakeExpr(
+        ctype.call,
+        x=SimpleNamespace(obj_ea=0x5000),
+        a=[FakeNumberExpr(4), FakeNumberExpr(8)],
+        ea=0x77,
+    )
+    unknown = FakeExpr(
+        ctype.call,
+        x=SimpleNamespace(obj_ea=0x5000),
+        a=[FakeExpr(ctype.var), FakeNumberExpr(12)],
+        ea=0x78,
+    )
+
+    assert MemoryAllocationObject.create(FakeCfunc([]), known).size == 32
+    obj = MemoryAllocationObject.create(FakeCfunc([]), unknown)
+    assert obj is not None
+    assert obj.size is None
+
+
 def test_memory_allocation_object_create_uses_windows_heapalloc_size_argument(monkeypatch):
     import ida_name
 
@@ -496,16 +554,17 @@ def test_memory_allocation_object_create_supports_prefixed_linux_kernel_allocato
     assert obj.size == 0x40
 
 
-def test_memory_allocation_object_create_returns_zero_for_non_numeric_size(monkeypatch):
+def test_memory_allocation_object_create_returns_none_size_for_non_numeric_size(monkeypatch):
+    """I.24: an unprovably-constant size still creates the allocation row
+    (size None), so callers can tell "unknown" from a real zero."""
     import ida_name
 
     monkeypatch.setattr(ida_name, "get_short_name", lambda _ea: "malloc")
     call = FakeExpr(ctype.call, x=SimpleNamespace(obj_ea=0x5000), a=[FakeExpr(ctype.var)], ea=0x99)
     obj = MemoryAllocationObject.create(FakeCfunc([]), call)
 
-
-
-    assert obj.size == 0
+    assert obj is not None
+    assert obj.size is None
 
 
 
@@ -547,7 +606,7 @@ def test_memory_allocation_object_create_handles_missing_size_argument(monkeypat
     obj = MemoryAllocationObject.create(FakeCfunc([]), call)
 
     assert obj is not None
-    assert obj.size == 0
+    assert obj.size is None
 
 def test_get_argument_index_resolves_formal_argument_ordinals():
     import importlib.util

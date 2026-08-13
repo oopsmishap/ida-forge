@@ -583,10 +583,10 @@ class ReturnedObject(ScanObject):
 
 
 class MemoryAllocationObject(ScanObject):
-    def __init__(self, name: str, size: int):
+    def __init__(self, name: str, size: int | None):
         super().__init__()
         self.name = name
-        self.size = size
+        self.size = size  # None: allocator size could not be folded
         self.id = ObjectType.memory_allocator
         log_debug(f"Creating MemoryAllocationObject {self.name}, {self.size}")
 
@@ -625,17 +625,41 @@ class MemoryAllocationObject(ScanObject):
         return normalized
 
     @staticmethod
-    def _extract_numeric_argument(args, index: int) -> int:
+    def _extract_numeric_argument(args, index: int) -> int | None:
         if index < 0 or index >= len(args):
-            return 0
+            return None
 
         expr = args[index]
         while expr is not None and getattr(expr, "op", None) == ctype.cast:
             expr = getattr(expr, "x", None)
 
-        if expr is not None and getattr(expr, "op", None) == ctype.num:
+        if expr is None:
+            return None
+
+        op = getattr(expr, "op", None)
+        if op == ctype.num:
             return expr.numval()
-        return 0
+
+        # Fold constant arithmetic so `calloc(2, 0x20)`-style chains resolve:
+        # size = n * m / n + m / n - m, recursing through casts. A single
+        # non-constant operand makes the whole expression unknown.
+        for folded_op, combine in (
+            (getattr(ctype, "mul", None), lambda a, b: a * b),
+            (getattr(ctype, "add", None), lambda a, b: a + b),
+            (getattr(ctype, "sub", None), lambda a, b: a - b),
+        ):
+            if folded_op is not None and op == folded_op:
+                left = MemoryAllocationObject._extract_numeric_argument(
+                    [getattr(expr, "x", None)], 0
+                )
+                right = MemoryAllocationObject._extract_numeric_argument(
+                    [getattr(expr, "y", None)], 0
+                )
+                if left is None or right is None:
+                    return None
+                return combine(left, right)
+
+        return None
 
     @classmethod
     def _resolve_size(cls, allocator_name: str, args) -> int | None:
@@ -646,11 +670,17 @@ class MemoryAllocationObject(ScanObject):
 
         if allocator_name in _PRODUCT_SIZE_ALLOCATORS:
             left_index, right_index = _PRODUCT_SIZE_ALLOCATORS[allocator_name]
-            return cls._extract_numeric_argument(
-                args, left_index
-            ) * cls._extract_numeric_argument(args, right_index)
+            left = cls._extract_numeric_argument(args, left_index)
+            right = cls._extract_numeric_argument(args, right_index)
+            if left is None or right is None:
+                return None
+            return left * right
 
         return None
+
+    @staticmethod
+    def _is_allocator_name(allocator_name: str) -> bool:
+        return allocator_name in _SINGLE_SIZE_ALLOCATORS or allocator_name in _PRODUCT_SIZE_ALLOCATORS
 
     @staticmethod
     def create(cfunc: ida_hexrays.cfunc_t, cexpr: ida_hexrays.cexpr_t):
@@ -670,9 +700,12 @@ class MemoryAllocationObject(ScanObject):
             getattr(call_expr.x, "obj_ea", idaapi.BADADDR)
         )
         allocator_name = MemoryAllocationObject._normalize_allocator_name(raw_func_name)
-        size = MemoryAllocationObject._resolve_size(allocator_name, getattr(call_expr, "a", ()))
-        if size is None:
+        if not MemoryAllocationObject._is_allocator_name(allocator_name):
             return None
+
+        # An allocator whose size could not be folded to a constant is still
+        # an allocation — size None distinguishes "unknown" from a real 0.
+        size = MemoryAllocationObject._resolve_size(allocator_name, getattr(call_expr, "a", ()))
 
         result = MemoryAllocationObject(raw_func_name or allocator_name, size)
         result.ea = ScanObject.get_expression_address(cfunc, call_expr)

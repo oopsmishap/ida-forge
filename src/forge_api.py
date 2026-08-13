@@ -58,6 +58,7 @@ __all__ = [
     "remove_structure",
     "rename_local",
     "rename_structure",
+    "scan_from_allocation",
     "scan_global",
     "set_current",
     "set_func_proto",
@@ -2208,6 +2209,71 @@ def create_field(
 
 
 @api(
+    group="scan",
+    returns="dict",
+    example='r = forge_api.scan_from_allocation(0x1400014F0, var_name="a1", name="World", commit=True)',
+)
+def scan_from_allocation(
+    ea: int,
+    *,
+    var_name: str | None = None,
+    var_index: int | None = None,
+    item_ea: int | None = None,
+    name: str | None = None,
+    root_type: str | None = None,
+    vtable_addr: int | None = None,
+    commit: bool = False,
+) -> dict:
+    """One-shot heap-object recovery from an allocation site.
+
+    Finds the first heap allocation feeding the variable (I.23: via
+    :func:`guess_allocation`), creates a store structure named ``name`` (or an
+    auto ``Allocation`` name), deep-scans the allocator's result (I.8 root
+    retype applies when ``root_type`` is given), optionally converts the
+    member at offset 0 to a vtable (I.26: ``vtable_addr`` from
+    :func:`vtable_entries`), and optionally commits the type.
+
+    Returns ``{"ok": False, "error": ...}`` when the variable has no heap
+    allocation. Success returns ``{"ok": True, "allocation": <row>,
+    "structure": <name>, "members": [...]}``.
+
+    Returns:
+        dict.
+    """
+    rows = guess_allocation(ea, var_name=var_name, var_index=var_index, item_ea=item_ea)
+    allocation = next((row for row in rows if row["kind"] == "HEAP"), None)
+    if allocation is None:
+        return {
+            "ok": False,
+            "error": f"no heap allocation found for variable in {hex(ea)}",
+        }
+
+    struct_name = name or _unique_structure_name("Allocation")
+    create_structure(struct_name)
+    scan_result = deep_scan(
+        ea,
+        var_name=allocation["var"],
+        structure=struct_name,
+        recurse_calls=True,
+        root_type=root_type,
+    )
+    members = scan_result.get("members", [])
+
+    if vtable_addr is not None:
+        to_vtable(struct_name, 0, vtable_addr)
+
+    if commit:
+        create_type(struct_name, overwrite=True)
+
+    return {
+        "ok": True,
+        "allocation": allocation,
+        "structure": struct_name,
+        "members": members,
+    }
+
+
+@api(
     group="features",
     returns="list[dict]",
     example='rows = forge_api.guess_allocation(0x1400014F0, var_name="a1")',
@@ -2230,7 +2296,12 @@ def guess_allocation(
     rows instead of showing a chooser.
 
     Returns:
-        list of ``{"ea": int, "var": str, "line": str, "kind": "HEAP"|"STACK"|"GLOBAL"}``.
+        list of ``{"ea": int, "var": str, "line": str,
+        "kind": "HEAP"|"STACK"|"GLOBAL", "size_hint": int | None,
+        "callee": int | None}`` — ``size_hint`` is the folded byte size of
+        the allocator call (``None`` when it could not be proven constant);
+        ``callee`` is the function whose body supplied the allocation when
+        the assignment went through a non-allocator helper (I.25).
     """
     _require_ida()
     from forge.api.hexrays import decompile as _decompile
@@ -2245,6 +2316,13 @@ def guess_allocation(
     visitor = GuessAllocationVisitor(cfunc, obj, interactive=False)
     visitor.process()
     return [
-        {"ea": int(row[0]), "var": row[1], "line": row[2], "kind": row[3]}
+        {
+            "ea": int(row[0]),
+            "var": row[1],
+            "line": row[2],
+            "kind": row[3],
+            "size_hint": row[4],
+            "callee": row[5],
+        }
         for row in visitor._data
     ]

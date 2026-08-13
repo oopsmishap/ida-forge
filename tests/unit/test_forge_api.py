@@ -974,6 +974,103 @@ def test_apply_type_parse_failure_reports_error(monkeypatch):
     monkeypatch.setattr(members_mod, "parse_user_tinfo", lambda decl: FakeTinfo(decl.split()[0]), raising=False)
 
 
+def test_scan_from_allocation_orchestrates(monkeypatch):
+    """I.23/I.26: scan_from_allocation finds the HEAP row, auto-builds the
+    structure, scans with recurse_calls, converts the vtable, then commits
+    with overwrite=True."""
+    calls = []
+    rows = [
+        {
+            "ea": 0x401000,
+            "var": "a1",
+            "line": "a1 = malloc(0x40)",
+            "kind": "HEAP",
+            "size_hint": 0x40,
+            "callee": None,
+        }
+    ]
+    monkeypatch.setattr(forge_api, "guess_allocation", lambda *a, **k: rows)
+    scanned = {}
+
+    def _fake_deep_scan(ea, *, var_name, structure, recurse_calls, root_type, **k):
+        scanned.update(var_name=var_name, structure=structure, recurse_calls=recurse_calls, root_type=root_type)
+        return {"structure": structure, "members": [{"name": "m0"}]}
+
+    monkeypatch.setattr(forge_api, "deep_scan", _fake_deep_scan)
+    monkeypatch.setattr(
+        forge_api,
+        "to_vtable",
+        lambda *a, **k: calls.append(("to_vtable", a)) or {"offset": 0},
+        raising=False,
+    )
+    monkeypatch.setattr(
+        forge_api,
+        "create_type",
+        lambda *a, **k: calls.append(("create_type", k)) or {"ok": True},
+        raising=False,
+    )
+
+    result = forge_api.scan_from_allocation(
+        0x401000, var_name="a1", name="World", vtable_addr=0x140006358, commit=True
+    )
+
+    assert result == {
+        "ok": True,
+        "allocation": rows[0],
+        "structure": "World",
+        "members": [{"name": "m0"}],
+    }
+    assert scanned == {
+        "var_name": "a1",
+        "structure": "World",
+        "recurse_calls": True,
+        "root_type": None,
+    }
+    assert forge_api.get_structure("World") is not None
+    # vtable conversion runs before the commit; commit is overwrite=True
+    assert calls[0] == ("to_vtable", ("World", 0, 0x140006358))
+    assert calls[1] == ("create_type", {"overwrite": True})
+
+
+def test_scan_from_allocation_reports_missing_heap(monkeypatch):
+    """I.23: no heap allocation for the variable -> an error dict, and no
+    structure is created."""
+    monkeypatch.setattr(
+        forge_api,
+        "guess_allocation",
+        lambda *a, **k: [{"ea": 0x401010, "var": "a1", "kind": "STACK", "size_hint": None, "callee": None}],
+    )
+    monkeypatch.setattr(forge_api, "deep_scan", lambda *a, **k: {}, raising=False)
+    monkeypatch.setattr(forge_api, "create_type", lambda *a, **k: {}, raising=False)
+
+    result = forge_api.scan_from_allocation(0x401000, var_name="a1")
+
+    assert result["ok"] is False
+    assert "no heap allocation" in result["error"]
+    assert forge_api.structures() == []
+
+
+def test_scan_from_allocation_auto_names_and_skips_commit(monkeypatch):
+    """I.23: unnamed scans get an Allocation auto-name; commit=False leaves
+    the type uncommitted."""
+    calls = []
+    rows = [{"ea": 0x401000, "var": "a1", "kind": "HEAP", "size_hint": None, "callee": None, "line": ""}]
+    monkeypatch.setattr(forge_api, "guess_allocation", lambda *a, **k: rows)
+    monkeypatch.setattr(
+        forge_api,
+        "deep_scan",
+        lambda ea, **k: {"structure": k["structure"], "members": []},
+    )
+    monkeypatch.setattr(forge_api, "create_type", lambda *a, **k: calls.append(1) or {}, raising=False)
+    monkeypatch.setattr(forge_api, "to_vtable", lambda *a, **k: {}, raising=False)
+
+    result = forge_api.scan_from_allocation(0x401000, var_name="a1")
+
+    assert result["structure"] == "Allocation"
+    assert result["ok"] is True
+    assert calls == []
+
+
 def test_apply_type_store_fallback_creates_placeholder_first(monkeypatch):
     """I.19: a store-structure declaration parses via the lazy placeholder
     (B8) — the placeholder is created before the re-parse."""
