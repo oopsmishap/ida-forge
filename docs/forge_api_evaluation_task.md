@@ -2,12 +2,15 @@
 
 ## Mission
 
-Reverse-engineer a real binary end-to-end using **only** the headless
-`forge_api` facade through the IDA MCP tools (`ida_open_database` /
-`ida_execute_python`). The point is not the reversal itself — it is a
-**feature-by-feature exercise of the entire facade** — so use every
-function the API offers somewhere in the session, and record what worked,
-what didn't, and what was missing.
+Reverse-engineer a real binary end-to-end using the headless `forge_api`
+facade through the IDA MCP tools (`ida_open_database` /
+`ida_execute_python`), **supplemented as needed with the MCP's built-in
+`ida-domain` API** (the `db` / `ida_domain` globals available in every
+execute). The point is not the reversal itself — it is a
+**feature-by-feature exercise of the entire forge facade** — so use every
+forge function somewhere in the session, reach for ida-domain whenever
+forge can't do the job cleanly, and record what worked, what didn't, and
+what was missing.
 
 ## Target
 
@@ -22,11 +25,11 @@ compare only after the report is drafted, to score recovery.
 
 ## Ground rules
 
-1. Prefer `forge_api` for **everything** — type recovery, struct
-   creation, member naming, vtable discovery, arg/local retyping and
-   renaming, type commit, prototype fixes, name cleanup. Anything done
-   with raw `ida_*` calls counts as a gap: record it, then try to express
-   the same operation in forge.
+1. **forge first, ida-domain second.** Every operation starts with forge.
+   Reach for the ida-domain API when: forge has no equivalent, the forge
+   path fails, or the forge path is clearly clumsier. Record **which** of
+   those three it was — each is a distinct finding (missing feature vs
+   bug vs tweak request).
 2. Use `forge_api.help()` to discover the surface — the catalog is
    self-describing. Consult the source (`src/forge_api.py`) only when an
    error is genuinely unclear.
@@ -67,8 +70,8 @@ global renders as a struct, `is_type`, `type_of`, `named_types`, and
 
 **Pseudocode mutation — the "naming" core**: `set_lvar_types` on args
 and locals, `rename_local` on ~10 variables, `set_func_proto` on a wrong
-signature, and **renaming functions** (however you manage it — if forge
-has no path, that is a finding).
+signature, and **renaming functions** (try forge first; if there is no
+forge path, use the ida-domain API and file it as a finding).
 
 ## Deliverable: the report (`forge_api_evaluation_output.md` — or next to
 the task doc)
@@ -82,24 +85,28 @@ An honest usability review with these sections:
 2. **Good** — genuinely useful, easy, well-shaped: call + outcome.
 3. **Bad / broken** — everything that failed or silently misbehaved, with
    the repro call and the exact error.
-4. **Not useful / N/A** — features tried and dropped, with why; a
+4. **ida-domain escapes** — every operation done through the
+   ida-domain API instead of forge, tagged with which rule applied:
+   (a) no forge equivalent, (b) forge path failed, (c) forge path was
+   clumsier. These map 1:1 onto the feature requests / tweaks below.
+5. **Not useful / N/A** — features tried and dropped, with why; a
    feature that doesn't apply to this binary is a legitimate "needs an
    applicability hint" entry.
-5. **Needs tweaks** — friction in existing APIs (naming, defaults,
+6. **Needs tweaks** — friction in existing APIs (naming, defaults,
    return shapes, missing confirmations) with the smallest-change
    suggestion for each.
-6. **Feature requests, ranked** — anything that would have made this
-   session easier: function/global renaming (`ida_name.set_name` lives
-   raw), automatic root retyping, member naming from constants/string
-   literals, batching (`decompile_all`, `recover(...)`), array/stride
-   detection, undo of type writes, decode of bit/flag fields — plus
-   anything you had to do with a raw `ida_*` escape.
-7. **Score** — verdict on the facade overall, and the 1–2 changes you
+7. **Feature requests, ranked** — anything that would have made this
+   session easier: function/global renaming, automatic root retyping,
+   member naming from constants/string literals, batching
+   (`decompile_all`, `recover(...)`), array/stride detection, undo of
+   type writes, decode of bit/flag fields — plus everything from the
+   ida-domain escape list above.
+8. **Score** — verdict on the facade overall, and the 1–2 changes you
    would prioritize first.
 
 ## Exit criteria
 
-- Report exists with all seven sections.
+- Report exists with all eight sections.
 - Every checklist item is used or explicitly marked N/A with the reason.
 - The report closes with a ranked top-5-change list for the next forge
   iteration.
