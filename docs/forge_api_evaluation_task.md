@@ -44,7 +44,7 @@ compare only after the report is drafted, to score recovery.
 **Store & structs**: `create_structure`, `get_structure`, `structures`,
 `set_member`, `add_member` (incl. a self/forward reference like
 `Node *` before the IDB type exists), `remove_members`, `nudge_members`,
-`rename_structure`, `clear_structures`, `get_member(include_disabled=True)`
+`rename_structure`, `get_member(include_disabled=True)`
 on a collision-disabled offset, `to_vtable`, `link_child` +
 `create_child_types`.
 

@@ -36,7 +36,6 @@ __all__ = [
     "auto_resolve",
     "callees_of",
     "callers_of",
-    "clear_structures",
     "create_child_types",
     "create_field",
     "create_structure",
@@ -1139,28 +1138,6 @@ def structures() -> list[str]:
         sorted list of structure names.
     """
     return sorted(_structures)
-
-
-@api(
-    group="structures",
-    returns="None",
-    example="forge_api.clear_structures()",
-)
-def clear_structures() -> None:
-    """Remove every structure from the shared store (not from the IDB).
-
-    Also drops the persisted catalog so a cleared session does not resurrect
-    stale structures on the next load. Returns None.
-    """
-    catalog.clear()
-    try:
-        from forge.api.storage import Storage
-
-        Storage("Structures").kill()
-    except Exception as exc:  # noqa: BLE001 — storage may be unavailable headless
-        from forge.util.logging import log_warning
-
-        log_warning(f"could not drop persisted structure catalog: {exc}")
 
 
 @api(

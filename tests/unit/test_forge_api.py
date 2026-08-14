@@ -53,9 +53,15 @@ def _stub_member_tinfo(monkeypatch):
 
 @pytest.fixture(autouse=True)
 def _reset_store():
-    forge_api.clear_structures()
+    # clear_structures was removed from the facade (2026-08-13: agents
+    # used it to wipe the shared catalog mid-eval, erasing the persisted
+    # store the GUI structure-builder reads). Tests reset through the
+    # internal dict instead.
+    forge_api._structures.clear()
+    forge_api._state.current = None
     yield
-    forge_api.clear_structures()
+    forge_api._structures.clear()
+    forge_api._state.current = None
 
 
 def test_help_catalog_lists_every_api_function():
@@ -1194,7 +1200,8 @@ def test_import_types_excludes_system_and_template_names(monkeypatch):
     added = []
     monkeypatch.setattr(forge_api, "add_member", lambda *a, **k: added.append((a[0], a[1], k.get("name"))))
 
-    forge_api.clear_structures()
+    forge_api._structures.clear()
+    forge_api._state.current = None
     result = forge_api.import_types()
 
     assert sorted(result["imported"]) == ["CellMeta", "PointerParent"]

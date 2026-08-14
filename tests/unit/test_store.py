@@ -58,13 +58,15 @@ def _fresh_state(monkeypatch):
         sys.modules["forge.api.storage"], "Storage", _FakeStorage, raising=False
     )
     _FakeStorage._data.clear()
-    forge_api.clear_structures()
+    forge_api._structures.clear()
+    forge_api._state.current = None
     from forge.api.store import catalog
 
     catalog.events.clear()
     yield
     catalog.events.clear()
-    forge_api.clear_structures()
+    forge_api._structures.clear()
+    forge_api._state.current = None
     _FakeStorage._data.clear()
 
 
@@ -197,17 +199,16 @@ def test_catalog_load_falls_back_to_u64_for_bad_member_type(monkeypatch):
     assert member.tinfo.dstr() == "u64"
 
 
-def test_clear_structures_kills_persistence():
-    """I.28: clear_structures empties the catalog AND drops the persisted
-    snapshot so a cleared session never resurrects stale structures."""
-    forge_api.create_structure("S")
-    forge_api.add_member("S", 0, "u32")
-    assert _FakeStorage._data["Structures"].get("data") is not None
+def test_store_has_no_default_wipe_verb():
+    """2026-08-30: clear_structures was REMOVED from the facade.
 
-    forge_api.clear_structures()
-
-    assert forge_api.structures() == []
-    assert _FakeStorage._data["Structures"].get("data") is None
+    Eval agents used it per-script to wipe the shared store, erasing the
+    persisted catalog the GUI structure-builder reads (data-loss trap).
+    Nothing — not the catalog, not __all__, not help() — may offer a
+    wholesale wipe through the facade.
+    """
+    assert "clear_structures" not in forge_api.__all__
+    assert "clear_structures" not in forge_api.help()["functions"]
 
 
 def test_form_shares_catalog_with_forge_api(monkeypatch):
