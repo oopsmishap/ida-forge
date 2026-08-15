@@ -1,125 +1,19 @@
 # ida-forge TODO
 
-Current state (2026-08-13): all planned work — the 2026-08-11 assessment
-wave, the forge-api plan (R10/R11, I.8–I.28, T3.3), the O1–O5
-verification/fix pass, the full-facade **evaluation review** (E section
-below), the **E.1–E.11 bug fixes**, and the **round-2 review fixes**
-(`607c3ab`: rename_ea, templated args, create_field persistence, nudge
-loudness) — is in. Two evaluation rounds done; the round-2 review scored
-the facade 8/10 ("genuinely productive") with the pain concentrated in
-attribution depth + missing verbs — those are the open items below. The
-**recovery-eval round 2 (2026-08-15) scored 99/100** on the cold fixture
-(20/20 types, 5/5 globals, 10/10 flows; report:
-`docs/forge_api_recovery_eval_output.md`) and filed the ranked gaps in
-the **R2 section** below. The commit-level record lives in
-`CHANGELOG.md`.
+Current state (2026-08-15): all planned work is done — the assessment
+wave, the forge-api plan (R10/R11, I.8–I.28, T3.3), the O1–O5 pass, the
+E-series bug fixes, the round-2 review fixes, and both recovery evals
+(round 1 baseline; round 2 = **99/100** on the cold fixture, 20/20
+types, 5/5 globals, 10/10 flows). **`CHANGELOG.md` owns the completed
+history** (E.1–E.11, round-2 review fixes `607c3ab`, recovery-eval gaps
+1/3–6 `45b9d2a`, `clear_structures` removal `5a8da9e`, round-2 report
+`e86ce8b`); this file tracks only open work.
 
 Baselines: `python -m pytest -q` → 577 passing; `python -m ruff check src
 tests` → clean; branch `forge-api` clean working tree.
 
-## Evaluation findings — forge_api review, 2026-08-13
-
-Full walk of `pure_c_struct_fixture.exe` headless via idalib
-(`docs/forge_api_evaluation_output.md`). Usability verdict 6.5/10:
-core loop good (store structs, headless commit, apply_type, retyping),
-roughly a third of the session spent on API drift and silent failures.
-The report's §7 priority: fix the IDA 9.x drift first, then renaming.
-Standalone bugs first — all live-reproduced:
-
-### E-bug — FIXED 2026-08-13 (commits `4372b94`, `97b9474`, `8d8bd3c`)
-
-All eleven live-reproduced defects are fixed, unit-tested (14 new tests)
-and live-verified on the pure_c fixture worker:
-
-- **E.1** IDA 9.x drift — `ida_typeinf.parse_decl` cannot parse function
-  prototypes; `idc.parse_decl` is the legacy **2-arg** `(decl, flags)`
-  form returning `(ret, tp, fld)` → deserialize (live signature probe).
-  `set_func_proto` applies via `apply_tinfo` (set_ti removed). Fixes
-  `set_func_proto` (live: prototype applied) + `create_field` (no more
-  AttributeError). **Live caveat**: `create_field` returned False with no
-  reason on the fixture — the crash is gone, the silent-False needs a
-  reason string (fold into E.20 tweaks).
-- **E.2** unnamed tables → `vtbl_<addr>` fallback (live: to_vtable ok).
-- **E.3** `create_structure` seeds the own-name placeholder before the
-  member loop (live: `next/child/tag` all kept).
-- **E.4** decl_src tracked on every string-authored member
-  (add/set_member, link materialize); `rename_relationship_references`
-  rewrites texts referencing the old name; `Member._resolve_pack_tinfo`
-  re-parses fresh at pack, and **heals `#NN *` ordinal refs** from
-  pre-decl_src catalog entries by current type name (live: rename →
-  members show `EvalSelfRenamed *`, push ok).
-- **E.5** `imports()` walks the real IAT (`get_import_module_qty` +
-  `enum_import_names`), module+name filters (live: 50 rows, KERNEL32).
-- **E.6** `inverse_if` ctree walk + nearest-`cit_if` pick (live: True on
-  the fixture if). Also fixed the same `to_specific_type`-is-a-method
-  normalization trap in guess_allocation's treeitems fallbacks.
-- **E.7** templated types read via tomllib (lazy toml fallback) — no
-  `toml` package needed headless (live: templated_keys listed).
-- **E.8** `link_child` materializes the child pointer (decl_src set);
-  retype actually lands at finalize via `refresh_linked_member_types`
-  (a child must be committed first — that ordering is by design).
-- **E.10** `create_type(overwrite=False)` auto-replaces forge
-  placeholders (`_is_forge_placeholder_type`); a real pre-existing type
-  still errors (live-verified both sides).
-- **E.11** `get_member`/`set_member(member_name=…)` disambiguate
-  collision offsets (live: `b`/`u64` picked).
-- **E.9** `finalize_all` rows carry `created_names` + `error`
-  (`create_subtree_types_postorder` returns `(ok, created, error)`).
-
-Sandbox note: the pure_c fixture's shared catalog was refreshed during
-the probes (clear_structures), so pre-decl_src entries (KV etc.) are no
-longer in the store; the ordinal heal covers them if they reappear via
-`import_types`.
-
-### Round-2 fixes — FIXED 2026-08-13 (commit `607c3ab`, live-verified)
-
-- **`rename_ea(ea, name)`** — the naming-core verb (round-2 request #1):
-  `ida_name.set_name` + SN_NOCHECK, loud failure; registered in the
-  catalog + `__all__`. Live: rename stuck (`function_info` shows it).
-- **`create_field` persistence** (round-2 §3.2, top-5 #2) — IDA 9.x udt
-  offsets are BYTES; the old `×8` bit convention broke the gap math and
-  the `set_numbered_type` commit. Now byte-based + delete/re-file via
-  the live-proven `idc_set_local_type` path. Live: `type_of('Kid')`
-  shows the inserted `r2_pad` member.
-- **Templated multi-arg keys** (§3.5) — each template param formats TWO
-  TOML tokens (type + name suffix); the facade now synthesizes suffixes
-  (`_templated_args_with_suffixes`). Live: `std::vector<T>` and
-  `std::map<K,V>` resolve to full cdecls.
-- **`nudge_members` unknown offsets** (§3.7) — loud
-  `{"ok": False, "error": "no member at offset(s) 0x18"}` instead of a
-  silent no-op.
-
-> Dropped 2026-08-13: E.12 (function/global renaming — a leaf
-> `ida_name.set_name` wrapper — **implemented as `rename_ea` in
-> `607c3ab`, live-verified**) and E.15 (plain scan loop; its real work is
-> F.2). This section tracks only items with real design/implementation.
-
-### Recovery-eval findings (2026-08-13, report:
-`H:/re/_random/c_structs/docs/forge_api_recovery_eval_output.md`) — FIXED
-in commit `45b9d2a` (live-verified on the fixture) unless noted:
-
-- **Gap 1 — keyword/parser commit errors are loud now**:
-  `_commit_failure_reason` checks C keywords + `idc_parse_types` error
-  count; `create_type`/`finalize` failures carry the real reason (live:
-  `'inline' is a C keyword — the IDB type parser rejects it`). The
-  `inline`-tag struct itself is impossible in the IDB parser — rename
-  only.
-- **Gap 2 — helper-aware allocation (E.22) STILL OPEN**: scans stop at
-  `v1 = chain_node_new(...)` wrappers; the callee row never fires.
-- **Gap 3 — deep_scan/shallow_scan restore the root retype** when a scan
-  yields no evidence (previously a failed scan left the lvar retyped).
-- **Gap 4 — `apply_type(redefine_range=True)` covers the WHOLE span**:
-  one `create_struct` item over the region + `auto_wait` for plain UDTs
-  (live: `dispatch` re-applied as a 104-byte struct item); skipped when
-  user-named sub-heads would be swallowed.
-- **Gap 5 — pack re-parses named-reference text**: scanner-copied
-  member tinfos (e.g. inline-child) rebind the fresh size after the
-  child type is re-filed; parents no longer pin the old 48-byte child.
-- **Gap 6 — `decompile(force=True)` already clears the cfunc cache** —
-  no work needed.
-
-### E.21–E.30 — round-2 review findings (2026-08-13, report: second half of
-`docs/forge_api_evaluation_output.md`)
+## Open review findings (2026-08-13, report: `docs/forge_api_evaluation_output.md`)
+— round-2 review of the facade (8/10, pain in attribution + missing verbs)
 
 - **E.21 `deep_scan` merge hygiene — fresh vs accumulate mode.** Repeated
   scans into one store structure accumulate hypotheses + byte-granular
@@ -128,14 +22,15 @@ in commit `45b9d2a` (live-verified on the fixture) unless noted:
   offset 0). Add `clear_first=True` kwarg (fresh mode) so re-scans
   produce a stable member set. Round-2 top-5 #5.
 - **E.22 Helper-aware allocation tracking.** `v1 = grid_build(...)`
-  (body calls `calloc(1,0x28)`) — `guess_allocation`/`scan_from_allocation`
-  return []/error; the I.25 `callee` row exists for direct allocator
-  calls but the walker never enters the helper body. Recover
-  `GridNode` through wrappers. Round-2 top-5 #3.
+  (body calls `calloc(1,0x28)`) — `guess_allocation`/
+  `scan_from_allocation` return []/error; the I.25 `callee` row exists
+  for direct allocator calls but the walker never enters the helper
+  body. Recover `GridNode` through wrappers. Round-2 top-5 #3. (R2.7
+  confirms: `make_chain`/`kv_append`/`build_grid` all hit this.)
 - **E.23 `callees_of` / `decompile()['calls']` IAT-slot resolution.**
-  Rows contain `.idata` slot addresses (`0x140004b98` = puts) — resolve
-  slots to import-target EAs (or mark them) so call-graph consumers
-  don't need the dereference.
+  Rows contain `.idata` slot addresses (`0x140004b98` = puts) —
+  resolve slots to import-target EAs (or mark them) so call-graph
+  consumers don't need the dereference.
 - **E.24 Duplicate-name member selection.** `member_name` disambiguates
   first match only; two members with the same name at one offset (name
   differs by type only) need `(offset, name, type)` matching or an
@@ -149,77 +44,69 @@ in commit `45b9d2a` (live-verified on the fixture) unless noted:
 - **E.27 `remove_type(name)`** — facade type deletion with the working
   ordinal-delete path (`del_named_type` name-form returns False live on
   9.4; `del_numbered_type(ordinal)` works). Placeholder materialization
-  makes stray types inevitable; cleanup needs this verb. (Round-1 E.19
-  first half — now with live evidence.)
+  makes stray types inevitable; cleanup needs this verb.
+- **E.28 Union member types (2026-08-15, from round-2 partial).** The
+  store has no union member representation: `Variant.as` commits as
+  `u64`, the four union tags (`as_u32/as_i32/as_f32/as_ptr`) are
+  lost. Offsets/sizes are exact; needs a union member (or inline-anon
+  cdecl) type in the store + pack path. Re-commit `ItemStack`/`Outer`
+  afterwards for full member-type credit.
+- **E.29 Non-UDT type creation (2026-08-15).** `DispatchFn` typedef
+  (`int (__cdecl *)(void*, unsigned int)`) had to be created via
+  ida-domain redeclare — forge's `create_type` handles structs only.
+  Extend to function-pointer typedefs (+ unions = E.28) so a session
+  never leaves the facade for a type verb.
 - **E.14 update — printf-literal member naming.** The fixture's own
   format strings (`"first=%s id=%u flags=%u score=%u sample=%u"`) carry
-  exact member names; a heuristic naming scan members from the consuming
-  printf signature would collapse the manual naming step (round-2 top-5
-  #5b).
+  exact member names; a heuristic naming scan from the consuming printf
+  signature would collapse the manual naming step (round-2 top-5 #5b).
 - **E.16 update — array/stride evidence.** `Stack2[2]`, `u32[2]` dims
   and `u8[16]`/`xmmword` blobs were all hand-fixed in round 2;
   `scan_global` emitted the blobs, not the arrays.
 
-### Recovery-eval round 2 — ranked gaps (2026-08-15, score 99/100, report:
-`docs/forge_api_recovery_eval_output.md`; §8 of the report)
+## Recovery-eval round 2 — ranked gaps (2026-08-15, report:
+`docs/forge_api_recovery_eval_output.md`)
 
-Second full recovery pass on the cold fixture. The scan half was skipped
-deliberately (E.22 wrapper shape + disassembly was evidence-complete); the
-store/commit/apply/mirror halves ran through forge. Ranked from §8:
-
-- **R2.1 — placeholder-size poison at pack (highest priority).** Adding a
-  member whose store-name resolves only to the seed `char _placeholder`
-  (1 B) packs the parent from that size and corrupts the whole layout
-  (observed: `Inline` first@16 → second@104; `Outer` bag 16→1 B so grid
-  shifted +0x10, dispatch +0x20, stacks +0x88). `create_type(parent)`
-  re-pack does NOT resolve the -1 sizes after the child commits — the
-  `45b9d2a` re-bind only helped when the parent pack already knew the
-  sizes. Workaround today: `set_member(parent, off, type=child)` then
-  re-`create_type`. Fix target: resolve store names to committed types at
-  pack time.
+- **R2.1 — placeholder-size poison at pack (highest priority).** A
+  member whose store-name resolves only to the seed 1-byte
+  `char _placeholder` packs the parent from that size and corrupts the
+  layout (observed `Inline` first@16 → second@104; `Outer` bag 16→1 B
+  shifting grid +0x10 / dispatch +0x20 / stacks +0x88).
+  `create_type(parent)` re-pack does NOT resolve the -1 sizes after the
+  child commits; workaround `set_member(parent, off, type=child)` +
+  re-`create_type`. Fix target: resolve store names to committed types
+  at pack time.
 - **R2.2 — `apply_type(redefine_range=True)` suppressed on user-named
-  heads.** A named global stays a 1-byte head; the full-span struct item
-  only materializes for unnamed heads — the user-name guard eats
-  multi-field globals. Workaround: apply before naming, or ida-domain
-  `apply_tinfo` after `del_items(DELIT_DELNAMES)`.
+  heads.** A named global keeps a 1-byte head; the full-span struct item
+  only materializes for unnamed heads. Workaround: apply before naming,
+  or ida-domain `del_items(DELIT_DELNAMES)` + `apply_tinfo`.
 - **R2.3 — struct-item lifetime race in idalib.** `create_struct` /
-  `apply_type` items at global heads get re-split to 1-byte items by
-  deferred auto-analysis whenever the engine re-sees dense code refs
-  (observed repeatedly, even after `auto_wait`). Robust path:
-  `del_items(DELIT_DELNAMES, span)` + `apply_tinfo(tinfo, TINFO_DEFINITE)`
-  + `set_name` — persists through save/reopen (verified).
-- **R2.4 — `apply_type` `del_items(ea, DELIT_SIMPLE, ea+size)` semantics
-  erode the .data tail.** The 3rd arg is an absolute END offset, but the
-  facade reads it as a byte size: applying `char *[4]` at 0x6000 deleted
-  items through 0x6020+0x20 and sibling structs came back as 1-byte
-  unknowns. Size-vs-end double-check in the facade.
-- **R2.5 — `int32` silently dropped by the member-type parser.** The
-  member vanishes without error (`__int32` works). Alias or loud error
-  for the C `intN/uintN` typedef family.
-- **R2.6 — C-keyword member names dropped from the cdecl without
-  error.** (member named `inline` etc. — no message). Rename or loud
-  error, mirroring the E.21 keyword check for type names.
-- **R2.7 — E.22 (known, OPEN)** — wrapper-helper allocations
-  (`make_chain`/`kv_append`/`build_grid` allocate inside callees);
-  scanners don't follow. Compensate with `deep_scan` on the helper +
-  manual construction from disassembly.
+  `apply_type` items at global heads re-split to 1-byte items under
+  deferred auto-analysis (even after `auto_wait`). Robust path:
+  `del_items(DELIT_DELNAMES, span)` + `apply_tinfo(TINFO_DEFINITE)` +
+  `set_name` — survives save/reopen (verified).
+- **R2.4 — `apply_type` `del_items(ea, DELIT_SIMPLE, ea+size)` erodes
+  the .data tail.** The 3rd arg is an absolute END offset, not a byte
+  size: applying `char *[4]` at 0x6000 deleted items through
+  0x6020+0x20 and sibling structs came back as 1-byte unknowns.
+- **R2.5 — `int32`/`uintN` silently dropped** by the member-type
+  parser (member vanishes, no error; `__int32` works). Alias or loud
+  error for the C typedef family.
+- **R2.6 — C-keyword member names silently dropped** from the cdecl
+  (e.g. member `inline` — no message). Rename or loud error, mirroring
+  the type-name keyword check.
+- **R2.7 — E.22 confirmed (see above)** — no change; compensating
+  `deep_scan` on the helper + manual construction from disassembly.
 
-Round-2 delta vs round 1: `g_banner` corrected `char[21]` → `char[22]`
-(22-byte banner, applied + persisted); `Variant.as` remains a `u64`
-member — the union's four tags (`as_u32/as_i32/as_f32/as_ptr`) are not
-represented because the forge store has no union member type; offsets
-exact, needs the IDT path (`id`-domain) + re-commit of `ItemStack`/`Outer`
-for full member-type credit.
-
-### E-feat — ranked (round 1)
+## E-feat — ranked feature gaps
 
 - **E.13 `recover()` end-to-end pipeline — highest-value orchestration
-  gap** (postmortem verdict): store-struct allocate → scan → commit type
-  → re-scan with the fresh type → **rebind every recorded lvar/global to
-  the canonical type** → re-apply globals after a type re-file → drop
-  experiment/exhibit types. Nothing today re-applies when a better type
-  arrives later; that is exactly why the saved IDB shows exhibit scan
-  types painted over canonical ones (see F.8).
+  gap** (postmortem verdict): store-struct allocate → scan → commit
+  type → re-scan with the fresh type → **rebind every recorded
+  lvar/global to the canonical type** → re-apply globals after a type
+  re-file → drop experiment/exhibit types. Nothing today re-applies
+  when a better type arrives later; that is why the round-1 saved IDB
+  showed exhibit scan types painted over canonical ones (see F.8).
 - **E.14 Member naming from constants/strings** — magic values
   (`1347703345`, `0x1300000012`) and `strcpy` targets are the strongest
   naming evidence the scanner ignores; everything lands `u32_10`/
@@ -239,8 +126,8 @@ for full member-type credit.
   (Type deletion itself is E.27.)
 - **E.20 Tweak batch** — `push_type` one-size error string (surface the
   underlying cause); `nudge_members` echo new offsets; `get_member`
-  default `include_disabled=False`; `decompile(max_lines)` doc note that
-  mid-declaration slicing is unreliable (`line_range` is the path);
+  default `include_disabled=False`; `decompile(max_lines)` doc note
+  that mid-declaration slicing is unreliable (`line_range` is the path);
   `vtable_entries` on a non-vtable should say "not a code-pointer array"
   rather than return bare `[]`; `import_types` needs an N/A hint when
   the til has no foreign UDTs.
@@ -249,17 +136,17 @@ for full member-type credit.
 
 - **I.25 cross-function allocation discovery** returns no row when the
   callee returns a non-local expression (`return (T *)ptr;` with an
-  idx-less var) — lvar-index matching requires the returned value to be a
-  local assigned from an allocator (2026-08-13 live finding on
-  `grid_chain = build_grid_chain(...)`; `list_demo` verifies the mechanism
-  works where the premise holds).
-- **`cfunc.treeitems` is empty** on freshly decompiled functions on this
-  IDA 9.4 build — any new treeitem-based code must use the ctree-visitor
-  walk fallback (`visit_insn` hook, `apply_to(body, None)`,
-  `cit_return=80`), per `guess_allocation`'s iterators.
-- **Replay offset drift**: re-running curated scripts can shift committed
-  absolute offsets vs a prior session (+64..168 B observed) — re-verify
-  against disassembly, not the old store diff.
+  idx-less var) — lvar-index matching requires the returned value to be
+  a local assigned from an allocator (2026-08-13 live finding on
+  `grid_chain = build_grid_chain(...)`; `list_demo` verifies the
+  mechanism where the premise holds).
+- **`cfunc.treeitems` is empty** on freshly decompiled functions on
+  this IDA 9.4 build — any new treeitem-based code must use the
+  ctree-visitor walk fallback (`visit_insn` hook, `apply_to(body,
+  None)`, `cit_return=80`), per `guess_allocation`'s iterators.
+- **Replay offset drift**: re-running curated scripts can shift
+  committed absolute offsets vs a prior session (+64..168 B observed) —
+  re-verify against disassembly, not the old store diff.
 
 ## Future capabilities (ideas, in value order — not committed scope)
 
@@ -312,7 +199,7 @@ for full member-type credit.
 
 - The type-recovery recipe is deterministic (replayed twice): retype
   root → create_structure → deep_scan → rename from decompile semantics →
-  to_vtable → create_type → retype args → decompile to verify. A facade
+  to_vtable → commit type → retype args → decompile to verify. A facade
   `recover(root_ea, var_name="a1", name="...")` orchestrates the whole
   loop on `deep_scan(root_type=...)` + auto-create + `set_lvar_types`.
 - Acceptance: on a fresh DB, `recover(0x1400017A0, var_name="a1")`
@@ -328,7 +215,7 @@ for full member-type credit.
 ## Verification commands
 
 ```bash
-python -m pytest -q            # 554 passing
+python -m pytest -q            # 577 passing
 python -m ruff check src tests # clean
 git log --oneline main..HEAD   # pending commit list
 ```
@@ -344,19 +231,21 @@ git log --oneline main..HEAD   # pending commit list
   the structure-builder features need the decompiler.
 - When touching `types.py`, re-read the leimurr comment — the canonical
   warning for the tinfo-handle class of bug.
-- **Headless (ida-codemode / idalib) session notes, 2026-08-12/13**:
+- **Headless (ida-codemode / idalib) session notes, 2026-08-12/13/15**:
   - `importlib.reload(forge_api)` re-executes the module — the store
     catalog survives (it lives in `forge.api.store`), but module-level
     state like the guess visitor must be reloaded separately
-    (`importlib.reload(forge.features.guess_allocation.guess_allocation)`).
+    (`importlib.reload(forge.features.guess_allocation.guess_allocation)`);
+    or delete the whole module group (`del sys.modules[...]` for
+    `forge_api` + `forge*`) then re-import.
   - Idle workers disconnect after ~20 s lease — the installed
-    `ida-codemode` defaults are patched to `keepalive=600`
-    (`database.py`/`client.py`); takes effect after the MCP server
-    restarts. Keep curation scripts in one execute either way.
+    `ida-codemode` defaults are patched to `keepalive=600`; takes effect
+    after the MCP server restarts. Keep curation scripts in one execute
+    either way.
   - IDA 9.4 lvar API: `cfunc.set_lvar_type` gone; use
-    `modify_user_lvar_info(func_ea, MLI_TYPE, lvar_saved_info_t)` and pass
-    the flag (without `MLI_TYPE` it silently fails). `lvar.type` is a
-    callable. `rename_lvar` exists, `set_lvar_name` does not;
+    `modify_user_lvar_info(func_ea, MLI_TYPE, lvar_saved_info_t)` and
+    pass the flag (without `MLI_TYPE` it silently fails). `lvar.type`
+    is a callable. `rename_lvar` exists, `set_lvar_name` does not;
     `lvar.is_arg_var` is a property.
   - IDA 9.4 ctree: `cfunc.treeitems` empty; statement traversal uses
     `ctree_visitor_t.apply_to(body, None)` with the `visit_insn` hook;
