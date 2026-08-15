@@ -2099,12 +2099,16 @@ def refresh_types(*, include_names: bool = False) -> dict:
                 # update the type in place; keep the store's name unless
                 # the name is synthesized and include_names is requested
                 existing.tinfo = tinfo
-                if include_names and idb_member_name:
-                    is_aliased = getattr(existing, "_is_name_aliased", None)
-                    if callable(is_aliased) and is_aliased():
-                        if existing.name != idb_member_name:
-                            existing.name = idb_member_name
-                            renamed.append(idb_member_name)
+                _is_aliased = getattr(existing, "_is_name_aliased", None)
+                    if (
+                        include_names
+                        and idb_member_name
+                        and callable(_is_aliased)
+                        and _is_aliased()
+                        and existing.name != idb_member_name
+                    ):
+                        existing.name = idb_member_name
+                        renamed.append(idb_member_name)
             else:
                 structure.add_member(
                     Member(offset, tinfo, None, 0)
