@@ -49,16 +49,25 @@ every type in a reused .i64 as unverified and rebuild it anyway.
 > rebuilding the store from the til via `import_types()` and treat every
 > imported structure as unverified.
 
-Ground truth (for scoring ONLY, after the recovery pass is drafted):
-`tests/fixtures/c_pure_structs/` — `include/fixture.h` is the full type
-spec; `src/fixture.c` shows how the types flow. Do not open it during
-recovery.
+> **HARD GATE — ground truth is OFF-LIMITS until Phase 4 (Score).**
+> `tests/fixtures/c_pure_structs/` (`include/fixture.h` = the full type
+> spec; `src/fixture.c` = how the types flow) is scored-against truth.
+> It sits IN THIS REPO — do not open it for member lists, offsets,
+> names, sizes, placements, or "what the scanner missed". Opening it
+> before the final IDB state is committed invalidates the run: member
+> sets found by peeking are not recovered evidence, and builds justified
+> by the header must be recorded as gaps (type + "resolved from
+> ground truth, not binary evidence"). Judge scanner weakness ONLY from
+> the binary: disassembly, decompilation, format strings, xrefs.
+> The header opens for the FIRST time at Phase 4, after Apply.
 
 ## Scoring
 
-Build a ground-truth table from `fixture.h`: for each type — size, member
-offsets, member names, member types; for each global — its type; for each
-function — parameter types and the pointer types it passes around.
+Build a ground-truth table from `fixture.h` — **at Phase 4, AFTER the
+recovery+apply passes are committed** (the Phase 4 Score step; never
+during 1-3): for each type — size, member offsets, member names, member
+types; for each global — its type; for each function — parameter types
+and the pointer types it passes around.
 
 Score the final IDB state with an MCP script (read types via
 `type_of`/`get_structure`/`decompile`, never by eyeballing):
@@ -164,9 +173,14 @@ report those as found gaps.
    store and re-commit (`create_type(overwrite=True)`) — the point is the
    end state, not the path.
 5. Scan tools are the builder: `deep_scan`/`scan_global`/
-   `scan_from_allocation` are the primary mechanism for deriving layouts;
-   manual member construction is a fallback for scanner-blind spots and
-   must be listed in the report's gaps (type + missed-evidence reason).
+   `scan_from_allocation` are the primary mechanism for deriving layouts
+   — run them first and record their output, whatever it produced.
+   Manual member construction is a fallback ONLY for scanner-blind
+   spots proven from binary evidence (disassembly, decompilation,
+   format strings, xrefs) — never from the header — and each manual
+   build must be listed in the report's gaps (type + missed-evidence
+   reason). Divergence from the header is NOT a scanner failure: the
+   header is the score sheet, not the analysis input.
 6. **Update, never delete** (R3.1): there is no type-delete verb —
    `remove_type` is gone, `undo_type` refuses to delete a type the commit
    created, and `remove_structure` raises once the structure is committed
@@ -174,6 +188,14 @@ report those as found gaps.
    `set_member`) and re-commit with `create_type(..., overwrite=True)` —
    overwrite is now an in-place til update, so applied globals and
    retyped locals keep referencing the type.
+7. **Ground truth stays closed until Phase 4.** Do not read
+   `tests/fixtures/c_pure_structs/` (header, source, or any derived
+   listing of it) during Recon/Recover/Apply — not for names, offsets,
+   sizes, member sets, or "what the scanner missed". Ground truth is
+   the SCORE SHEET only; opening it mid-run makes every hand-built
+   member a scored-against-self cheat and the report's gaps dishonest.
+   If you find the analysis stuck, iterate on binary evidence; the
+   header opens at Phase 4, and not before. (R3.3)
 
 ## Phases
 
@@ -186,21 +208,29 @@ report those as found gaps.
    where they fit; (b) record the call's output in the report, whatever
    it produced (even "no evidence" rows count as the attempt); (c) only
    then hand-build/disassemble what the scanners genuinely cannot see
-   (helper-allocated nodes like `chain_node_new`, arrays, nested inlines)
-   and report each manual build — type, why the scanner missed it — in
-   the gaps section; (d) name members from the format-string evidence
+   (helper-allocated nodes like `chain_node_new`, arrays, nested
+   inlines), judged from the BINARY alone (disassembly, decompilation,
+   format strings, xrefs — the header stays closed per Rule 7) and
+   report each manual build — type, why the scanner missed it — in the
+   gaps section; (d) name members from the format-string evidence
    (`name_members_from_printf` before hand-naming).
 3. **Apply** — `finalize`/`create_type` (children first), `apply_type(
    ..., redefine_range=True)` on every global region (one call covers the
    whole span),`set_lvar_types` on the section runners so the pseudocode
    renders struct access.
-4. **Score** — the MCP scoring script vs the ground-truth table; fix
-   anything fixable, re-score, re-commit.
+4. **Score** — the ground-truth table is built HERE, from
+   `tests/fixtures/c_pure_structs/` — the FIRST time the header may be
+   opened (Rule 7); score the final IDB state with the MCP script vs
+   that table; fix anything fixable (recovery edits still count as
+   recovery — re-commit before scoring again), re-score, re-commit.
 5. **Report** — `docs/forge_api_recovery_eval_output.md` in this repo
    (round-1 lives at `H:/re/_random/c_structs/docs/forge_api_recovery_eval_output.md`)
    with: accuracy table (per struct/global/function + total %), every
    incorrect/missing item with the forge call that failed to produce it,
-   and the ranked forge gaps (these feed the TODO list).
+   the ranked forge gaps (these feed the TODO list), and a one-line
+   attestation: "ground truth opened at Phase 4 only" (Rule 7) — any
+   earlier opening must be named with the phase it happened in and the
+   builds it influenced.
 
 ## Acceptance
 

@@ -2,6 +2,21 @@
 
 All notable changes are tracked here. Format: date — change set (branch/commit).
 
+## 2026-08-15 — R3.3 eval-task ground-truth gate
+
+The eval agent was peeking at `tests/fixtures/c_pure_structs/` mid-run
+(header-driven `add_member`, "because scanner output diverged from
+fixture.h" — defeating the scan-first rules and making the gaps report
+dishonest). The eval task doc now declares ground truth a HARD GATE:
+- Rule 7: do not read `tests/fixtures/c_pure_structs/` (header, source,
+  or any derived listing) during Recon/Recover/Apply — the header opens
+  for the first time at Phase 4 (Score).
+- Rule 5 / Phase 2: manual builds are a fallback only for scanner-blind
+  spots proven from binary evidence (disassembly, decompilation, format
+  strings, xrefs); "diverges from the header" is not a scanner failure —
+  the header is the score sheet, not the analysis input.
+- Scoring/Phase 4: the ground-truth table is built at Phase 4 only.
+
 ## 2026-08-15 — R3.2 recovery-eval gap-fix wave (F1–F7)
 
 Recovery-eval round 2 gaps closed: four real fixes, one exercised-at-
