@@ -72,7 +72,6 @@ __all__ = [
     "refresh_types",
     "remove_members",
     "remove_structure",
-    "remove_type",
     "rename_ea",
     "rename_local",
     "rename_structure",
@@ -1452,12 +1451,26 @@ def remove_structure(name: str | None = None) -> bool:
     With ``name`` None, removes the current structure. Returns whether a
     structure was removed.
 
+    REFUSES (raises :class:`ForgeApiError`) when the structure has been
+    committed to the IDB — a committed type is the end state, never a
+    scratch object: fix its layout in place with ``remove_members`` /
+    ``add_member`` / ``set_member`` and re-``create_type(overwrite=True)``
+    (the update path, which never deletes the applied type). Uncommitted
+    (never-``create_type``-ed) structures may be removed freely; the store
+    is the working area, the IDB is the record.
+
     Returns:
         bool.
     """
     structure = _resolve_structure(name, required=False)
     if structure is None:
         return False
+    if getattr(structure, "created_type_name", None) is not None:
+        raise ForgeApiError(
+            f"structure {structure.name!r} is committed to the IDB — do not "
+            "delete it. Update it in place (remove_members/add_member/"
+            "set_member) and re-commit with create_type(..., overwrite=True)."
+        )
     del _structures[structure.name]
     for other in _structures.values():
         other.remove_relationships_with(structure.name)
@@ -3339,40 +3352,6 @@ def create_type(name: str | None = None, *, overwrite: bool = False) -> dict:
 @api(
     group="types",
     returns="dict",
-    example='r = forge_api.remove_type("Recovered"); r["removed"]',
-)
-def remove_type(name: str) -> dict:
-    """Delete a named IDB type and drop its TypeMirror baseline (E27).
-
-    Removes the type via :meth:`Structure._delete_named_type` — the
-    ordinal-delete path (the name-delete is a silent no-op on IDA 9.4).
-    The ``TypeMirror`` baseline entry (:func:`import_types`/
-    :func:`refresh_types` bookkeeping) is removed alongside. ``removed``
-    is False when ``name`` was not a known type (``ok`` still True — the
-    end state is "no such type").
-
-    Returns:
-        ``{"ok": bool, "removed": bool, "name": str}``.
-    """
-    _require_ida()
-    from forge.api.structure import Structure
-
-    existed = Structure._named_type_exists(name)
-    ok = Structure._delete_named_type(name)
-    with contextlib.suppress(Exception):
-        mirror = _mirror_store()
-        if name in mirror:
-            del mirror[name]
-    return {
-        "ok": ok,
-        "removed": existed and not Structure._named_type_exists(name),
-        "name": name,
-    }
-
-
-@api(
-    group="types",
-    returns="dict",
     example='r = forge_api.create_typedef("DispatchFn", "int (__cdecl *)(void *, unsigned int)")',
 )
 def create_typedef(name: str, declaration: str) -> dict:
@@ -3431,13 +3410,13 @@ def undo_type(name: str) -> dict:
     the prior cdecl before every commit that changes a type; ``undo_type``
     restores it via :meth:`Structure.set_cdecl` (``overwrite=True``,
     dialog-free) and consumes the snapshot. When the type did not exist
-    before the commit, it is removed instead. Returns an error dict when
-    no snapshot exists.
+    before the commit, there is nothing to restore to — the revert is
+    REFUSED with an error instead of deleting: a committed type is
+    updated, never deleted (an applied/comitted type must not dangle).
+    Returns an error dict when no snapshot exists.
 
     Returns:
-        ``{"ok": True, "restored_declaration": str}``,
-        :func:`remove_type`'s result when the type was created by the
-        commit (no prior declaration), or an error dict.
+        ``{"ok": True, "restored_declaration": str}``, or an error dict.
     """
     _require_ida()
     from forge.api.structure import Structure
@@ -3454,7 +3433,13 @@ def undo_type(name: str) -> dict:
         if name in mirror:
             del mirror[name]
     if prior is None:
-        return remove_type(name)
+        return {
+            "ok": False,
+            "error": f"no prior declaration for {name!r} — the type was created "
+            "by the commit. Update it instead: edit the store structure "
+            "(remove_members/add_member/set_member) and re-commit with "
+            "create_type(..., overwrite=True).",
+        }
     structure = Structure(name)
     restored = structure.set_cdecl(prior, structure.main_offset, overwrite=True)
     if restored is None:

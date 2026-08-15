@@ -2,6 +2,24 @@
 
 All notable changes are tracked here. Format: date — change set (branch/commit).
 
+## 2026-08-15 — R3.1 update-not-delete wave (eval round 3)
+
+Agent-facing delete paths removed; committed types are updated in place.
+
+- `remove_type` deleted from the facade (E.27 reverted): a committed
+  type is the end state — fix layouts with `remove_members`/`add_member`/
+  `set_member` and re-commit `create_type(overwrite=True)`.
+- `undo_type` refuses when the commit created the type (no prior
+  declaration) instead of calling `remove_type` — nothing deletes a
+  committed type anymore.
+- `remove_structure` raises ForgeApiError for structures committed to
+  the IDB (store purge only for uncommitted WIP).
+- `create_type(..., overwrite=True)` updates the til IN PLACE via
+  `update_named_type` (fallback: old delete+recreate) — the ordinal
+  survives, so applied globals and retyped locals never reference a
+  deleted type (delete+recreate by ordinal dangled applied items on the
+  9.4 idalib worker).
+
 ## 2026-08-15 — ALL-forge-TODOs closure wave (`726dd8b`, `01cee06`, `91b95a6`, `b93eaf1`, `cb55b3f`)
 
 Every open item (R2.1–R2.6, E.13–E.29, F.1–F.8) implemented in the

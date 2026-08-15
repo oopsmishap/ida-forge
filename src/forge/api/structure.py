@@ -856,8 +856,8 @@ class Structure:
             )
             return None
 
-        # The overwrite flow deletes the old type before creating the new
-        # one. Validate the edited declaration first so a malformed edit
+        # The overwrite flow used to delete the old type before creating the
+        # new one. Validate the edited declaration first so a malformed edit
         # cannot destroy the existing type (the DB would end up with no
         # type at all — which silently breaks child scans on the parent).
         if not self._declaration_parses(cdecl):
@@ -867,6 +867,31 @@ class Structure:
                 True,
             )
             return None
+
+        # R3.1 (eval review 2026-08-15): overwrite is an UPDATE, not a
+        # delete. ``update_named_type`` replaces the type in place — the
+        # ordinal survives, so every applied item / typedef consumer keeps
+        # referencing the type (delete+recreate by ordinal left applied
+        # globals pointing at a deleted type on the idalib worker).
+        update_fn = getattr(ida_typeinf, "update_named_type", None)
+        if callable(update_fn):
+            try:
+                parsed = ida_typeinf.tinfo_t()
+                if ida_typeinf.parse_decl(
+                    parsed,
+                    ida_typeinf.get_idati(),
+                    cdecl,
+                    ida_typeinf.PT_TYP | ida_typeinf.PT_SIL,
+                ) and update_fn(ida_typeinf.get_idati(), structure_name, parsed):
+                    self.created_type_name = structure_name
+                    log_debug(f"Updated type {structure_name} in place")
+                    return self._apply_scanned_variable_types(
+                        structure_name, origin
+                    )
+            except Exception as exc:  # noqa: BLE001 — fall back to delete+recreate
+                log_debug(
+                    f"in-place update unavailable for {structure_name}: {exc}"
+                )
 
         if not self._delete_named_type(structure_name):
             log_error(

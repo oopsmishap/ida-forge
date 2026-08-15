@@ -39,7 +39,10 @@ the detail lives in CHANGELOG.md 2026-08-15:
   **E.24** `(offset, name, type)` member triple match.
   **E.25** `scan_global` exclusive-tail extension for data-referenced
   boundary heads. **E.26** mirror honesty (`skipped` reason dict,
-  `refresh_types(include_names=)`). **E.27** `remove_type`.
+  `refresh_types(include_names=)`). ~~**E.27** `remove_type`~~ — removed
+  by R3.1 (update-not-delete: `create_type(overwrite=True)` now updates
+  the til in place; `undo_type` refuses to delete; `remove_structure`
+  refuses committed structures).
   **E.28** inline-union member parse + pack (live: `VariantT` 16 B, 4
   tags). **E.29** `create_typedef`. **E.14** `name_members_from_printf`
   (live: PointerParent members named from `log_msg` formats: parent/

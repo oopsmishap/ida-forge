@@ -66,7 +66,11 @@ Score the final IDB state with an MCP script (read types via
 - **Structs (60%)**: per struct — 40% layout (size + every member offset
   exact), 30% member names, 30% member types (pointer targets count: a
   `Kid *` member named `first` beats `u64` + `first`). All types from the
-  header must be present and committed in the IDB.
+  header must be present and committed in the IDB. A struct whose
+  recovery transcript shows NO scanner call (`deep_scan`/`shallow_scan`/
+  `scan_global`/`scan_from_allocation`) before its manual work caps at
+  50% of the struct bucket — the scanners are the builder, manual
+  construction is the documented fallback, not the default.
 - **Globals (20%)**: each global renders as its struct type
   (`apply_type(..., redefine_range=True)` — this now covers the WHOLE
   byte span as one struct item, no manual `create_struct` needed), arrays
@@ -80,7 +84,7 @@ Score the final IDB state with an MCP script (read types via
 Report per-item exact/partial/missing with evidence (call + output), and
 a final percentage.
 
-## Forge state at this run (2026-08-13, post `45b9d2a`)
+## Forge state at this run (2026-08-15 — R3.1 update-not-delete; earlier: post `45b9d2a`)
 
 Working as intended — do not work around these:
 
@@ -106,6 +110,18 @@ Working as intended — do not work around these:
   non-overlapping ranges. (R2.4.)
 - `int32`/`uintN` shorthand does not parse in member types — use
   `__intN`/`unsigned __intN`. (R2.5.)
+- **Update, never delete (R3.1):** `remove_type` no longer exists;
+  `undo_type` refuses when there is no prior declaration to restore;
+  `remove_structure` raises for any structure committed to the IDB.
+  Layout corrections are in-place edits (`remove_members`/`add_member`/
+  `set_member`) followed by `create_type(..., overwrite=True)`, which
+  now UPDATES the til in place (`update_named_type`) — the ordinal
+  survives, so applied globals and retyped locals never dangle.
+- The headless store IS the store the GUI structure-builder reads (one
+  shared catalog, persisted in the DB's netnodes) — a structure created
+  with `create_structure` shows in the builder on a warm GUI reopen; a
+  headless run simply has no form open. Save the DB (`save_database`)
+  before the worker drops or the last edits are lost.
 
 Your primary grind: committing your recoveries in the IDB so globals
 render and pseudocode shows real member access.
@@ -133,20 +149,29 @@ disassembly of the helper, and report it as a found gap.
    `scan_from_allocation` are the primary mechanism for deriving layouts;
    manual member construction is a fallback for scanner-blind spots and
    must be listed in the report's gaps (type + missed-evidence reason).
+6. **Update, never delete** (R3.1): there is no type-delete verb —
+   `remove_type` is gone, `undo_type` refuses to delete a type the commit
+   created, and `remove_structure` raises once the structure is committed
+   to the IDB. Fix layouts in place (`remove_members`/`add_member`/
+   `set_member`) and re-commit with `create_type(..., overwrite=True)` —
+   overwrite is now an in-place til update, so applied globals and
+   retyped locals keep referencing the type.
 
 ## Phases
 
 1. **Recon** — map functions, globals, and every printf format string
    (they carry member name evidence). Plan which section runner feeds
    which struct. (ida-domain work.)
-2. **Recover** — every layout MUST come from scanner evidence: per
-   section, drive `deep_scan` with a root type from the allocation site,
-   or `scan_global`/`scan_from_allocation` where they fit; commit what
-   the scanner derived. Hand-build/disassemble only what the scanners
-   genuinely cannot see (helper-allocated nodes like `chain_node_new`,
-   arrays, nested inlines) AND report each manual build — type, why the
-   scanner missed it — in the gaps section. Name members from the
-   format-string evidence (forge naming + idc reads).
+2. **Recover** — every layout MUST come from scanner evidence, in this
+   ORDER per struct: (a) run the scanner first — `deep_scan` with a root
+   type from the allocation site, or `scan_global`/`scan_from_allocation`
+   where they fit; (b) record the call's output in the report, whatever
+   it produced (even "no evidence" rows count as the attempt); (c) only
+   then hand-build/disassemble what the scanners genuinely cannot see
+   (helper-allocated nodes like `chain_node_new`, arrays, nested inlines)
+   and report each manual build — type, why the scanner missed it — in
+   the gaps section; (d) name members from the format-string evidence
+   (`name_members_from_printf` before hand-naming).
 3. **Apply** — `finalize`/`create_type` (children first), `apply_type(
    ..., redefine_range=True)` on every global region (one call covers the
    whole span),`set_lvar_types` on the section runners so the pseudocode

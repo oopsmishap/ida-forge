@@ -53,7 +53,9 @@ commit → apply → mirror.
 
 - **meta**: `help(topic)`, `to_hex`.
 - **store**: create_structure, get_structure, structures, set_current,
-  remove_structure, duplicate_structure, rename_structure, add_member,
+  remove_structure (STORE-ONLY purge; raises ForgeApiError once the
+  structure is committed to the IDB — update committed types in place),
+  duplicate_structure, rename_structure, add_member,
   set_member (`member_name=` disambiguates collision-offset pairs;
   editing fields), remove_members, get_member (offset + `member_name=`),
   nudge_members, auto_resolve.
@@ -61,11 +63,18 @@ commit → apply → mirror.
   (ea + var_name/var_index/item_ea + structure + root_type + recurse_calls/
   max_depth), scan_global(ea, span), guess_allocation(ea, var_name),
   scan_from_allocation(ea, var_name=..., name=..., root_type=..., commit=).
-- **build/apply**: create_type (overwrite=True refines; non-placeholder
-  existing types abort when overwrite=False), finalize, finalize_all
-  (children first; failure rows carry `error` + `created_names`),
-  create_child_types, apply_type(ea, decl, redefine_range=True) — the
-  WHOLE span becomes one struct item (no manual create_struct).
+- **build/apply**: create_type (overwrite=True UPDATES in place via
+  `update_named_type` — the ordinal survives, applied items never
+  dangle; non-placeholder existing types abort when overwrite=False),
+  undo_type (restores the pre-commit declaration; REFUSES when the type
+  was created by the commit — there is no delete path), finalize,
+  finalize_all (children first; failure rows carry `error` +
+  `created_names`), create_child_types, apply_type(ea, decl,
+  redefine_range=True) — the WHOLE span becomes one struct item (no
+  manual create_struct).
+- **types**: create_typedef — and NO delete verbs: `remove_type` does
+  not exist. Fix a layout with `remove_members`/`add_member`/`set_member`
+  and re-commit with `create_type(..., overwrite=True)`.
 - **naming**: rename_local, set_lvar_types (C types on args/locals;
   `scope=`), rename_ea (functions/globals — ida_name.set_name SN_NOCHECK),
   set_func_proto (function prototypes; works headless).
@@ -85,16 +94,18 @@ commit → apply → mirror.
 2. Build: `create_structure("Name")` then `add_member(name, offset,
    "Type *", name=...)` — self/forward references parse before any IDB
    type exists (lazy placeholder).
-3. Recover: `deep_scan(ea, var_name=..., root_type="Type *")` or
-   `scan_from_allocation`. KNOWN GAP: scans do NOT follow wrapper
-   helpers (`v = node_new(...)` with the calloc inside) — deep_scan the
-   callee instead.
+3. Recover — SCAN FIRST, always: `deep_scan(ea, var_name=...,
+   root_type="Type *")` or `scan_from_allocation` / `scan_global` before
+   any manual construction; keep the call's output as evidence. KNOWN
+   GAP: scans do NOT follow wrapper helpers (`v = node_new(...)` with
+   the calloc inside) — deep_scan the callee instead.
 4. De-noise: scanners emit hypotheses + byte-granular junk — trim with
    `remove_members` / `set_member(enabled=False)`, keep evidence-based
    names.
 5. Commit: `create_type(name, overwrite=True)` / `finalize` — children
    before parents, or just re-commit (the parent re-binds member types
-   automatically).
+   automatically). NEVER delete: there is no type-delete verb; correct a
+   committed layout in place and re-commit.
 6. Globals: `apply_type(ea, "Name", redefine_range=True)`.
 7. Retype: `set_lvar_types` on section runners; rename functions with
    `rename_ea`.

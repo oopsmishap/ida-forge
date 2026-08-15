@@ -2456,58 +2456,37 @@ def test_e6_inverse_if_skips_else_less_ifs(monkeypatch):
     assert forge_api.inverse_if(0x140001000, 0x4010) is False
 
 
-def test_remove_type_deletes_named_type(monkeypatch):
-    """E27: remove_type deletes the IDB type (ordinal path) and drops the
-    TypeMirror baseline."""
-    from forge.api import structure as structure_mod
+def test_remove_type_verb_does_not_exist():
+    """R3.1: the delete verb is gone — agents update committed types via
+    create_type(overwrite=True), they never delete them."""
+    assert not hasattr(forge_api, "remove_type")
+    assert "remove_type" not in forge_api.__all__
 
-    existing = {"Recovered"}
 
-    def _fake_exists(name):
-        return name in existing
+def test_remove_structure_refuses_committed_structure(monkeypatch):
+    """R3.1: a store structure committed to the IDB cannot be removed —
+    deleting it would orphan applied items; update in place instead."""
+    monkeypatch.setattr(forge_api, "_resolve_structure", lambda name, required=True: SimpleNamespace(
+        name="Committed", created_type_name="Committed"
+    ))
 
-    def _fake_delete(name):
-        existing.discard(name)
-        return True
+    with pytest.raises(forge_api.ForgeApiError, match="committed to the IDB"):
+        forge_api.remove_structure("Committed")
 
+
+def test_remove_structure_allows_uncommitted(monkeypatch):
+    """R3.1: uncommitted store work is a scratch area and may be removed."""
+    structures = {"Wip": SimpleNamespace(name="Wip", created_type_name=None)}
+    monkeypatch.setattr(forge_api, "_structures", structures)
     monkeypatch.setattr(
-        structure_mod.Structure, "_named_type_exists", staticmethod(_fake_exists),
+        forge_api, "_resolve_structure",
+        lambda name, required=True: structures.get(name),
         raising=False,
     )
-    monkeypatch.setattr(
-        structure_mod.Structure, "_delete_named_type", staticmethod(_fake_delete),
-        raising=False,
-    )
-    mirror = {"Recovered": {"hash": "x"}}
-    monkeypatch.setattr(forge_api, "_mirror_store", lambda: mirror)
+    monkeypatch.setattr(forge_api, "_state", SimpleNamespace(current="Wip"))
 
-    result = forge_api.remove_type("Recovered")
-
-    assert result == {"ok": True, "removed": True, "name": "Recovered"}
-    assert mirror == {}  # baseline dropped
-
-
-def test_remove_type_missing_type_reports_removed_false(monkeypatch):
-    from forge.api import structure as structure_mod
-
-    def _fake_exists(name):
-        return False
-
-    monkeypatch.setattr(
-        structure_mod.Structure, "_named_type_exists", staticmethod(_fake_exists),
-        raising=False,
-    )
-    monkeypatch.setattr(
-        structure_mod.Structure,
-        "_delete_named_type",
-        staticmethod(lambda name: True),
-        raising=False,
-    )
-    monkeypatch.setattr(forge_api, "_mirror_store", dict)
-
-    result = forge_api.remove_type("NoSuch")
-
-    assert result == {"ok": True, "removed": False, "name": "NoSuch"}
+    assert forge_api.remove_structure("Wip") is True
+    assert structures == {}
 
 
 def test_undo_type_snapshot_and_restore(monkeypatch):
@@ -2548,23 +2527,24 @@ def test_undo_type_snapshot_and_restore(monkeypatch):
     assert snap == {}  # snapshot consumed
 
 
-def test_undo_type_removes_type_created_by_commit(monkeypatch):
-    """E17: a commit that CREATED the type (no prior declaration) undoes by
-    removing it."""
+def test_undo_type_refuses_to_delete_type_created_by_commit(monkeypatch):
+    """R3.1: a commit that CREATED the type (no prior declaration) cannot be
+    undone by deletion — the type may already be applied. Update instead."""
     snap = {"S": {"before": None, "after": "struct S { int x; };"}}
     monkeypatch.setattr(forge_api, "_UNDO_STORE", lambda: snap)
-    removed = []
-    monkeypatch.setattr(
-        forge_api,
-        "remove_type",
-        lambda name: removed.append(name) or {"ok": True, "removed": True, "name": name},
-        raising=False,
-    )
 
     result = forge_api.undo_type("S")
 
-    assert result["removed"] is True
-    assert removed == ["S"]
+    assert result == {
+        "ok": False,
+        "error": (
+            "no prior declaration for 'S' — the type was created by the "
+            "commit. Update it instead: edit the store structure "
+            "(remove_members/add_member/set_member) and re-commit with "
+            "create_type(..., overwrite=True)."
+        ),
+    }
+    assert snap == {}  # snapshot consumed either way
 
 
 def test_undo_type_missing_snapshot_errors(monkeypatch):
