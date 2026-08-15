@@ -2,6 +2,30 @@
 
 All notable changes are tracked here. Format: date — change set (branch/commit).
 
+## 2026-08-15 — R3.8 reopening apply + void/apply-noise fixes
+
+Reports: in the GUI, "Create Type" created the type but applied nothing,
+and IDA kept printing "Void type is forbidden here". Findings & fixes:
+
+- **Apply survives reloads**: live scan objects are never serialized, so
+  after ANY database reopen a commit applied to zero sites (silently
+  since R3.5's per-site try/except). Commit now re-applies from the
+  PERSISTED netnode rows (R3.6) when live objects are gone — locals by
+  (func_ea, var) via `modify_user_lvar_info`, globals by recorded ea.
+  Live-proven: scan+commit → close → warm reopen → re-commit applies
+  8/8 sites and the DB lvars carry `Struct *`.
+- **A rowless refresh erased the persisted rows**: `_refresh_scan_sites`
+  overwrote the netnode rows with an empty live set after reloads —
+  now mirrors the catalog payload rule (live wins, else keep rows).
+- **Void-typed members are skipped at pack time with a named warning** —
+  IDA's "Void type is forbidden here" names no member; forge now does.
+  (All `void *` shapes are legal — verified live with a 14-case parser
+  matrix; only bare `void`/`typedef void` members trigger it.)
+- **Apply failures are audible again**: when every recorded site fails
+  to apply, the commit warns with the structure name and the fix
+  (re-scan / reapply); debug logs name the failing site.
+- 663 tests green, ruff clean.
+
 ## 2026-08-15 — R3.7 integral-pointee member-apply noise fix
 
 Recurring `WARNING: Structure _DWORD is not a known type; member ...

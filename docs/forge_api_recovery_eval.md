@@ -129,15 +129,20 @@ Working as intended — do not work around these:
   store never held — rename via `rename_member(name, offset, new_name)`
   (R3.2 F2). The store is NOT changed: rename AFTER the last
   `create_type(overwrite=True)` re-commit, or the rename is lost.
-- Scan evidence is visible and persistent (R3.5/R3.6): `scan_sites(
-  name)` lists every recorded site (func_ea/var, stored in the IDB's
-  netnodes — survives worker drops and warm reopens), and every
-  `create_type`/`finalize` result reports `applied_sites` — the sites
-  the pointer type was actually applied to on that commit. An empty
-  `applied_sites` with scans recorded means the evidence is NOT
-  attached to the committed structure (hand-rebuilt members carry no
-  scan objects): re-scan into the store structure, then commit;
-  `reapply(name)` re-runs the apply step.
+- Scan evidence is visible and persistent (R3.5/R3.6/R3.8):
+  `scan_sites(name)` lists every recorded site (func_ea/var, stored in
+  the IDB's netnodes — survives worker drops and warm reopens), and
+  every `create_type`/`finalize` result reports `applied_sites` — the
+  sites the pointer type was actually applied to on that commit. After
+  a reopen the LIVE scan objects are gone but the rows survive, so the
+  commit RE-APPLIES from the persisted rows (locals by func_ea+var,
+  globals by ea) — the GUI's "apply across scanned locations" works
+  across sessions. An `applied_sites: []` with sites recorded means the
+  evidence is not attached — re-scan into the store structure, then
+  commit; `reapply(name)` re-runs the apply step. Void-typed members
+  are skipped at pack time with a named warning (IDA's "Void type is
+  forbidden here" is undiagnosable), and per-site apply failures warn
+  instead of vanishing silently.
 - Hex-Rays only renders global member access when the reach is
   `lea reg, stru_xxx.field`; literal-address `qword_...` operands stay
   untyped (compiler artifact — workaround: apply the type at the

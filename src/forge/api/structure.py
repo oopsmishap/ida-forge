@@ -33,6 +33,58 @@ def _strip_pragma_decl(cdecl: str) -> str:
     return re.sub(r"^#pragma pack\([^\n]*\)\s*", "", cdecl, count=1)
 
 
+def _apply_lvar_pointer_type(func_ea: int, var: str, structure_name: str) -> bool:
+    """Retype the local named ``var`` in ``func_ea`` to ``Name *`` (R3.8).
+
+    Row-based fallback of the F.1 variable apply: the persisted scan
+    rows carry (func_ea, var); the live lvar is matched by NAME (the
+    live path matches by location/defea, which the rows do not store).
+    Commits through the same ``modify_user_lvar_info(MLI_TYPE)``
+    mechanism, so the effect is identical after a database reload.
+    """
+    import ida_hexrays
+
+    from forge.api.hexrays import decompile as _decompile
+    from forge.api.members import parse_user_tinfo
+
+    try:
+        cfunc = _decompile(func_ea)
+        if cfunc is None:
+            return False
+        lvar = next(
+            (
+                candidate
+                for candidate in cfunc.get_lvars()
+                if getattr(candidate, "name", None) == var
+            ),
+            None,
+        )
+        if lvar is None:
+            return False
+        tinfo = parse_user_tinfo(f"{structure_name} *")
+        if tinfo is None:
+            return False
+        lvi = ida_hexrays.lvar_saved_info_t()
+        lvi.ll = ida_hexrays.lvar_locator_t(lvar.location, lvar.defea)
+        lvi.type = tinfo
+        ida_hexrays.modify_user_lvar_info(
+            cfunc.entry_ea, ida_hexrays.MLI_TYPE, lvi
+        )
+        return True
+    except Exception:  # noqa: BLE001 — row-based apply is best-effort
+        return False
+
+
+def _apply_ea_pointer_type(ea: int, tinfo) -> bool:
+    """Apply ``tinfo`` at a recorded global site (R3.8 row fallback)."""
+    try:
+        return bool(
+            ida_typeinf.apply_tinfo(ea, tinfo, ida_typeinf.TINFO_DEFINITE)
+        )
+    except Exception:  # noqa: BLE001 — best-effort
+        return False
+
+
 @contextmanager
 def _type_write_undo(action: str):
     """Run a destructive type write inside an IDA undo snapshot.
@@ -687,6 +739,20 @@ class Structure:
         current_offset = origin
 
         for index, member in packable_members:
+            # R3.8: a member whose type resolves to void can never commit
+            # — IDA's parser rejects it ("Void type is forbidden here")
+            # with a message that says nothing about WHICH member. Skip
+            # it loudly so the failure is diagnosable instead.
+            member_tinfo = getattr(member, "tinfo", None)
+            is_void = getattr(member_tinfo, "is_void", None)
+            if callable(is_void) and is_void():
+                log_warning(
+                    f"Skipping void-typed member {member.name} at "
+                    f"0x{member.offset:x} in {struct_name} — IDA forbids "
+                    "void members; set a real type or disable the member."
+                )
+                continue
+
             gap_size = member.offset - current_offset
             if gap_size > 0:
                 udt_data.push_back(
@@ -807,6 +873,7 @@ class Structure:
         # members carry no scanned variables — re-scan INTO this
         # structure before committing.
         applied: list[dict] = []
+        failed: list = []
         seen_targets: set[tuple] = set()
         for scan_object in self.get_unique_scanned_variables(origin):
             target_key = (
@@ -824,8 +891,45 @@ class Structure:
                 log_debug(
                     f"apply failed for {scan_object!r} after commit: {exc}"
                 )
+                failed.append(scan_object)
                 continue
             applied.append(self._scan_site_row(scan_object))
+
+        # R3.8: when the live scan objects are gone (catalog reload /
+        # warm reopen — scan objects are never serialized, only their
+        # rows), re-apply from the PERSISTED rows (netnode payload):
+        # locals via modify_user_lvar_info by (func_ea, var), globals
+        # via the recorded ea. Keeps the GUI's "apply across scanned
+        # locations" and headless commits alive across sessions.
+        if not seen_targets and self.scan_sites_rows:
+            from forge.api.hexrays import is_code as _is_code
+
+            for row in self.scan_sites_rows:
+                var = row.get("var")
+                func_ea = row.get("func_ea")
+                site_ea = row.get("ea")
+                is_global_ea = (
+                    site_ea
+                    and site_ea not in (None, 0, idaapi.BADADDR)
+                    and not _is_code(site_ea)
+                )
+                ok = False
+                if var and func_ea and func_ea != idaapi.BADADDR and not is_global_ea:
+                    ok = _apply_lvar_pointer_type(func_ea, var, structure_name)
+                elif is_global_ea:
+                    ok = _apply_ea_pointer_type(site_ea, tinfo)
+                if ok:
+                    applied.append(dict(row))
+                else:
+                    failed.append(row)
+
+        if failed and not applied:
+            log_warning(
+                f"Applied the committed type to none of the recorded "
+                f"scan sites (structure {structure_name}); re-scan into "
+                f"the structure (deep_scan with structure={structure_name!r}) "
+                "or call reapply after the sites are recorded."
+            )
         self.last_apply_sites = applied
         return tinfo
 

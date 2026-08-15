@@ -2591,10 +2591,13 @@ def _refresh_scan_sites(target) -> None:
     Call after any scan merges evidence into ``target``: the rows land in
     the catalog's netnode payload on the next ``_mark_dirty``, so
     :func:`scan_sites` answers from the DB after any reopen/rebuild.
+    Live member scan objects win; with none (reloaded catalog) the
+    previously persisted rows are KEPT — a rowless refresh must not
+    erase the DB's record (R3.8).
     """
-    from forge.api.store import _live_scan_site_rows
+    from forge.api.store import _scan_sites_payload
 
-    target.scan_sites_rows = _live_scan_site_rows(target)
+    target.scan_sites_rows = _scan_sites_payload(target)
 
 
 @api(

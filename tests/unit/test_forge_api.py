@@ -211,6 +211,64 @@ def test_set_cdecl_wraps_pragma_pack(monkeypatch):
     assert captured[2][1] == body
 
 
+def test_build_cdecl_skips_void_typed_members(monkeypatch):
+    """R3.8: a void-typed member is skipped at pack time with a warning —
+    IDA rejects `void` members ("Void type is forbidden here") and the
+    failure used to be un-diagnosable."""
+    from forge.api import structure as structure_mod
+    from forge.api.members import Member, parse_user_tinfo
+
+    class _VoidTinfo:
+        def is_void(self):
+            return True
+
+        def is_floating(self):
+            return False
+
+        def is_int(self):
+            return False
+
+        def is_integral(self):
+            return False
+
+        def is_ptr(self):
+            return False
+
+        def is_array(self):
+            return False
+
+        def is_signed(self):
+            return False
+
+        def dstr(self):
+            return "void"
+
+        def get_size(self):
+            return 0
+
+    structure = structure_mod.Structure("V")
+    structure.add_member(
+        Member(0, _VoidTinfo(), None, 0)
+    )
+    structure.add_member(
+        Member(8, parse_user_tinfo("u32"), None, 0)
+    )
+    structure.pack = 1
+
+    monkeypatch.setattr(
+        structure_mod.ida_typeinf,
+        "print_tinfo",
+        lambda *a, **k: "struct V { unsigned __int32 b; };",
+        raising=False,
+    )
+    result = structure.build_cdecl()
+
+    assert result is not None
+    _, cdecl = result
+    assert "void" not in cdecl
+    assert "unsigned __int32" in cdecl
+
+
 def test_set_cdecl_pragma_survives_overwrite_gate(monkeypatch):
     """R3.2 (F1): the overwrite gate and the update_named_type branch
     parse the STRIPPED body (parse_decl rejects preprocessor lines),
@@ -368,6 +426,65 @@ def test_create_type_persists_scan_sites_after_commit(monkeypatch):
     assert result["ok"] is True
     seen = {row["var"] for row in structure.scan_sites_rows}
     assert "a1" in seen
+
+
+def test_apply_scanned_variables_row_fallback_after_reload(monkeypatch):
+    """R3.8: after a catalog reload the live scan objects are gone —
+    the commit re-applies from the PERSISTED rows ((func_ea, var) for
+    locals, ea for globals), so the GUI's "apply across scanned
+    locations" works across sessions."""
+    import forge.api.structure as structure_mod
+
+    forge_api.create_structure("S")
+    forge_api.add_member("S", 0, "u32")
+    structure = forge_api._resolve_structure("S")
+    structure.scan_sites_rows = [
+        {"func_ea": 0x401000, "var": "v0", "ea": 0x401000, "type": None,
+         "member_offset": 0},
+        {"func_ea": 0x140000000, "var": "g_world", "ea": 0x140006000,
+         "type": None, "member_offset": 8},
+    ]
+    lvar_calls = []
+    ea_calls = []
+    monkeypatch.setattr(
+        structure_mod,
+        "_apply_lvar_pointer_type",
+        lambda func_ea, var, name: lvar_calls.append((func_ea, var, name)) or True,
+    )
+    monkeypatch.setattr(
+        structure_mod,
+        "_apply_ea_pointer_type",
+        lambda ea, tinfo: ea_calls.append((ea, tinfo)) or True,
+    )
+    monkeypatch.setattr(
+        structure_mod.Structure,
+        "_load_named_type",
+        lambda self, name: object(),
+        raising=False,
+    )
+    import forge.api.hexrays as hexrays_mod
+
+    monkeypatch.setattr(
+        hexrays_mod, "is_code", lambda ea: ea != 0x140006000, raising=False
+    )
+    monkeypatch.setattr(
+        structure_mod.ida_typeinf,
+        "tinfo_t",
+        lambda *a, **k: _FakeTinfoWithCreatePtr(),
+        raising=False,
+    )
+
+    structure._apply_scanned_variable_types("S", 0)
+
+    assert lvar_calls == [(0x401000, "v0", "S")]
+    assert len(ea_calls) == 1
+    assert ea_calls[0][0] == 0x140006000
+    assert structure.last_apply_sites == structure.scan_sites_rows
+
+
+class _FakeTinfoWithCreatePtr:
+    def create_ptr(self, *a, **k):
+        return True
 
 
 def test_create_type_re_resolves_placeholder_member_sizes(monkeypatch):
