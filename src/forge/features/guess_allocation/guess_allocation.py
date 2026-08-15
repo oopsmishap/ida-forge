@@ -201,58 +201,18 @@ class GuessAllocationVisitor(RecursiveUpwardsObjectVisitor):
     def _iter_returned_exprs(cfunc):
         """Yield the expression of every ``return <expr>`` statement.
 
-        Same treeitems → ctree-visitor fallback as
-        :meth:`_iter_assignment_sites` (treeitems is empty on the live
-        9.4 build, O1 finding 2026-08-13).
+        Delegates to :func:`forge.api.hexrays.iter_returned_exprs` (the
+        shared walker, F.3). The return code is passed through THIS
+        module's ``ctype`` so test doubles can pin their own code.
         """
-        # Returns are statements — the forge enum spells it ``cit_return``
-        # (80 on this build; older SDK docs say 78 — never hardcode, O1
-        # live finding 2026-08-13).
+        from forge.api.hexrays import iter_returned_exprs as _iter_returns
+
         ret_op = (
             getattr(ctype, "ret", None)
             or getattr(ctype, "cit_ret", None)
             or getattr(ctype, "cit_return", None)
         )
-        treeitems = getattr(cfunc, "treeitems", None)
-        if treeitems:
-            for item in treeitems:
-                # to_specific_type is a method; ``or item`` would keep the
-                # bound method and never match (same trap as inverse_if E6).
-                specific = getattr(item, "it", None) or item
-                to_specific = getattr(specific, "to_specific_type", None)
-                if callable(to_specific):
-                    specific = to_specific()
-                if ret_op is not None and getattr(specific, "op", None) == ret_op:
-                    yield getattr(specific, "x", None)
-            return
-
-        walker_cls = getattr(ida_hexrays, "ctree_visitor_t", None)
-        if walker_cls is None or ret_op is None:
-            return
-
-        class _ReturnWalker(walker_cls):
-            def __init__(self):
-                try:
-                    walker_cls.__init__(self, 0)
-                except TypeError:
-                    walker_cls.__init__(self, None)  # pragma: no cover — binding drift
-                self.returned = []
-
-            def visit_insn(self, insn):
-                # the binding hook for statements is visit_insn, not
-                # visit_statement (O1 live finding, 2026-08-13)
-                if getattr(insn, "op", None) == ret_op:
-                    self.returned.append(getattr(insn, "x", None))
-                return 0
-
-        walker = _ReturnWalker()
-        body = getattr(cfunc, "body", None)
-        if body is not None:
-            try:
-                walker.apply_to(body, None)
-            except Exception:  # noqa: BLE001 — walk is best-effort
-                return
-        yield from walker.returned
+        yield from _iter_returns(cfunc, ret_op=ret_op)
 
     def _find_allocator_assignment(self, cfunc, returned, asg_op):
         """The ``var = allocator(...)`` assignment feeding the returned value.

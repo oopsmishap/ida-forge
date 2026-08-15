@@ -24,6 +24,7 @@ import contextlib
 import importlib
 import importlib.util
 import inspect
+import json
 import re
 import sys
 
@@ -35,6 +36,7 @@ __all__ = [
     "add_member",
     "apply_type",
     "auto_resolve",
+    "backfill_lumina",
     "callees_of",
     "callers_of",
     "create_child_types",
@@ -43,8 +45,10 @@ __all__ = [
     "create_type",
     "create_typedef",
     "decompile",
+    "decompile_many",
     "deep_scan",
     "duplicate_structure",
+    "export_store",
     "finalize",
     "finalize_all",
     "function_info",
@@ -52,6 +56,7 @@ __all__ = [
     "get_structure",
     "guess_allocation",
     "help",
+    "import_store",
     "import_types",
     "imports",
     "inverse_if",
@@ -62,6 +67,8 @@ __all__ = [
     "nudge_members",
     "push_all",
     "push_type",
+    "reapply",
+    "recover",
     "refresh_types",
     "remove_members",
     "remove_structure",
@@ -71,12 +78,14 @@ __all__ = [
     "rename_structure",
     "scan_from_allocation",
     "scan_global",
+    "scan_returned",
     "set_current",
     "set_func_proto",
     "set_lvar_types",
     "set_member",
     "shallow_scan",
     "signature",
+    "split_flags",
     "structures",
     "templated_apply",
     "templated_decl",
@@ -483,8 +492,11 @@ def decompile(
     IAT slots included (:func:`callees_of` resolves slots to the imported
     functions they point at, E.23). ``line_range`` (1-based, inclusive)
     or ``max_lines`` slice the pseudocode lines only — ``lvars``/``calls``
-    are untouched. ``force=True`` clears IDA's cached cfunctions first so
-    freshly retyped globals/locals render (``clear_cached_cfuncs``).
+    are untouched. ``max_lines`` truncates MID-DECLARATION (a cap on the
+    first N lines); ``line_range`` slices whole, complete declarations —
+    prefer it for declaration-quote use (E20d). ``force=True`` clears
+    IDA's cached cfunctions first so freshly retyped globals/locals
+    render (``clear_cached_cfuncs``).
 
     Returns:
         dict or None.
@@ -554,6 +566,49 @@ def decompile(
         "lvars": lvar_rows,
         "calls": sorted(calls),
     }
+
+
+@api(
+    group="decompile",
+    returns="list[dict]",
+    example='heads = forge_api.decompile_many([0x1400014F0, 0x1400020F0])',
+)
+def decompile_many(eas: list) -> list:
+    """Decompile many functions; return their first pseudocode lines (F.2).
+
+    One decompile per EA; each row is ``{"ea", "ok", "head"}`` with
+    ``head`` the first pseudocode line (None outside functions). GUI
+    progress is shown ONLY when ``ida_kernwin.replace_wait_box`` exists —
+    idalib/headless workers stay silent.
+
+    Returns:
+        list of row dicts.
+    """
+    _require_ida()
+    import ida_kernwin
+
+    has_progress = hasattr(ida_kernwin, "replace_wait_box") and hasattr(
+        ida_kernwin, "hide_wait_box"
+    )
+    rows = []
+    targets = list(eas or [])
+    if has_progress:
+        ida_kernwin.replace_wait_box("forge: decompiling...")
+    try:
+        for position, ea in enumerate(targets):
+            if has_progress:
+                ida_kernwin.replace_wait_box(
+                    f"forge: decompiling {position + 1}/{len(targets)}..."
+                )
+            try:
+                head = signature(ea)
+            except Exception:  # noqa: BLE001 — one bad EA must not stop the rest
+                head = None
+            rows.append({"ea": ea, "ok": head is not None, "head": head})
+    finally:
+        if has_progress:
+            ida_kernwin.hide_wait_box()
+    return rows
 
 
 @api(
@@ -1304,12 +1359,13 @@ def get_member(
     *,
     member_name: str | None = None,
     member_type: str | None = None,
-    include_disabled: bool = True,
+    include_disabled: bool = False,
 ) -> dict | None:
     """Return the first member dict at ``offset``.
 
-    Unlike :meth:`Structure.get_member_by_offset`, ``include_disabled=False``
-    skips collision-disabled members. ``member_name`` (E11, 2026-08-13)
+    Collision-disabled members are hidden by default (E20c);
+    ``include_disabled=True`` includes them. ``member_name`` (E11,
+    2026-08-13)
     disambiguates collision pairs — without it, the offset match silently
     picks whichever member sorts first. ``member_type`` (E24) narrows the
     match further: only members whose displayed type string equals it
@@ -1649,18 +1705,20 @@ def nudge_members(
 ) -> dict:
     """Shift the given member offsets by ``delta`` (form ``nudge_selected_rows``).
 
-    Mirrors the GUI rule: a nudge that would make a member overlap a member that
+    Mirrors the GUI rule: a nudge that would move a member onto a member that
     was NOT moved is rejected and restored. Negative ``delta`` moving a member
     below zero is also rejected. The structure's ``main_offset`` follows when a
     moved member is the origin row.
 
     Returns:
-        ``{"ok": True}`` or ``{"ok": False, "error": ...}``.
+        ``{"ok": True, "moved": {old_hex: new_hex}}`` or
+        ``{"ok": False, "error": ...}`` (E20b — the moved map makes the
+        nudge observable; error dicts are unchanged).
     """
     target = _resolve_structure(structure)
     members = [m for m in target.members if m.offset in offsets]
     if not members:
-        # Eval review round 2 §3.7: a silent ok:True no-op for unknown
+        # Eval review round 2 §3.7: a silent ok:True for unknown
         # offsets hides typos — say so.
         return {
             "ok": False,
@@ -1670,13 +1728,15 @@ def nudge_members(
     if any(member.offset + delta < 0 for member in members):
         return {"ok": False, "error": "cannot move rows to a negative offset"}
 
-    moved = {id(member) for member in members}
+    moved = {id(member): member for member in members}
     original_offsets = {id(member): member.offset for member in target.members}
     original_main_offset = target.main_offset
 
+    moved_map = {}
     for member in members:
         old_offset = member.offset
         member.offset += delta
+        moved_map[hex(old_offset)] = hex(member.offset)
         member.invalidate_score()
         if target.main_offset == old_offset:
             target.set_main_offset(member.offset)
@@ -1697,7 +1757,7 @@ def nudge_members(
         return {"ok": False, "error": "would overlap a non-selected member"}
 
     _mark_dirty()
-    return {"ok": True}
+    return {"ok": True, "moved": moved_map}
 
 
 @api(
@@ -1844,6 +1904,9 @@ def vtable_entries(address: int) -> list[dict] | dict:
     (or a data xref marks the table end). Returns
     ``[{"offset", "ea", "slot"}, ...]``; ``{"ok": False, "error": ...}`` when
     ``address`` is not a plausible vtable (no name, unreadable pointer).
+    When the address IS a named pointer table but its first pointer does
+    not resolve into a function, the data is not a vtable — reported
+    explicitly as ``"not a code-pointer array"`` (E20e, was a silent []).
 
     Returns:
         list of slot dicts, or an error dict.
@@ -1859,6 +1922,8 @@ def vtable_entries(address: int) -> list[dict] | dict:
         ]
     except (AssertionError, AttributeError, OSError, TypeError, ValueError) as exc:
         return {"ok": False, "error": f"no vtable at {hex(address)}: {exc}"}
+    if not slots:
+        return {"ok": False, "error": "not a code-pointer array"}
     return slots
 
 
@@ -1888,6 +1953,83 @@ def vtable_name(address: int) -> dict:
         }
     except (AssertionError, AttributeError, TypeError, ValueError) as exc:
         return {"ok": False, "error": f"no vtable at {hex(address)}: {exc}"}
+
+
+@api(
+    group="structures",
+    returns="dict",
+    example='r = forge_api.export_store("forge_store.json")',
+)
+def export_store(path: str) -> dict:
+    """Dump every store structure to a portable JSON file (F.5).
+
+    Uses the same serialization the catalog's netnode persistence uses
+    (member decls as strings — never live tinfo handles). No IDA calls:
+    works headless. The file is the input of :func:`import_store`.
+
+    Returns:
+        ``{"ok": True, "structures": int, "path": str}`` or an error dict.
+    """
+    try:
+        with open(path, "w", encoding="utf-8") as handle:
+            json.dump(
+                {
+                    "structures": [
+                        catalog._serialize(structure)
+                        for structure in _structures.values()
+                    ]
+                },
+                handle,
+                indent=2,
+            )
+    except (OSError, TypeError) as exc:
+        return {"ok": False, "error": str(exc)}
+    return {"ok": True, "structures": len(_structures), "path": str(path)}
+
+
+@api(
+    group="structures",
+    returns="dict",
+    example='r = forge_api.import_store("forge_store.json")',
+)
+def import_store(path: str, *, merge: bool = False) -> dict:
+    """Rebuild store structures from an :func:`export_store` dump (F.5).
+
+    Deserializes through the same path as the catalog's persistence
+    loader (members, relationships, provenance). With ``merge=False``
+    (default) names already in the store are SKIPPED and reported; with
+    ``merge=True`` existing entries are replaced by the file's versions.
+
+    Returns:
+        ``{"ok": True, "imported": [names], "skipped": [names]}`` or an
+        error dict.
+    """
+    try:
+        with open(path, encoding="utf-8") as handle:
+            payload = json.load(handle)
+    except (OSError, json.JSONDecodeError) as exc:
+        return {"ok": False, "error": str(exc)}
+    raw_structures = (
+        payload.get("structures", []) if isinstance(payload, dict) else []
+    )
+    imported = []
+    skipped = []
+    for raw in raw_structures:
+        name = raw.get("name")
+        if not name:
+            continue
+        if not merge and name in _structures:
+            skipped.append(name)
+            continue
+        try:
+            structure = catalog._deserialize(raw)
+        except Exception:  # noqa: BLE001 — a corrupt entry must not abort the import
+            skipped.append(name)
+            continue
+        _structures[name] = structure
+        imported.append(name)
+    _mark_dirty()
+    return {"ok": True, "imported": imported, "skipped": skipped}
 
 
 # --------------------------------------------------------------------------- #
@@ -2030,7 +2172,11 @@ def import_types(pattern: str | None = None) -> dict:
                     name=getattr(member, "name", "") or None,
                 )
         imported.append(name)
-    return {"imported": imported, "skipped": skipped}
+    result = {"imported": imported, "skipped": skipped}
+    if not imported and not skipped:
+        # E20f: an empty import is a finding, not a bug — say so.
+        result["note"] = "no foreign UDTs in the til"
+    return result
 
 
 @api(
@@ -2112,8 +2258,13 @@ def push_all() -> dict:
         try:
             if push_type(name):
                 pushed.append(name)
+            elif name in _structures:
+                # E20a: surface the REAL commit error — only unknown
+                # names keep the generic string.
+                result = create_type(name, overwrite=True)
+                failed[name] = str(result.get("error") or "type write failed")
             else:
-                failed[name] = "type write failed or unknown structure"
+                failed[name] = "unknown structure"
         except Exception as exc:  # noqa: BLE001 — one bad type must not stop the rest
             failed[name] = str(exc)
     return {"pushed": pushed, "failed": failed}
@@ -2472,6 +2623,138 @@ def deep_scan(
 
 
 @api(
+    group="build",
+    returns="dict",
+    example='r = forge_api.recover(0x1400020F0, var_name="v0", name="ChainNode")',
+)
+def recover(
+    ea: int,
+    *,
+    var_name: str | None = None,
+    var_index: int | None = None,
+    name: str | None = None,
+    commit: bool = True,
+    clear_first: bool = True,
+    max_depth: int | None = None,
+) -> dict:
+    """One-shot structure recovery pipeline (F.8 + E.13).
+
+    Builds the target structure (``name`` or an auto ``Recovered`` name),
+    deep-scans the function at ``ea`` from the root variable (default: the
+    first argument; override with ``var_name``/``var_index``, E.19) with
+    call recursion ON, optionally clears the structure first (E.21), then
+    commits the type and retypes the root variable to the committed type
+    pointer so re-decompiled pseudocode renders member access. On a commit
+    failure the error carries the real reason (keyword/parser diagnostic).
+
+    Returns:
+        ``{"ok": True, "structure": str, "type": str, "members": int}``
+        or an ok:False dict.
+    """
+    _require_ida()
+    from forge.api.hexrays import decompile as _decompile
+    from forge.api.structure import Structure
+
+    # `name` is the structure to BUILD; create it when it is not in the
+    # store yet (an existing entry is reused — clear_first governs).
+    if name is not None and name not in _structures:
+        target = Structure(name)
+        _structures[name] = target
+        _state.current = name
+    else:
+        target = _target_scan_structure(name)
+    scan = deep_scan(
+        ea,
+        var_name=var_name,
+        var_index=var_index,
+        structure=target.name,
+        recurse_calls=True,
+        max_depth=max_depth,
+        clear_first=clear_first,
+    )
+    if scan.get("ok") is False:
+        return scan
+    if commit:
+        committed = create_type(target.name, overwrite=True)
+        if not committed.get("ok", False):
+            return {
+                "ok": False,
+                "error": committed.get("error") or "commit failed",
+            }
+
+    root_var = var_name
+    if root_var is None:
+        try:
+            cfunc = _decompile(ea)
+            if cfunc is not None:
+                lvars = list(cfunc.get_lvars())
+                argids = list(getattr(cfunc, "argidx", None) or [])
+                if argids and 0 <= argids[0] < len(lvars):
+                    root_var = lvars[argids[0]].name
+                elif lvars:
+                    root_var = lvars[0].name
+        except Exception:  # noqa: BLE001 — retyping the root is best-effort
+            root_var = None
+    type_name = target.created_type_name or target.name
+    if root_var and commit:
+        with contextlib.suppress(Exception):
+            set_lvar_types(ea, {root_var: f"{type_name} *"})
+    if commit:
+        with contextlib.suppress(Exception):
+            reapply(target.name)
+    return {
+        "ok": True,
+        "structure": target.name,
+        "type": type_name,
+        "members": len(scan.get("members", [])),
+    }
+
+
+@api(
+    group="build",
+    returns="dict",
+    example='r = forge_api.reapply("Recovered"); r["applied"]',
+)
+def reapply(name: str | None = None) -> dict:
+    """Re-apply the committed type to every scan-evidence variable (E.19).
+
+    Re-runs the "apply globally" step of a commit: every recorded scan
+    variable of the structure's structure (uniqueness via
+    ``identity_key``) gets the structure's pointer type applied again —
+    locals via ``modify_user_lvar_info``, globals via ``apply_tinfo``.
+    Skips (and reports) the objects whose application raised.
+
+    Returns:
+        ``{"applied": int, "skipped": [names]}``.
+    """
+    _require_ida()
+    import ida_typeinf
+
+    target = _resolve_structure(name)
+    type_name = target.created_type_name or target.name
+    tinfo = ida_typeinf.tinfo_t()
+    if not tinfo.get_named_type(ida_typeinf.get_idati(), type_name):
+        return {"applied": 0, "skipped": [type_name]}
+    pointer_of = ida_typeinf.tinfo_t()
+    pointer_of.create_ptr(tinfo)
+
+    applied = 0
+    skipped = []
+    for scan_object in target.get_unique_scanned_variables(target.main_offset):
+        if scan_object is None:
+            continue
+        try:
+            scan_object.apply_type(pointer_of)
+            applied += 1
+        except Exception as exc:  # noqa: BLE001 — one bad object must not stop the rest
+            skipped.append(getattr(scan_object, "name", "<unnamed>"))
+            from forge.util.logging import log_debug
+
+            log_debug(f"reapply failed for {scan_object!r}: {exc}")
+    return {"applied": applied, "skipped": skipped}
+
+
+@api(
     group="scan",
     returns="dict",
     example='r = forge_api.shallow_scan(0x1400014F0, var_name="a1", structure="Recovered")',
@@ -2750,6 +3033,98 @@ def _add_named_sub_heads(target, ea: int, span: int, scanned_funcs: set | None =
                 size_type,
                 name=_head_name_without_address(name),
             )
+
+
+@api(
+    group="decompile",
+    returns="list[dict]",
+    example='rows = forge_api.scan_returned(0x1400020F0)',
+)
+def scan_returned(ea: int, *, max_depth: int = 4) -> list:
+    """Return-value recon for the function at ``ea`` (F.3).
+
+    Every ``return X`` whose value is pointer-typed (after cast-peel)
+    becomes a row with ``return_ea`` (the return's EA), ``type`` (the
+    value's declared type), ``var`` (the returned local's name, None for
+    arbitrary expressions), ``allocation`` (the allocator-assignment
+    guess feeding the value — ``{"ea", "size", "var"}`` or None when the
+    guesser finds nothing), and ``callers`` — every calling function
+    with the lvar that receives the result
+    (``[{"func_ea", "lvar_name"}]``). The caller-driven deep_scan stays
+    caller-side; :func:`recover` runs the one-shot pipeline.
+
+    Returns:
+        list of row dicts.
+    """
+    _require_ida()
+    from forge.api.hexrays import ctype as _ct
+    from forge.api.hexrays import decompile as _decompile
+    from forge.api.hexrays import get_funcs_calling_address, iter_returned_exprs
+    from forge.features.guess_allocation.guess_allocation import GuessAllocationVisitor
+
+    cfunc = _decompile(ea)
+    if cfunc is None:
+        return []
+    asg_op = getattr(_ct, "asg", None)
+    cast_op = getattr(_ct, "cast", None)
+    allocator_finder = GuessAllocationVisitor.__new__(GuessAllocationVisitor)
+    rows = []
+    for returned in iter_returned_exprs(cfunc):
+        if returned is None:
+            continue
+        value_node = returned
+        while (
+            cast_op is not None
+            and getattr(value_node, "op", None) == cast_op
+            and getattr(value_node, "x", None) is not None
+        ):
+            value_node = value_node.x
+        tinfo = getattr(returned, "type", None)
+        if tinfo is None:
+            tinfo = getattr(value_node, "type", None)
+        is_ptr = getattr(tinfo, "is_ptr", None)
+        if not callable(is_ptr) or not is_ptr():
+            continue
+        try:
+            type_str = tinfo.dstr()
+        except Exception:  # noqa: BLE001 — degraded tinfos degrade to None
+            type_str = None
+        var_node = getattr(value_node, "v", None)
+        var_name = getattr(var_node, "name", None)
+
+        allocation = None
+        try:
+            alloc_obj = allocator_finder._find_allocator_assignment(
+                cfunc, value_node, asg_op
+            )
+            if alloc_obj is not None:
+                allocation = {
+                    "ea": getattr(alloc_obj, "ea", None),
+                    "size": getattr(alloc_obj, "size", None),
+                    "var": var_name,
+                }
+        except Exception:  # noqa: BLE001 — allocation guessing is best-effort
+            allocation = None
+
+        callers = []
+        for caller_ea in sorted(get_funcs_calling_address(ea)):
+            caller_cfunc = _decompile(caller_ea)
+            if caller_cfunc is None:
+                continue
+            assigned = _assigned_lvar_for_call(caller_cfunc, ea)
+            if assigned is not None:
+                callers.append({"func_ea": caller_ea, "lvar_name": assigned})
+
+        rows.append(
+            {
+                "return_ea": getattr(returned, "ea", None),
+                "type": type_str,
+                "var": var_name,
+                "allocation": allocation,
+                "callers": callers,
+            }
+        )
+    return rows
 
 
 # --------------------------------------------------------------------------- #
@@ -3256,31 +3631,23 @@ def _format_token_labels(format_bytes) -> list[str | None]:
     return tokens
 
 
-def _printf_call_expressions(cfunc) -> list:
-    """The call cexprs of printf-family imports in ``cfunc`` (E14).
+def _iter_ctree_calls(cfunc):
+    """Yield every call cexpr in ``cfunc`` (treeitems or visitor walk).
 
-    Walks treeitems like the other ctree scans, falling back to a
-    ctree-visitor walk when treeitems is empty (the live 9.4 shape).
-    A call counts when its target EA resolves to an imported name ending
-    in ``printf``/``sprintf``/``snprintf``/``vsnprintf``.
+    Shared by the printf naming (E14) and scan_returned (F.3) call-site
+    walks. Treeitems is empty on the live 9.4 build — the ctree-visitor
+    fallback covers it (same pattern as the E.22 walkers).
     """
     import ida_hexrays
 
-    import_name_by_ea = {row["ea"]: row["name"] or "" for row in imports()}
     ctype_mod = getattr(ida_hexrays, "ctype", None)
     if ctype_mod is None:
         from forge.api.hexrays import ctype as ctype_mod
 
     call_op = getattr(ctype_mod, "call", None)
-    printf_suffixes = ("printf", "sprintf", "snprintf", "vsnprintf")
-    calls: list = []
 
-    def _is_printf_call(cexpr) -> bool:
-        if call_op is not None and getattr(cexpr, "op", None) != call_op:
-            return False
-        callee_ea = getattr(getattr(cexpr, "x", None), "obj_ea", None)
-        name = import_name_by_ea.get(callee_ea) or ""
-        return name.endswith(printf_suffixes)
+    def _is_call(cexpr) -> bool:
+        return call_op is None or getattr(cexpr, "op", None) == call_op
 
     treeitems = getattr(cfunc, "treeitems", None)
     if treeitems:
@@ -3289,13 +3656,13 @@ def _printf_call_expressions(cfunc) -> list:
             to_specific = getattr(specific, "to_specific_type", None)
             if callable(to_specific):
                 specific = to_specific()
-            if _is_printf_call(specific):
-                calls.append(specific)
-        return calls
+            if _is_call(specific):
+                yield specific
+        return
 
     walker_cls = getattr(ida_hexrays, "ctree_visitor_t", None)
     if walker_cls is None:
-        return calls
+        return
 
     class _CallWalker(walker_cls):
         def __init__(self):
@@ -3306,7 +3673,7 @@ def _printf_call_expressions(cfunc) -> list:
             self.found = []
 
         def visit_expr(self, expr):
-            if _is_printf_call(expr):
+            if _is_call(expr):
                 self.found.append(expr)
             return 0
 
@@ -3316,8 +3683,59 @@ def _printf_call_expressions(cfunc) -> list:
         try:
             walker.apply_to(body, None)
         except Exception:  # noqa: BLE001 — walk is best-effort
-            return calls
-    return walker.found
+            return
+    yield from walker.found
+
+
+def _printf_call_expressions(cfunc) -> list:
+    """The call cexprs of printf-family imports in ``cfunc`` (E14).
+
+    A call counts when its target EA resolves to an imported name ending
+    in ``printf``/``sprintf``/``snprintf``/``vsnprintf``.
+    """
+    import_name_by_ea = {row["ea"]: row["name"] or "" for row in imports()}
+    printf_suffixes = ("printf", "sprintf", "snprintf", "vsnprintf")
+    return [
+        call
+        for call in _iter_ctree_calls(cfunc)
+        if (
+            import_name_by_ea.get(
+                getattr(getattr(call, "x", None), "obj_ea", None), ""
+            ).endswith(printf_suffixes)
+        )
+    ]
+
+
+def _assigned_lvar_for_call(cfunc, target_ea) -> str | None:
+    """The lvar name a call's result is assigned to (F.3).
+
+    Finds the call of ``target_ea`` in ``cfunc`` and, when its parent
+    statement is an assignment (``v = f(...)``), returns ``v``'s name.
+    """
+    from forge.api.hexrays import ctype as _ctype
+
+    asg_op = getattr(_ctype, "asg", None)
+    for call in _iter_ctree_calls(cfunc):
+        if getattr(getattr(call, "x", None), "obj_ea", None) != target_ea:
+            continue
+        parent = None
+        body = getattr(cfunc, "body", None)
+        find_parent = getattr(body, "find_parent_of", None)
+        if callable(find_parent):
+            try:
+                parent = find_parent(call)
+            except Exception:  # noqa: BLE001 — parent lookup is best-effort
+                parent = None
+        if parent is None:
+            continue
+        target_node = getattr(parent, "x", None)
+        if (
+            asg_op is None or getattr(parent, "op", None) == asg_op
+        ) and getattr(target_node, "v", None) is not None:
+            name = getattr(target_node, "v", None).name
+            if name:
+                return name
+    return None
 
 
 @api(
@@ -3558,6 +3976,141 @@ def to_usercall(ea: int) -> dict:
     if name is None:
         return {"ok": False, "error": "unknown calling convention"}
     return {"ok": True, "ea": ea, "convention": name}
+
+
+@api(
+    group="features",
+    returns="dict",
+    example='r = forge_api.backfill_lumina(limit=20)',
+)
+def backfill_lumina(
+    eas: list | None = None,
+    *,
+    pattern: str | None = None,
+    limit: int | None = None,
+) -> dict:
+    """Apply Lumina metadata to functions (F.7).
+
+    ``eas`` is an explicit list of function EAs; without it, every
+    function in the database is a candidate. ``pattern`` filters by name
+    (case-folded substring); ``limit`` caps the number of applications.
+    Each target gets ``ida_hexrays.calc_func_metadata`` +
+    ``apply_metadata``; per-target failures accumulate in ``errors``.
+    When the build lacks the Lumina metadata API the verb says so
+    explicitly.
+
+    Returns:
+        ``{"applied": int, "errors": [...]}``, or an error dict when the
+        API is missing.
+    """
+    _require_ida()
+    import ida_hexrays
+    import ida_name
+
+    calc = getattr(ida_hexrays, "calc_func_metadata", None)
+    apply_meta = getattr(ida_hexrays, "apply_metadata", None)
+    if not callable(calc) or not callable(apply_meta):
+        return {
+            "ok": False,
+            "error": "lumina metadata API not available on this build",
+        }
+
+    if eas is None:
+        try:
+            import idautils
+
+            functions = list(idautils.Functions())
+        except Exception as exc:  # noqa: BLE001 — enumerate across builds
+            return {"ok": False, "error": f"could not enumerate functions: {exc}"}
+    else:
+        functions = [int(ea) for ea in eas]
+
+    if pattern:
+        folded = pattern.casefold()
+        functions = [
+            ea
+            for ea in functions
+            if folded in (ida_name.get_name(ea) or "").casefold()
+        ]
+    if limit is not None and limit >= 0:
+        functions = functions[:limit]
+
+    applied = 0
+    errors = []
+    for ea in functions:
+        try:
+            result = calc(ea)
+            if result is None or result == -1:
+                errors.append(f"{hex(ea)}: metadata unavailable")
+                continue
+            apply_meta(ea)
+            applied += 1
+        except Exception as exc:  # noqa: BLE001 — one failure must not abort the batch
+            errors.append(f"{hex(ea)}: {exc}")
+    return {"applied": applied, "errors": errors}
+
+
+@api(
+    group="structures",
+    returns="dict",
+    example='r = forge_api.split_flags("Flags", 0x10, [("visible", 8), ("opts", 32)])',
+)
+def split_flags(
+    structure: str | None = None, offset: int = 0, fields: list = ()
+) -> dict:
+    """Split one byte-aligned flag member into named fields (E.18).
+
+    The enabled member at ``offset`` must exist and its size must equal
+    ``sum(bits) / 8``; every width must be a multiple of 8 (bit-fields are
+    NOT supported — a non-byte-aligned spec fails with
+    ``"bit-fields not byte-aligned"``). The original member is removed
+    and ``fields`` are added at ``offset``, ``offset + width/8``, ... as
+    ``u8``/``u16``/``u32``/``u64`` per width (mirror of the create_field
+    byte-aligned view).
+
+    Returns:
+        ``{"ok": True, "members": [member dicts], "bit_spec_ok": True}``
+        or ``{"ok": False, "error": str}``.
+    """
+    target = _resolve_structure(structure)
+    member = target.get_member_by_offset(offset)
+    if member is None or not getattr(member, "enabled", True):
+        return {"ok": False, "error": f"no enabled member at offset 0x{offset:x}"}
+    fields = list(fields or [])
+    for _name, bits in fields:
+        if bits <= 0 or bits % 8 != 0:
+            return {"ok": False, "error": "bit-fields not byte-aligned"}
+    total_bytes = sum(bits for _name, bits in fields) // 8
+    effective_size = (
+        member.effective_size() if hasattr(member, "effective_size") else member.size
+    )
+    if effective_size != total_bytes:
+        return {
+            "ok": False,
+            "error": (
+                f"member at 0x{offset:x} is {effective_size} byte(s), "
+                f"fields need {total_bytes}"
+            ),
+        }
+
+    index_of_member = next(
+        index for index, candidate in enumerate(target.members) if candidate is member
+    )
+    target.remove_members([index_of_member])
+    created = []
+    cursor = offset
+    for name, bits in fields:
+        width_bytes = bits // 8
+        type_decl = {1: "u8", 2: "u16", 4: "u32", 8: "u64"}.get(width_bytes)
+        if type_decl is None:
+            return {
+                "ok": False,
+                "error": f"unsupported field width {bits} bits",
+            }
+        created.append(add_member(target.name, cursor, type_decl, name=name))
+        cursor += width_bytes
+    _mark_dirty()
+    return {"ok": True, "members": created, "bit_spec_ok": True}
 
 
 @api(

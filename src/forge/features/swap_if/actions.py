@@ -1,14 +1,13 @@
 import ida_hexrays
 import ida_kernwin
-import ida_nalt
 
-from forge.api.hooks import HexRaysHook, register_hook
+from forge.api.ctree_transform import SilentIfSwapper  # F.6: hook moved to the DSL core
+from forge.api.hooks import register_hook
 from forge.api.ui_actions import HexRaysPopupAction, register_action
 from forge.util.logging import log_debug
 
 from .helper import inverse_if
-from .storage import get_inverted, has_inverted, set_inverted
-from .visitor import SpaghettiVisitor, SwapThenElseVisitor
+from .storage import set_inverted
 
 
 @register_action
@@ -46,29 +45,4 @@ class SwapThenElse(HexRaysPopupAction):
         return ida_kernwin.AST_DISABLE_FOR_WIDGET
 
 
-@register_hook
-class SilentIfSwapper(HexRaysHook):
-    name = "SilentIfSwapper"
-
-    def __init__(self):
-        super().__init__()
-
-    def maturity(self, *args):
-        cfunc, level_of_maturity = args
-
-        if level_of_maturity == ida_hexrays.CMAT_TRANS1 and has_inverted(
-            cfunc.entry_ea
-        ):
-            log_debug(f"Swapping then/else in {hex(cfunc.entry_ea)}")
-            inverted = [
-                n + ida_nalt.get_imagebase() for n in get_inverted(cfunc.entry_ea)
-            ]
-            log_debug(f"Got inverted: {inverted}")
-            visitor = SwapThenElseVisitor(inverted)
-            visitor.apply_to(cfunc.body, None)
-
-        elif level_of_maturity == ida_hexrays.CMAT_TRANS2:
-            visitor = SpaghettiVisitor()
-            visitor.apply_to(cfunc.body, None)
-
-        return 0
+register_hook(SilentIfSwapper)  # F.6: the class moved to forge.api.ctree_transform

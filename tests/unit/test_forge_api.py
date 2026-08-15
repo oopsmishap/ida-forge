@@ -669,10 +669,11 @@ def test_get_member_honors_include_disabled(monkeypatch):
     # the first match at offset 0 is the enabled member
     assert forge_api.get_member("S", 0)["name"] == "a"
     assert forge_api.get_member("S", 0, include_disabled=False)["name"] == "a"
-    # offset 8's only member is disabled: hidden when excluded, visible when
-    # include_disabled=True
-    assert forge_api.get_member("S", 8)["name"] == "gone"
+    # offset 8's only member is disabled: E20c — hidden by DEFAULT now,
+    # visible only with include_disabled=True
+    assert forge_api.get_member("S", 8) is None
     assert forge_api.get_member("S", 8, include_disabled=False) is None
+    assert forge_api.get_member("S", 8, include_disabled=True)["name"] == "gone"
 
 
 def test_add_member_reports_collision(monkeypatch):
@@ -2135,8 +2136,9 @@ def test_vtable_entries_reports_non_vtable(monkeypatch):
     )
 
     # E2: unnamed table → vtbl_<addr> fallback, zero slots, no assert.
+    # E20e: zero slots now says "not a code-pointer array" (was []).
     result = forge_api.vtable_entries(0x140006358)
-    assert result == []
+    assert result == {"ok": False, "error": "not a code-pointer array"}
 
     # A genuinely broken read still surfaces as an error dict.
     def _broken_read(ea):
@@ -2741,6 +2743,411 @@ def test_name_members_from_printf_no_printf_call(monkeypatch, _real_hexrays):
 
     assert result["ok"] is False
     assert "printf" in result["error"]
+
+
+def test_recover_pipeline_scans_commits_and_retypes(monkeypatch, _real_hexrays):
+    """F.8/E.13: recover() builds the structure, deep-scans with recursion
+    + clear_first, commits the type, retypes the root and re-applies."""
+    calls = []
+    monkeypatch.setattr(
+        forge_api,
+        "deep_scan",
+        lambda ea, **k: (
+            calls.append(("deep_scan", k)) or {
+                "structure": k["structure"],
+                "members": [{"name": "next"}, {"name": "tag"}],
+            }
+        ),
+    )
+    monkeypatch.setattr(
+        forge_api,
+        "create_type",
+        lambda *a, **k: calls.append(("create_type", k)) or {"ok": True},
+        raising=False,
+    )
+    monkeypatch.setattr(
+        forge_api,
+        "set_lvar_types",
+        lambda *a, **k: calls.append(("set_lvar_types", a[1])),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        forge_api,
+        "reapply",
+        lambda *a, **k: calls.append(("reapply", a)) or {"applied": 2, "skipped": []},
+        raising=False,
+    )
+
+    result = forge_api.recover(0x1400020F0, var_name="v1", name="DeepChainNodeR")
+
+    assert result == {
+        "ok": True,
+        "structure": "DeepChainNodeR",
+        "type": "DeepChainNodeR",
+        "members": 2,
+    }
+    scan_kwargs = calls[0][1]
+    assert scan_kwargs["structure"] == "DeepChainNodeR"
+    assert scan_kwargs["var_name"] == "v1"
+    assert scan_kwargs["recurse_calls"] is True
+    assert scan_kwargs["clear_first"] is True
+    assert calls[1] == ("create_type", {"overwrite": True})
+    assert calls[2] == ("set_lvar_types", {"v1": "DeepChainNodeR *"})
+    assert calls[3] == ("reapply", ("DeepChainNodeR",))
+
+
+def test_recover_reports_commit_failure(monkeypatch):
+    monkeypatch.setattr(
+        forge_api,
+        "deep_scan",
+        lambda *a, **k: {"structure": "S", "members": []},
+    )
+    monkeypatch.setattr(
+        forge_api,
+        "create_type",
+        lambda *a, **k: {"ok": False, "error": "boom"},
+        raising=False,
+    )
+
+    result = forge_api.recover(0x401000, name="S")
+
+    assert result["ok"] is False
+    assert result["error"] == "boom"
+
+
+def test_reapply_applies_pointer_type_to_scan_evidence(monkeypatch):
+    """E.19: reapply re-runs the apply-globally step over the recorded
+    scan variables; failing objects are reported, not fatal."""
+    import ida_typeinf
+
+    forge_api.create_structure("S")
+    forge_api.add_member("S", 0, "u32", name="x")
+    structure = forge_api._resolve_structure("S")
+    applied = []
+
+    class _PtrTinfo:
+        def __init__(self, *a, **k):
+            pass
+
+        def get_named_type(self, til, name):
+            return True
+
+        def create_ptr(self, other):
+            return True
+
+        def dstr(self):
+            return "S *"
+
+    monkeypatch.setattr(ida_typeinf, "tinfo_t", _PtrTinfo, raising=False)
+
+    class _Good:
+        name = "v1"
+
+        def apply_type(self, tinfo):
+            applied.append(tinfo.dstr())
+
+    class _Bad:
+        name = "v2"
+
+        def apply_type(self, tinfo):
+            raise RuntimeError("boom")
+
+    member = structure.members[0]
+    member.scanned_variables = {_Good(), _Bad()}
+
+    result = forge_api.reapply("S")
+
+    assert result["applied"] == 1
+    assert result["skipped"] == ["v2"]
+    assert applied == ["S *"]
+
+
+def test_nudge_members_reports_moved_map():
+    forge_api.create_structure("M")
+    forge_api.add_member("M", 0x0, "u32")
+    forge_api.add_member("M", 0x8, "u32")
+
+    result = forge_api.nudge_members("M", [0x0], 4)
+
+    assert result["ok"] is True
+    assert result["moved"] == {"0x0": "0x4"}
+
+
+def test_push_all_surfaces_real_commit_error(monkeypatch):
+    """E20a: push_all failures carry the create_type error for
+    known structures (not the generic string)."""
+    forge_api.create_structure("Good")
+    forge_api.add_member("Good", 0, "u32")
+    forge_api.create_structure("Bad")
+    forge_api.add_member("Bad", 0, "u32")
+
+    monkeypatch.setattr(forge_api, "push_type", lambda name: False)
+    monkeypatch.setattr(
+        forge_api,
+        "create_type",
+        lambda *a, **k: {"ok": False, "error": "boom"},
+        raising=False,
+    )
+
+    result = forge_api.push_all()
+
+    assert set(result["pushed"]) == set()
+    assert result["failed"] == {"Good": "boom", "Bad": "boom"}
+
+
+def test_decompile_many_returns_heads(monkeypatch):
+    """F.2: decompile_many rows carry ea/ok/first-pseudocode-line."""
+    monkeypatch.setattr(
+        forge_api,
+        "signature",
+        lambda ea: f"int f_{ea:x}(void)" if ea == 0x401000 else None,
+        raising=False,
+    )
+
+    rows = forge_api.decompile_many([0x401000, 0x402000])
+
+    assert rows == [
+        {"ea": 0x401000, "ok": True, "head": "int f_401000(void)"},
+        {"ea": 0x402000, "ok": False, "head": None},
+    ]
+
+
+def test_scan_returned_rows_with_callers(monkeypatch, _real_hexrays):
+    """F.3: pointer-typed returns yield recon rows; caller assignments
+    resolve to the receiving lvar name."""
+    import sys as _sys
+
+    # the guess-allocation module (imported by scan_returned at call
+    # time) needs a visitor base; the conftest stub only carries
+    # FunctionTouchVisitor — mirror what test_guess_allocation installs.
+    visitor_module = _sys.modules["forge.api.visitor"]
+    if not hasattr(visitor_module, "RecursiveUpwardsObjectVisitor"):
+        visitor_module.RecursiveUpwardsObjectVisitor = type(
+            "RecursiveUpwardsObjectVisitor", (), {}
+        )
+
+    import forge.api.hexrays as hx
+
+    make_chain = SimpleNamespace(
+        entry_ea=0x1400020F0,
+        treeitems=[
+            SimpleNamespace(
+                to_specific_type=lambda: SimpleNamespace(
+                    op=hx.ctype.cit_return,
+                    x=SimpleNamespace(
+                        ea=0x140002120,
+                        type=SimpleNamespace(
+                            is_ptr=lambda: True, dstr=lambda: "DeepChainNode *"
+                        ),
+                        v=SimpleNamespace(name="v1"),
+                    ),
+                )
+            )
+        ],
+    )
+    caller = SimpleNamespace(
+        entry_ea=0x140001000,
+        treeitems=[
+            SimpleNamespace(
+                to_specific_type=lambda: SimpleNamespace(
+                    op=hx.ctype.call,
+                    x=SimpleNamespace(obj_ea=0x1400020F0),
+                    a=[],
+                )
+            )
+        ],
+        body=SimpleNamespace(
+            find_parent_of=lambda call: SimpleNamespace(
+                op=hx.ctype.asg, x=SimpleNamespace(v=SimpleNamespace(name="node"))
+            )
+        ),
+    )
+
+    def _decompile(ea):
+        if ea == 0x1400020F0:
+            return make_chain
+        if ea == 0x140001000:
+            return caller
+        return None
+
+    monkeypatch.setattr(_real_hexrays, "decompile", lambda ea: _decompile(ea))
+    monkeypatch.setattr(
+        _real_hexrays,
+        "get_funcs_calling_address",
+        lambda ea: {0x140001000},
+    )
+
+    rows = forge_api.scan_returned(0x1400020F0)
+
+    assert rows == [
+        {
+            "return_ea": 0x140002120,
+            "type": "DeepChainNode *",
+            "var": "v1",
+            "allocation": None,
+            "callers": [{"func_ea": 0x140001000, "lvar_name": "node"}],
+        }
+    ]
+
+
+def test_export_import_store_roundtrip(tmp_path):
+    """F.5: export/import round-trips the store model through JSON."""
+    forge_api.create_structure("World")
+    forge_api.add_member("World", 0x10, "u64", name="magic", comment="c")
+    forge_api.add_member("World", 0x18, "u32", name="count")
+
+    exported = forge_api.export_store(str(tmp_path / "store.json"))
+
+    assert exported["ok"] is True
+    assert exported["structures"] == 1
+
+    forge_api.remove_structure("World")
+    assert forge_api.structures() == []
+
+    imported = forge_api.import_store(str(tmp_path / "store.json"))
+
+    assert imported == {"ok": True, "imported": ["World"], "skipped": []}
+    world = forge_api.get_structure("World")
+    assert {m["name"]: m["offset"] for m in world["members"]} == {
+        "magic": 0x10,
+        "count": 0x18,
+    }
+
+
+def test_import_store_skips_existing_unless_merge(tmp_path):
+    """F.5: merge=False skips names already in the store; merge=True
+    replaces them."""
+    forge_api.create_structure("World")
+    forge_api.add_member("World", 0, "u32", name="x")
+    forge_api.export_store(str(tmp_path / "store.json"))
+    forge_api.remove_structure("World")
+    forge_api.create_structure("World")
+    forge_api.add_member("World", 0x20, "u32", name="y")
+
+    skipped = forge_api.import_store(str(tmp_path / "store.json"))
+    assert skipped == {"ok": True, "imported": [], "skipped": ["World"]}
+
+    merged = forge_api.import_store(str(tmp_path / "store.json"), merge=True)
+    assert merged == {"ok": True, "imported": ["World"], "skipped": []}
+
+
+def test_split_flags_splits_byte_aligned_fields(monkeypatch):
+    """E.18: a u64 flag member splits into byte-aligned named fields."""
+    from forge.api import members as members_mod
+
+    monkeypatch.setattr(members_mod, "parse_user_tinfo", _sized_parse, raising=False)
+    forge_api.create_structure("Flags")
+    forge_api.add_member("Flags", 0x10, "u64", name="flags")
+
+    result = forge_api.split_flags(
+        "Flags", 0x10, [("visible", 8), ("mode", 8), ("opts", 32), ("reserved", 16)]
+    )
+
+    assert result["ok"] is True
+    assert result["bit_spec_ok"] is True
+    offsets = [(m["offset"], m["name"], m["type"]) for m in result["members"]]
+    assert offsets == [
+        (0x10, "visible", "u8"),
+        (0x11, "mode", "u8"),
+        (0x12, "opts", "u32"),
+        (0x16, "reserved", "u16"),
+    ]
+    assert len(forge_api.get_structure("Flags")["members"]) == 4
+
+
+def test_split_flags_rejects_bit_fields():
+    """E18: non-byte-aligned widths fail loudly (bit-fields unsupported)."""
+    forge_api.create_structure("Flags")
+    forge_api.add_member("Flags", 0x10, "u64", name="flags")
+
+    result = forge_api.split_flags("Flags", 0x10, [("a", 4), ("b", 4)])
+
+    assert result["ok"] is False
+    assert "bit-fields not byte-aligned" in result["error"]
+
+
+def test_backfill_lumina_applies_metadata(monkeypatch):
+    """F.7: calc+apply per function; missing API is a loud error."""
+    import ida_hexrays
+
+    applied = []
+    monkeypatch.setattr(
+        ida_hexrays,
+        "calc_func_metadata",
+        lambda ea: (applied.append(("calc", ea)) or ea),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        ida_hexrays,
+        "apply_metadata",
+        lambda ea: applied.append(("apply", ea)),
+        raising=False,
+    )
+
+    result = forge_api.backfill_lumina([0x401000, 0x402000])
+
+    assert result == {"applied": 2, "errors": []}
+    assert applied == [("calc", 0x401000), ("apply", 0x401000), ("calc", 0x402000), ("apply", 0x402000)]
+
+    monkeypatch.setattr(ida_hexrays, "calc_func_metadata", None, raising=False)
+    missing = forge_api.backfill_lumina([0x401000])
+    assert missing == {
+        "ok": False,
+        "error": "lumina metadata API not available on this build",
+    }
+
+
+def test_if_inverter_and_transform_contract(monkeypatch):
+    """F.6: the ctree_transform DSL — IfInverter wraps one inversion;
+    StatementTransform is a contract base."""
+    import ida_hexrays
+
+    from forge.api.ctree_transform import (
+        CtreeStatementVisitor,
+        IfInverter,
+        StatementTransform,
+    )
+    from forge.features.swap_if import helper as swap_helper
+
+    monkeypatch.setattr(ida_hexrays, "cit_if", 42, raising=False)
+    monkeypatch.setattr(ida_hexrays, "ctree_visitor_t", type("V", (), {
+        "__init__": lambda self, *a, **k: None,
+        "apply_to": lambda self, *a, **k: None,
+    }), raising=False)
+    cfunc = SimpleNamespace(
+        entry_ea=0x401000,
+        treeitems=[
+            SimpleNamespace(
+                to_specific_type=lambda: SimpleNamespace(
+                    op=42, cif=SimpleNamespace(ielse=True, ea=0x4000)
+                )
+            )
+        ],
+        body=None,
+    )
+    inverted = []
+    monkeypatch.setattr(
+        swap_helper, "inverse_if", lambda cif: inverted.append(cif), raising=False
+    )
+
+    transform = IfInverter(cfunc, 0x4000)
+    assert transform.transform() is True
+    assert inverted[0].ea == 0x4000
+
+    with pytest.raises(NotImplementedError):
+        StatementTransform(None).transform()
+
+    # the window visitor records statements and dispatches
+    seen = []
+
+    class _Spy(CtreeStatementVisitor):
+        def handle_statement(self, insn):
+            seen.append(getattr(insn, "ea", None))
+
+    visitor = _Spy(-1)
+    visitor.visit_insn(SimpleNamespace(ea=0x4010))
+    assert visitor.window == [SimpleNamespace(ea=0x4010)]
+    assert seen == [0x4010]
 
 
 def test_rename_ea_renames_function_or_global(monkeypatch):

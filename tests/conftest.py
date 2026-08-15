@@ -223,6 +223,11 @@ _stub_module(
     Hexrays_Hooks=_DummyHexraysHooks,
     ctree_item_t=type("ctree_item_t", (), {}),
     ctree_parentee_t=type("ctree_parentee_t", (), {}),
+    ctree_visitor_t=type(
+        "ctree_visitor_t",
+        (),
+        {"__init__": lambda self, *a, **k: None, "apply_to": lambda self, *a, **k: None},
+    ),
     cfunc_t=type("cfunc_t", (), {}),
     cexpr_t=type("cexpr_t", (), {}),
     lvar_t=type("lvar_t", (), {}),
