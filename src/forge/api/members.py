@@ -191,6 +191,14 @@ def _parse_named_like_type(normalized: str) -> ida_typeinf.tinfo_t | None:
 
 def parse_user_tinfo(declaration: str) -> ida_typeinf.tinfo_t | None:
     normalized = normalize_type_declaration(declaration)
+    # E28: braceless bare-union/struct bodies (``union { int a; float b; }``)
+    # fail to parse on IDA with the plain or semicolon forms — the member
+    # suffix must come first. ``{`` in the text guards struct/union bodies
+    # generally; the later generic attempts still run for everything else.
+    if normalized.startswith("union") or "{" in normalized:
+        tinfo = _parse_decl_attempt(f"{normalized} __forge_member;")
+        if tinfo is not None:
+            return tinfo
     attempts = [
         normalized,
         f"{normalized};",

@@ -2303,6 +2303,82 @@ def test_undo_type_missing_snapshot_errors(monkeypatch):
     assert "no undo snapshot" in result["error"]
 
 
+def test_create_typedef_commits_typedef_line(monkeypatch):
+    """E29: create_typedef parses the declaration and commits
+    ``typedef <decl> <name>;`` through the pure IDB-write path."""
+    import forge.api.types as forge_types_mod
+
+    created = []
+    monkeypatch.setattr(
+        forge_types_mod,
+        "create_type",
+        lambda name, decl: (created.append((name, decl)) or True),
+        raising=False,
+    )
+
+    result = forge_api.create_typedef(
+        "DispatchFn", "int (__cdecl *)(void *, unsigned int)"
+    )
+
+    assert result == {"ok": True, "type": "DispatchFn"}
+    assert created == [
+        (
+            "DispatchFn",
+            "typedef int (__cdecl *)(void *, unsigned int) DispatchFn;",
+        )
+    ]
+
+
+def test_create_typedef_parse_failure_is_loud(monkeypatch):
+    """E29: an unparseable typedef body fails loudly (no silent drop)."""
+    monkeypatch.setattr(members_mod, "parse_user_tinfo", lambda decl: None, raising=False)
+
+    result = forge_api.create_typedef("X", "not a type")
+
+    assert result["ok"] is False
+    assert "could not parse typedef declaration" in result["error"]
+
+
+def test_create_typedef_falls_back_to_hexrays_create_typedef(monkeypatch):
+    """E29: when the pure write path fails, the templated-types typedef
+    mechanism (ida_hexrays.create_typedef) materializes the type."""
+    import ida_hexrays
+
+    import forge.api.types as forge_types_mod
+
+    monkeypatch.setattr(
+        forge_types_mod, "create_type", lambda *a, **k: False, raising=False
+    )
+    calls = []
+    monkeypatch.setattr(
+        ida_hexrays,
+        "create_typedef",
+        lambda name: (calls.append(name) or True),
+        raising=False,
+    )
+    monkeypatch.setattr(forge_api, "is_type", lambda name: True, raising=False)
+
+    result = forge_api.create_typedef(
+        "DispatchFn", "int (__cdecl *)(void *, unsigned int)"
+    )
+
+    assert result == {"ok": True, "type": "DispatchFn"}
+    assert calls == ["DispatchFn"]
+
+
+def test_add_member_accepts_inline_union_type(monkeypatch):
+    """E28: add_member with an inline union type lands a real member."""
+    forge_api.create_structure("Variant")
+    member = forge_api.add_member(
+        "Variant",
+        0,
+        "union { unsigned __int32 as_u32; int as_i32; float as_f32; void *as_ptr; }",
+        name="as",
+    )
+    assert member["name"] == "as"
+    assert member["offset"] == 0
+
+
 # ---------------------------------------------------------------------------
 # Round-2 review regressions (2026-08-13)
 # ---------------------------------------------------------------------------

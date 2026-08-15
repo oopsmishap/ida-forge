@@ -187,7 +187,7 @@ def test_import_types_imports_local_udts(_registry):
 
     result = forge_api.import_types("world")
 
-    assert result == {"imported": ["World"], "skipped": []}
+    assert result == {"imported": ["World"], "skipped": {}}
     from forge.api.store import catalog
 
     assert catalog["World"].provenance.kind == "imported"
@@ -206,11 +206,79 @@ def test_import_types_skips_existing_and_base_and_temp(_registry):
 
     result = forge_api.import_types()
 
-    assert "World" in result["skipped"]
+    assert result["skipped"] == {
+        "World": "already in store",
+        "BaseT": "base til",
+    }
     assert "ns::Thing" not in result["imported"] and "ns::Thing" not in result["skipped"]
-    assert "BaseT" not in result["imported"] and "BaseT" not in result["skipped"]
     kept = forge_api.get_structure("World")
     assert [m["name"] for m in kept["members"]] == ["keep"]
+
+
+def test_import_types_skipped_carries_reasons(_registry):
+    """E26: skipped is a {name: reason} dict — system/compiler locals, base
+    til names and already-imported catalog names each say why."""
+    forge_api.create_structure("World")
+    forge_api.add_member("World", 0, "u32", name="keep")
+    _registry["World"] = FakeUdt("World", [(0, "o", "u32")])
+    _registry["UNWIND_INFO_HDR"] = FakeUdt("UNWIND_INFO_HDR", [(0, "u", "u8")])
+    _registry["BaseT"] = FakeUdt("BaseT", [(0, "b", "u32")], in_base=True)
+
+    result = forge_api.import_types()
+
+    assert result["skipped"] == {
+        "UNWIND_INFO_HDR": "system/compiler name",
+        "BaseT": "base til",
+        "World": "already in store",
+    }
+
+
+def test_refresh_types_synthesized_name_follows_idb(_registry):
+    """E26: include_names adopts the IDB member name for a member whose
+    store name is still the synthesized pattern (u32_0)."""
+    forge_api.create_structure("World")
+    forge_api.add_member("World", 0, "u32")  # auto name "u32_0"
+    _registry["World"] = FakeUdt("World", [(0, "u32_0", "u32")])
+    assert forge_api.push_type("World") is True  # baseline
+
+    _registry["World"] = FakeUdt("World", [(0, "count", "u32")])
+
+    result = forge_api.refresh_types(include_names=True)
+
+    assert result["renamed"] == ["count"]
+    assert forge_api.get_member("World", 0)["name"] == "count"
+
+
+def test_refresh_types_keeps_synthesized_name_without_include_names(_registry):
+    """E26: default refresh_types keeps the store's synthesized name — the
+    include_names opt-in is what adopts IDB names."""
+    forge_api.create_structure("World")
+    forge_api.add_member("World", 0, "u32")  # "u32_0"
+    _registry["World"] = FakeUdt("World", [(0, "u32_0", "u32")])
+    assert forge_api.push_type("World") is True
+
+    _registry["World"] = FakeUdt("World", [(0, "count", "u32")])
+
+    result = forge_api.refresh_types()
+
+    assert result["renamed"] == []
+    assert forge_api.get_member("World", 0)["name"] == "u32_0"
+
+
+def test_refresh_types_never_overwrites_hand_named_member(_registry):
+    """E26: a hand-named store member is never renamed, even with
+    include_names=True."""
+    forge_api.create_structure("World")
+    forge_api.add_member("World", 0, "u32", name="seen")  # hand name
+    _registry["World"] = FakeUdt("World", [(0, "seen", "u32")])
+    assert forge_api.push_type("World") is True
+
+    _registry["World"] = FakeUdt("World", [(0, "count", "u32")])
+
+    result = forge_api.refresh_types(include_names=True)
+
+    assert result["renamed"] == []
+    assert forge_api.get_member("World", 0)["name"] == "seen"
 
 
 def test_push_type_noop_when_in_sync(_registry, monkeypatch):
@@ -325,7 +393,7 @@ def test_refresh_types_updates_members_keeping_names(_registry):
 
     result = forge_api.refresh_types()
 
-    assert result == {"updated": [], "unchanged": ["World"]}
+    assert result == {"updated": [], "unchanged": ["World"], "renamed": []}
 
 
 def test_push_then_refresh_is_noop(_registry):
@@ -340,4 +408,4 @@ def test_push_then_refresh_is_noop(_registry):
 
     result = forge_api.refresh_types()
 
-    assert result == {"updated": [], "unchanged": ["World"]}
+    assert result == {"updated": [], "unchanged": ["World"], "renamed": []}

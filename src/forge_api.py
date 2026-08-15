@@ -40,6 +40,7 @@ __all__ = [
     "create_field",
     "create_structure",
     "create_type",
+    "create_typedef",
     "decompile",
     "deep_scan",
     "duplicate_structure",
@@ -1893,7 +1894,7 @@ def import_types(pattern: str | None = None) -> dict:
     tables) live in no til, so they import like user types.
 
     Returns:
-        ``{"imported": [names], "skipped": [names]}``.
+        ``{"imported": [names], "skipped": {name: reason}}``.
     """
     _require_ida()
     import ida_typeinf
@@ -1907,7 +1908,7 @@ def import_types(pattern: str | None = None) -> dict:
     except Exception:  # noqa: BLE001 — base-til handle varies by IDA version
         base_til = None
     imported = []
-    skipped = []
+    skipped = {}
     seen = set()
     for ordinal in range(ida_typeinf.get_ordinal_count(idati)):
         name = ida_typeinf.get_numbered_type_name(idati, ordinal)
@@ -1915,11 +1916,14 @@ def import_types(pattern: str | None = None) -> dict:
             continue
         seen.add(name)
         if "::" in name:
+            # E26: compiler-synthesized template names are silently not
+            # candidate types — they are not "skipped" catalog entries.
             continue
         # Compiler-generated locals live in the local til, not the base til,
         # so only a name-based denylist can exclude them (O1 live pass,
         # 2026-08-13: UNWIND_INFO_HDR/C_SCOPE_TABLE imported otherwise).
         if name in _SYSTEM_TYPE_NAMES or name.startswith("_$"):
+            skipped[name] = "system/compiler name"
             continue
         if pattern and pattern.casefold() not in name.casefold():
             continue
@@ -1928,9 +1932,10 @@ def import_types(pattern: str | None = None) -> dict:
             continue
         base = ida_typeinf.tinfo_t()
         if base_til is not None and base.get_named_type(base_til, name):
+            skipped[name] = "base til"
             continue
         if name in catalog:
-            skipped.append(name)
+            skipped[name] = "already in store"
             continue
 
         structure = Structure(name)
@@ -2045,16 +2050,22 @@ def push_all() -> dict:
     returns="dict",
     example='r = forge_api.refresh_types(); r["updated"]',
 )
-def refresh_types() -> dict:
-    """Pull IDB changes back into catalog structures (type-library mirror).
+def refresh_types(*, include_names: bool = False) -> dict:
+    """Pull IDB changes back into store types (type-library mirror).
 
     For every baseline entry whose current IDB member layout differs,
     re-import members into the store structure: update the types of members
     whose offset matches (keeping their names), add new members, never
     delete. Updates the baseline hash afterwards.
 
+    ``include_names`` (E26) also adopts the IDB member NAMES for store
+    members whose name is still the synthesized pattern (``u32_10`` /
+    ``field_8`` — :meth:`Member._is_name_aliased`); the IDB name wins on
+    mismatch. Naming a store member by hand (any non-synthesized name) is
+    never overwritten.
+
     Returns:
-        ``{"updated": [names], "unchanged": [names]}``.
+        ``{"updated": [names], "unchanged": [names], "renamed": [names]}``.
     """
     _require_ida()
     from forge.api.members import Member, parse_user_tinfo
@@ -2062,6 +2073,7 @@ def refresh_types() -> dict:
 
     updated = []
     unchanged = []
+    renamed = []
     baseline = {}
     try:
         baseline = dict(_mirror_store().items())
@@ -2078,14 +2090,21 @@ def refresh_types() -> dict:
         if structure is None:
             structure = Structure(name)
             catalog[name] = structure
-        for offset, _member_name, member_type in idb_rows:
+        for offset, idb_member_name, member_type in idb_rows:
             existing = structure.get_member_by_offset(offset)
             tinfo = parse_user_tinfo(member_type or "u64")
             if tinfo is None:
                 tinfo = parse_user_tinfo("u64")
             if existing is not None:
-                # update the type in place; keep the store's name
+                # update the type in place; keep the store's name unless
+                # the name is synthesized and include_names is requested
                 existing.tinfo = tinfo
+                if include_names and idb_member_name:
+                    is_aliased = getattr(existing, "_is_name_aliased", None)
+                    if callable(is_aliased) and is_aliased():
+                        if existing.name != idb_member_name:
+                            existing.name = idb_member_name
+                            renamed.append(idb_member_name)
             else:
                 structure.add_member(
                     Member(offset, tinfo, None, 0)
@@ -2100,6 +2119,7 @@ def refresh_types() -> dict:
             log_warning(f"could not refresh TypeMirror baseline for {name}: {exc}")
         updated.append(name)
     _mark_dirty()
+    return {"updated": updated, "unchanged": unchanged, "renamed": renamed}
     return {"updated": updated, "unchanged": unchanged}
 
 
@@ -2780,6 +2800,55 @@ def remove_type(name: str) -> dict:
         "removed": existed and not Structure._named_type_exists(name),
         "name": name,
     }
+
+
+@api(
+    group="types",
+    returns="dict",
+    example='r = forge_api.create_typedef("DispatchFn", "int (__cdecl *)(void *, unsigned int)")',
+)
+def create_typedef(name: str, declaration: str) -> dict:
+    """Create an IDB named type for a non-UDT C type (E29).
+
+    ``declaration`` is the typedef body: a function pointer, scalar alias,
+    enum, ... (``"int (__cdecl *)(void *, unsigned int)"``). Parsed through
+    the same member-parse path — an unparseable declaration fails loudly.
+    The typedef commits as ``typedef <declaration> <name>;`` through
+    ``forge_types.create_type`` (the pure IDB-write path used by every
+    commit — no pseudocode-view dependency); when that write fails, the
+    ``ida_hexrays.create_typedef`` mechanism (the templated-types path)
+    materializes the named type as a fallback. Typedefs live in the type
+    table like any other named type (:func:`type_of` reads them back).
+
+    Returns:
+        ``{"ok": bool, "type": str}``, or an error dict when the
+        declaration does not parse.
+    """
+    _require_ida()
+    from forge.api.members import parse_user_tinfo
+
+    if parse_user_tinfo(declaration) is None:
+        return {
+            "ok": False,
+            "error": f"could not parse typedef declaration {declaration!r}",
+        }
+
+    import ida_hexrays
+
+    import forge.api.types as forge_types
+
+    if forge_types.create_type(name, f"typedef {declaration} {name};"):
+        return {"ok": True, "type": name}
+
+    create_typedef_fn = getattr(ida_hexrays, "create_typedef", None)
+    if callable(create_typedef_fn):
+        try:
+            create_typedef_fn(name)
+        except Exception as exc:  # noqa: BLE001 — version/format tolerance
+            return {"ok": False, "type": name, "error": f"typedef write failed: {exc}"}
+        if is_type(name):
+            return {"ok": True, "type": name}
+    return {"ok": False, "type": name, "error": "typedef write failed"}
 
 
 @api(
