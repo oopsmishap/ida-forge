@@ -129,16 +129,23 @@ disassembly of the helper, and report it as a found gap.
 4. When forge gets a type wrong (wrong member set/offsets), fix it in the
    store and re-commit (`create_type(overwrite=True)`) — the point is the
    end state, not the path.
+5. Scan tools are the builder: `deep_scan`/`scan_global`/
+   `scan_from_allocation` are the primary mechanism for deriving layouts;
+   manual member construction is a fallback for scanner-blind spots and
+   must be listed in the report's gaps (type + missed-evidence reason).
 
 ## Phases
 
 1. **Recon** — map functions, globals, and every printf format string
    (they carry member name evidence). Plan which section runner feeds
    which struct. (ida-domain work.)
-2. **Recover** — per section: find the allocation site with
-   `scan_from_allocation` or `deep_scan` with a root type; hand-build or
-   disassemble what the scanners miss (helper-allocated nodes like
-   `chain_node_new`, arrays, nested inlines); name members from the
+2. **Recover** — every layout MUST come from scanner evidence: per
+   section, drive `deep_scan` with a root type from the allocation site,
+   or `scan_global`/`scan_from_allocation` where they fit; commit what
+   the scanner derived. Hand-build/disassemble only what the scanners
+   genuinely cannot see (helper-allocated nodes like `chain_node_new`,
+   arrays, nested inlines) AND report each manual build — type, why the
+   scanner missed it — in the gaps section. Name members from the
    format-string evidence (forge naming + idc reads).
 3. **Apply** — `finalize`/`create_type` (children first), `apply_type(
    ..., redefine_range=True)` on every global region (one call covers the
