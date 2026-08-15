@@ -31,6 +31,11 @@ class FakeMember:
     def set_enabled(self, enabled: bool):
         self.enabled = enabled
 
+    def effective_size(self) -> int:
+        # Pack-time size — identical to `size` in these unit doubles
+        # (real Members resolve the FRESH tinfo at pack; see R2.1).
+        return self.size
+
     def has_collision(self, other) -> bool:
         return self.offset + self.size > other.offset
 

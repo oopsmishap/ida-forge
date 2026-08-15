@@ -62,6 +62,7 @@ __all__ = [
     "refresh_types",
     "remove_members",
     "remove_structure",
+    "remove_type",
     "rename_ea",
     "rename_local",
     "rename_structure",
@@ -81,6 +82,7 @@ __all__ = [
     "to_usercall",
     "to_vtable",
     "type_of",
+    "undo_type",
     "vtable_entries",
     "vtable_name",
 ]
@@ -1054,19 +1056,26 @@ def apply_type(
     :func:`add_member`), so ``"GridNode"`` parses before its type exists.
     With ``redefine_range=True`` the type's byte span is first cleared: auto
     names on heads inside ``[ea, ea + size)`` are deleted (so a flattened
-    ``qword_...`` chain cannot shadow the struct), then ``del_items`` (a
-    simple delete), then the type is applied with ``TINFO_DEFINITE`` — the
-    sequence that makes a global render as ``g_outer.cell_meta[0].tag``.
+    ``qword_...`` chain cannot shadow the struct), then the whole span is
+    deleted with ``DELIT_DELNAMES`` and the type applied with
+    ``TINFO_DEFINITE`` — the report-proven sequence that makes a global
+    render as one struct item (``g_outer.cell_meta[0].tag``) and survives
+    idalib's deferred-analysis re-split race (R2.2/R2.3). The base head's
+    name is re-applied afterwards, so a user-named global keeps rendering
+    by name. When a user-named SUB-head sits inside the span, the
+    full-span delete is skipped (the user's name is never swallowed) and
+    the type applies to the first item only, as before. ``del_items``
+    takes the END offset ``ea + size``, never a length (R2.4).
 
     Returns:
-        ``{"ok": True, "ea": int, "type": str}`` or
+        ``{"ok": True, "ea": int, "type": str}`` (with optional
+        ``"warning"`` when the item re-split despite a retry) or
         ``{"ok": False, "error": str}``.
     """
     _require_ida()
     import re as _re
 
     import ida_bytes
-    import ida_idaapi
     import ida_name
     import ida_typeinf
 
@@ -1085,6 +1094,9 @@ def apply_type(
     if redefine_range:
         size = tinfo.get_size()
         if size is not None and size > 0 and size != ida_typeinf.BADSIZE:
+            from forge.util.logging import log_debug
+
+            log_debug(f"apply_type redefine_range span {hex(ea)}..{hex(ea + size)}")
             user_named = False
             for head in range(ea, ea + size):
                 if head == ea:
@@ -1095,41 +1107,53 @@ def apply_type(
                 if not ida_name.get_name(head):
                     continue
                 # Keep user-typed names; strip the auto qword_/xmmword_
-                # shadowing names so the struct owns the range.
+                # shadowing names so the struct owns the range (R2.2: a
+                # user-named sub-head blocks the whole-span delete).
                 if hasattr(ida_bytes, "has_user_name") and ida_bytes.has_user_name(flags):
                     user_named = True
                     continue
                 ida_name.del_global_name(head)
-            ida_bytes.del_items(ea, ida_bytes.DELIT_SIMPLE, ea + size)
-            # Recovery-eval gap #4 (2026-08-13): apply_tinfo(definite) only
-            # redefines the FIRST item; the rest of a multi-field global
-            # stays scalar until auto-analysis re-splits it (and idalib
-            # races the item back to 1 B without auto_wait). For plain
-            # UDTs, create the full-size struct item over the whole span,
-            # then settle analysis. Skip when user-named sub-heads would
-            # be swallowed.
-            is_udt = getattr(tinfo, "is_udt", None)
-            spans_struct = (
-                callable(is_udt)
-                and is_udt()
-                and not user_named
-            )
-            if spans_struct:
-                try:
-                    import ida_auto
+            base_name = ida_name.get_name(ea)
+            if user_named:
+                from forge.util.logging import log_warning
 
-                    tid = tinfo.get_tid() if hasattr(tinfo, "get_tid") else 0
-                    if (
-                        tid
-                        and tid != ida_idaapi.BADADDR
-                        and ida_bytes.create_struct(ea, size, tid)
-                    ):
-                        ida_auto.auto_wait()
-                except Exception as exc:  # noqa: BLE001 — fall back to single-item apply
-                    from forge.util.logging import log_debug
+                log_warning(
+                    "skipping full-span item: user-named sub-head inside span"
+                )
+            else:
+                # R2.3 (recovery eval): with DELIT_SIMPLE the deferred
+                # auto-analysis re-splits a fresh struct item back to 1 B
+                # (idalib race). DELIT_DELNAMES + apply + auto_wait is the
+                # sequence that survives save/reopen. R2.4: the 3rd
+                # argument is an END offset (ea + size), never a length.
+                import ida_auto
 
-                    log_debug(
-                        f"create_struct fallback needed for {hex(ea)}: {exc}"
+                ida_bytes.del_items(ea, ida_bytes.DELIT_DELNAMES, ea + size)
+                ida_typeinf.apply_tinfo(ea, tinfo, ida_typeinf.TINFO_DEFINITE)
+                ida_auto.auto_wait()
+                if ida_bytes.get_item_size(ea) != size:
+                    # Deferred-analysis re-split race: one retry with
+                    # settled analysis; still failing, report the warning
+                    # instead of lying about the item.
+                    ida_typeinf.apply_tinfo(ea, tinfo, ida_typeinf.TINFO_DEFINITE)
+                    if ida_bytes.get_item_size(ea) != size:
+                        return {
+                            "ok": True,
+                            "ea": ea,
+                            "type": tinfo.dstr(),
+                            "warning": (
+                                "re-split race: item at "
+                                f"{hex(ea)} re-split to a smaller item "
+                                "after apply; re-run apply_type once "
+                                "auto-analysis settles"
+                            ),
+                        }
+                # the delete clears the base head's name too (DELIT_DELNAMES
+                # removes names of deleted items) — restore it so named
+                # globals keep rendering by name.
+                if base_name:
+                    ida_name.set_name(
+                        ea, base_name, getattr(ida_name, "SN_NOCHECK", 0)
                     )
 
     ida_typeinf.apply_tinfo(ea, tinfo, ida_typeinf.TINFO_DEFINITE)
@@ -1204,6 +1228,7 @@ def get_member(
     offset: int = 0,
     *,
     member_name: str | None = None,
+    member_type: str | None = None,
     include_disabled: bool = True,
 ) -> dict | None:
     """Return the first member dict at ``offset``.
@@ -1211,9 +1236,12 @@ def get_member(
     Unlike :meth:`Structure.get_member_by_offset`, ``include_disabled=False``
     skips collision-disabled members. ``member_name`` (E11, 2026-08-13)
     disambiguates collision pairs — without it, the offset match silently
-    picks whichever member sorts first. Returns ``None`` when no structure
-    is selected/resolvable or no member matches (read-side convention
-    matches :func:`get_structure`).
+    picks whichever member sorts first. ``member_type`` (E24) narrows the
+    match further: only members whose displayed type string equals it
+    (``"u32"``, ``"Child *"``, ...) qualify, so same-offset/same-name
+    members that only differ by type stay addressable. Returns ``None``
+    when no structure is selected/resolvable or no member matches
+    (read-side convention matches :func:`get_structure`).
 
     Returns:
         member dict or None.
@@ -1225,6 +1253,8 @@ def get_member(
         if member.offset != offset:
             continue
         if member_name is not None and member.name != member_name:
+            continue
+        if member_type is not None and _member_type_str(member) != member_type:
             continue
         if not include_disabled and not member.enabled:
             continue
@@ -1341,6 +1371,8 @@ def add_member(
     """
     from forge.api.members import Member, parse_user_tinfo
 
+    if name is not None:
+        _validate_member_name(name)
     target = _resolve_structure(structure)
     tinfo = parse_user_tinfo(type)
     if tinfo is None:
@@ -1396,6 +1428,7 @@ def set_member(
     offset: int = 0,
     *,
     member_name: str | None = None,
+    member_type: str | None = None,
     type: str | None = None,
     name: str | None = None,
     comment: str | None = None,
@@ -1407,7 +1440,9 @@ def set_member(
     Only the provided keyword fields change. ``member_name`` (E11,
     2026-08-13) selects which member at a collision-offset is edited —
     without it the offset match silently picks whichever member sorts
-    first. ``type`` must parse as a C type; a parse failure returns
+    first. ``member_type`` (E24) narrows the selection the same way
+    :func:`get_member` does: the member's displayed type string must
+    equal it. ``type`` must parse as a C type; a parse failure returns
     ``{"ok": False, "error": ...}`` without changing anything. Raises
     :class:`ForgeApiError` when no member exists at ``offset``.
 
@@ -1416,6 +1451,8 @@ def set_member(
     """
     from forge.api.members import parse_user_tinfo
 
+    if name is not None:
+        _validate_member_name(name)
     target = _resolve_structure(structure)
     if member_name is not None:
         member = next(
@@ -1423,15 +1460,25 @@ def set_member(
                 m
                 for m in target.members
                 if m.offset == offset and m.name == member_name
+                and (member_type is None or _member_type_str(m) == member_type)
             ),
             None,
         )
     else:
-        member = target.get_member_by_offset(offset)
+        member = next(
+            (
+                m
+                for m in target.members
+                if m.offset == offset
+                and (member_type is None or _member_type_str(m) == member_type)
+            ),
+            None,
+        )
     if member is None:
         raise ForgeApiError(
             f"no member at offset 0x{offset:x}"
             + (f" named {member_name!r}" if member_name else "")
+            + (f" typed {member_type!r}" if member_type else "")
         )
     if type is not None:
         tinfo = parse_user_tinfo(type)
@@ -1937,6 +1984,11 @@ def push_type(name: str) -> bool:
         if getattr(member, "enabled", True)
     ]
     if sorted(idb_rows) != sorted(store_rows):
+        # E17: snapshot before the rewrite so push_type's commit is
+        # reversible with the facade snapshot (create_type records its
+        # own identical snapshot; this one guarantees the contract even
+        # if the commit path changes).
+        _snapshot_type_before_commit(name)
         result = create_type(name, overwrite=True)
         if not result.get("ok", False):
             return False
@@ -2502,6 +2554,29 @@ _C_RESERVED_KEYWORDS = frozenset(
 )
 
 
+_C_KEYWORDS = frozenset(
+    {
+        "alignas", "alignof", "and", "asm", "auto", "bool", "break", "case",
+        "char", "const", "continue", "default", "do", "double", "else",
+        "enum", "extern", "float", "for", "goto", "if", "inline", "int",
+        "long", "register", "restrict", "return", "short", "signed",
+        "sizeof", "static", "struct", "switch", "typedef", "union",
+        "unsigned", "void", "volatile", "while",
+    }
+)
+
+
+def _validate_member_name(name: str) -> None:
+    """Reject C-keyword member names (R2.6).
+
+    The IDB parser silently drops members whose names are reserved words
+    (``inline``, ``int``, ...) — the member vanishes from the committed
+    cdecl with no error. A loud failure up front beats a phantom member.
+    """
+    if name in _C_KEYWORDS:
+        raise ForgeApiError(f"{name} is a C keyword — rename the member")
+
+
 def _commit_failure_reason(cdecl: str, name: str) -> str:
     """Explain why committing ``cdecl`` as ``name`` failed.
 
@@ -2529,6 +2604,63 @@ def _commit_failure_reason(cdecl: str, name: str) -> str:
             f"({errors} error(s)) — reserved keyword or unresolved member type"
         )
     return "type parser accepted the declaration but no type materialized"
+
+
+def _UNDO_STORE():
+    """Netnode-backed snapshot store for :func:`undo_type` (E17)."""
+    from forge.api.storage import Storage
+
+    return Storage("ForgeTypeSnapshots")
+
+
+def _named_type_declaration(name: str) -> str | None:
+    """The IDB named type's full declaration text, parseable by set_cdecl.
+
+    ``type_of(name)["type"]`` is the bare type name (``Recovered2``), not
+    a restorable declaration; printing the tinfo the same way
+    :meth:`Structure.build_cdecl` does yields ``struct Recovered2 { ... };``.
+    Returns None when the type is missing or the print fails.
+    """
+    try:
+        import ida_typeinf
+
+        tinfo = ida_typeinf.tinfo_t()
+        if not tinfo.get_named_type(ida_typeinf.get_idati(), name):
+            return None
+        return (
+            ida_typeinf.print_tinfo(
+                None,
+                4,
+                5,
+                ida_typeinf.PRTYPE_MULTI
+                | ida_typeinf.PRTYPE_TYPE
+                | ida_typeinf.PRTYPE_SEMI,
+                tinfo,
+                name,
+                None,
+            )
+            or None
+        )
+    except Exception:  # noqa: BLE001 — version/format tolerance
+        return None
+
+
+def _snapshot_type_before_commit(name: str, after_decl: str | None = None) -> None:
+    """Record the type's pre-commit declaration for :func:`undo_type`.
+
+    E17: the facade snapshots the prior cdecl BEFORE every commit that
+    changes a type, so ``undo_type`` can restore it without an IDA undo
+    queue. A type that did not exist yet records ``before: None`` —
+    ``undo_type`` then removes it. Best-effort: any read/write failure
+    degrades to no snapshot, never a failed commit.
+    """
+    prior_decl = _named_type_declaration(name)
+    try:
+        _UNDO_STORE()[name] = {"before": prior_decl, "after": after_decl}
+    except Exception as exc:  # noqa: BLE001 — cache write must never break commits
+        from forge.util.logging import log_warning
+
+        log_warning(f"could not write undo snapshot for {name}: {exc}")
 
 
 def _is_forge_placeholder_type(name: str) -> bool:
@@ -2597,6 +2729,8 @@ def create_type(name: str | None = None, *, overwrite: bool = False) -> dict:
         # destroy the existing type (the DB would end up with no type at all).
         return {"ok": False, "error": "declaration could not be parsed for overwrite"}
 
+    # E17: record the pre-commit declaration so undo_type can restore it.
+    _snapshot_type_before_commit(target.name, cdecl)
     created = target.set_cdecl(cdecl, target.main_offset, overwrite=overwrite)
     if created is None:
         if overwrite is True:
@@ -2612,6 +2746,87 @@ def create_type(name: str | None = None, *, overwrite: bool = False) -> dict:
         "declaration": cdecl,
         "skipped": [m.name for m in target.members if not m.enabled],
     }
+
+
+@api(
+    group="types",
+    returns="dict",
+    example='r = forge_api.remove_type("Recovered"); r["removed"]',
+)
+def remove_type(name: str) -> dict:
+    """Delete a named IDB type and drop its TypeMirror baseline (E27).
+
+    Removes the type via :meth:`Structure._delete_named_type` — the
+    ordinal-delete path (the name-delete is a silent no-op on IDA 9.4).
+    The ``TypeMirror`` baseline entry (:func:`import_types`/
+    :func:`refresh_types` bookkeeping) is removed alongside. ``removed``
+    is False when ``name`` was not a known type (``ok`` still True — the
+    end state is "no such type").
+
+    Returns:
+        ``{"ok": bool, "removed": bool, "name": str}``.
+    """
+    _require_ida()
+    from forge.api.structure import Structure
+
+    existed = Structure._named_type_exists(name)
+    ok = Structure._delete_named_type(name)
+    with contextlib.suppress(Exception):
+        mirror = _mirror_store()
+        if name in mirror:
+            del mirror[name]
+    return {
+        "ok": ok,
+        "removed": existed and not Structure._named_type_exists(name),
+        "name": name,
+    }
+
+
+@api(
+    group="types",
+    returns="dict",
+    example='r = forge_api.undo_type("Recovered")',
+)
+def undo_type(name: str) -> dict:
+    """Revert a type to its pre-commit declaration (E17).
+
+    :func:`create_type`, :func:`finalize` and :func:`push_type` snapshot
+    the prior cdecl before every commit that changes a type; ``undo_type``
+    restores it via :meth:`Structure.set_cdecl` (``overwrite=True``,
+    dialog-free) and consumes the snapshot. When the type did not exist
+    before the commit, it is removed instead. Returns an error dict when
+    no snapshot exists.
+
+    Returns:
+        ``{"ok": True, "restored_declaration": str}``,
+        :func:`remove_type`'s result when the type was created by the
+        commit (no prior declaration), or an error dict.
+    """
+    _require_ida()
+    from forge.api.structure import Structure
+
+    try:
+        entry = _UNDO_STORE().get(name)
+    except Exception:  # noqa: BLE001 — snapshot reads are best-effort
+        entry = None
+    if entry is None or "before" not in entry:
+        return {"ok": False, "error": f"no undo snapshot for {name!r}"}
+    prior = entry.get("before")
+    with contextlib.suppress(Exception):
+        mirror = _UNDO_STORE()
+        if name in mirror:
+            del mirror[name]
+    if prior is None:
+        return remove_type(name)
+    structure = Structure(name)
+    restored = structure.set_cdecl(prior, structure.main_offset, overwrite=True)
+    if restored is None:
+        return {
+            "ok": False,
+            "error": "restore failed — "
+            + _commit_failure_reason(prior, name),
+        }
+    return {"ok": True, "restored_declaration": prior}
 
 
 @api(
@@ -2668,6 +2883,8 @@ def finalize(name: str | None = None) -> dict:
     _require_ida()
     target = _resolve_structure(name)
     unresolved = target.get_unresolved_child_names(_structures)
+    # E17: snapshot the pre-commit declaration for undo_type.
+    _snapshot_type_before_commit(target.name)
     tinfo = target.create_type_if_ready(_structures, headless=True)
     if tinfo is None:
         if unresolved:

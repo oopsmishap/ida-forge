@@ -50,6 +50,17 @@ TYPE_DECL_ALIASES = {
     "unsigned int": "u32",
     "unsigned __int64": "u64",
     "unsigned long long": "u64",
+    # R2.5 (recovery eval 2026-08-13): the intN/uintN shorthand family must
+    # parse like the __intN spellings — members typed ``int32``/``uint64``
+    # were silently dropped before. Unknown tokens still fail loudly.
+    "int8": "i8",
+    "int16": "i16",
+    "int32": "i32",
+    "int64": "i64",
+    "uint8": "u8",
+    "uint16": "u16",
+    "uint32": "u32",
+    "uint64": "u64",
 }
 
 
@@ -449,6 +460,27 @@ class Member(AbstractMember):
                 log_debug(f"pack re-parse of {raw!r} failed: {exc}")
         return None
 
+    def effective_size(self) -> int:
+        """The member's byte size at PACK time, not storage time.
+
+        R2.1 (recovery eval 2026-08-13): a member whose type was added
+        while the IDB only had forge's 1-byte seed placeholder keeps a
+        stale small ``size`` — packing then placed every later member at
+        the poisoned offset (``Outer.bag`` 16 → 1 B shifted grid/dispatch/
+        stacks). Resolve the size from the FRESH pack tinfo (the same
+        re-parse :meth:`_resolve_pack_tinfo` uses for the serialized
+        type), falling back to the stored size only when the pack resolve
+        has no size at all.
+        """
+        pack_tinfo = self._resolve_pack_tinfo() or self.tinfo
+        try:
+            size = pack_tinfo.get_size()
+        except Exception:  # noqa: BLE001 — degraded tinfos have no size
+            size = ida_typeinf.BADSIZE
+        if size == ida_typeinf.BADSIZE:
+            return getattr(self, "size", 1)
+        return size
+
     def get_udt_member(self, array_size: int = 0, offset: int = 0):
         udt_member = ida_typeinf.udt_member_t()
 
@@ -468,7 +500,13 @@ class Member(AbstractMember):
             array_tinfo.create_array(array_data)
             udt_member.type = array_tinfo
         udt_member.offset = self.offset - offset
-        udt_member.size = self.size * array_size if array_size else self.size
+        # R2.1 (recovery eval 2026-08-13): the size must come from the
+        # PACK-resolved tinfo — the stored size can still be the 1-byte
+        # seed placeholder's, and packing with it chain-shifts every
+        # later member (Outer bag → grid/dispatch/stacks).
+        udt_member.size = (
+            self.effective_size() * array_size if array_size else self.effective_size()
+        )
         udt_member.cmt = self.comment
         return udt_member
 

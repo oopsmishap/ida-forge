@@ -476,13 +476,13 @@ class Structure:
             return 0
 
         member = self.members[index]
-        if member.size <= 0:
+        if member.effective_size() <= 0:
             return 0
 
         span = self.members[next_enabled].offset - member.offset
-        if span <= member.size:
+        if span <= member.effective_size():
             return 0
-        return span // member.size
+        return span // member.effective_size()
 
     def clear_members(self) -> None:
         self.members.clear()
@@ -682,11 +682,13 @@ class Structure:
                 array_size = self.calculate_array_size(index)
                 if array_size > 1:
                     udt_data.push_back(member.get_udt_member(array_size, offset=origin))
-                    current_offset = member.offset + member.size * array_size
+                    # R2.1: use the pack-resolved size for the stride too,
+                    # or a placeholder-poisoned member mis-sizes the array.
+                    current_offset = member.offset + member.effective_size() * array_size
                     continue
 
             udt_data.push_back(member.get_udt_member(offset=origin))
-            current_offset = member.offset + member.size
+            current_offset = member.offset + member.effective_size()
 
         final_tinfo.create_udt(udt_data, ida_typeinf.BTF_STRUCT)
         cdecl = ida_typeinf.print_tinfo(

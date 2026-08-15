@@ -93,6 +93,131 @@ def test_to_hex_is_pure():
     assert forge_api.to_hex(0x401000) == "0x401000"
 
 
+def test_intN_aliases_normalize_in_type_declarations():
+    """R2.5: the intN/uintN shorthand normalizes to the __intN spellings so
+    member types typed ``int32``/``uint64`` parse instead of silently
+    vanishing from the committed cdecl."""
+    from forge.api.members import normalize_type_declaration
+
+    assert normalize_type_declaration("int8") == "i8"
+    assert normalize_type_declaration("int16") == "i16"
+    assert normalize_type_declaration("int32") == "i32"
+    assert normalize_type_declaration("int64") == "i64"
+    assert normalize_type_declaration("uint8") == "u8"
+    assert normalize_type_declaration("uint16") == "u16"
+    assert normalize_type_declaration("uint32") == "u32"
+    assert normalize_type_declaration("uint64") == "u64"
+    assert normalize_type_declaration("uint32 *") == "u32 *"
+    assert normalize_type_declaration("uint64[8]") == "u64[8]"
+    # unknown tokens are untouched — the parse path still fails loudly
+    assert normalize_type_declaration("int33") == "int33"
+
+
+def test_intN_aliases_add_member_accepts_shorthand(monkeypatch):
+    """R2.5: add_member with intN/uintN shorthand succeeds (parse goes
+    through the same normalize step as the display path)."""
+    forge_api.create_structure("S")
+    member = forge_api.add_member("S", 0x10, "int32", name="width")
+    assert member["offset"] == 0x10
+    assert member["name"] == "width"
+
+
+def test_create_type_re_resolves_placeholder_member_sizes(monkeypatch):
+    """R2.1 (priority #1): a member added while its type was still the
+    1-byte seed placeholder packs with the child's REAL size after the
+    child commits — no chain-shift of later members (the eval's
+    ``Outer.bag`` 16 → 1 B → grid/dispatch/stacks shift)."""
+    import ida_typeinf
+
+    from forge.api import members as members_mod
+    from forge.api import structure as structure_mod
+
+    child_committed = False
+
+    def _parse(declaration):
+        name = (declaration or "u32").split()[0]
+        if name == "Child":
+            # 1 B while Child is only a store placeholder; 40 B after the
+            # child's own commit (the "real size 40" of the eval scenario).
+            return FakeTinfo("Child", size=40 if child_committed else 1)
+        return FakeTinfo(name, size={"u64": 8, "u16": 2}.get(name, 4))
+
+    monkeypatch.setattr(members_mod, "parse_user_tinfo", _parse, raising=False)
+
+    forge_api.create_structure("Child")
+    forge_api.create_structure("Parent")
+    forge_api.add_member("Parent", 0x10, "Child *", name="child")
+    forge_api.add_member("Parent", 0x38, "u32", name="count")
+
+    # capture the rows build_cdecl pushes into the udt (print_tinfo is a
+    # stub in this environment, so the udt rows are the layout evidence)
+    recorded = []
+    real_udt_factory = ida_typeinf.udt_type_data_t
+
+    def _recording_udt():
+        data = real_udt_factory()
+        recorded.append(data)
+        return data
+
+    monkeypatch.setattr(ida_typeinf, "udt_type_data_t", _recording_udt, raising=False)
+    monkeypatch.setattr(
+        ida_typeinf, "print_tinfo", lambda *a, **k: "struct Parent { };", raising=False
+    )
+    monkeypatch.setattr(
+        ida_typeinf.tinfo_t, "get_named_type", lambda self, *a, **k: False, raising=False
+    )
+    captured_cdecls = []
+    monkeypatch.setattr(
+        structure_mod.Structure,
+        "set_cdecl",
+        lambda self, cdecl, origin=0, *, overwrite=None: (
+            captured_cdecls.append(cdecl) or object()
+        ),
+        raising=False,
+    )
+    assert forge_api.get_member("Parent", 0x10, member_name="child")["size"] == 1
+
+    # commit Child (real size 40), then pack the parent
+    child_committed = True
+    result = forge_api.create_type("Parent")
+
+    assert result["ok"] is True
+    assert len(captured_cdecls) == 1
+    rows = recorded[-1]
+    # child packs at its REAL 40 bytes (relative to the 0x10 origin)
+    assert rows[0].name == "child"
+    assert rows[0].offset == 0x0
+    assert rows[0].size == 40
+    # count lands directly after the child: no padding row, no chain-shift
+    assert rows[-1].name == "count"
+    assert rows[-1].offset == 0x28
+    assert rows[-1].size == 4
+    assert not any(getattr(row, "name", "").startswith("gap_") for row in rows)
+
+
+def test_add_member_rejects_c_keyword_name():
+    """R2.6: a member named after a C keyword fails loudly instead of
+    silently vanishing from the committed cdecl."""
+    forge_api.create_structure("S")
+    with pytest.raises(forge_api.ForgeApiError, match="C keyword"):
+        forge_api.add_member("S", 0x10, "u32", name="inline")
+    with pytest.raises(forge_api.ForgeApiError, match="C keyword"):
+        forge_api.add_member("S", 0x10, "u32", name="int")
+    # ordinary names still land
+    member = forge_api.add_member("S", 0x10, "u32", name="inline_data")
+    assert member["name"] == "inline_data"
+    assert len(forge_api.get_structure("S")["members"]) == 1
+
+
+def test_set_member_rejects_c_keyword_name():
+    """R2.6: renaming a member to a C keyword fails loudly too."""
+    forge_api.create_structure("S")
+    forge_api.add_member("S", 0x10, "u32", name="count")
+    with pytest.raises(forge_api.ForgeApiError, match="C keyword"):
+        forge_api.set_member("S", 0x10, name="union")
+    assert forge_api.get_member("S", 0x10)["name"] == "count"
+
+
 def test_store_create_and_members():
     forge_api.create_structure("S1")
     member = forge_api.add_member("S1", 0x10, "u32", name="count")
@@ -945,8 +1070,11 @@ def test_signature_returns_first_line(monkeypatch, _real_hexrays):
 # ---------------------------------------------------------------------------
 
 def test_apply_type_redefine_range_order(monkeypatch):
-    """I.19: redefine_range clears auto names in the span, then del_items,
-    then apply_tinfo — in that order — and reports the applied type."""
+    """I.19/R2.2/R2.3: redefine_range deletes auto names in the span, then
+    DELIT_DELNAMES the whole span, applies with TINFO_DEFINITE, waits for
+    auto-analysis, and re-applies the base head's name — the sequence that
+    survives idalib's re-split race."""
+    import ida_auto
     import ida_bytes
     import ida_name
     import ida_typeinf
@@ -955,7 +1083,8 @@ def test_apply_type_redefine_range_order(monkeypatch):
     monkeypatch.setattr(ida_bytes, "get_flags", lambda h: 1, raising=False)
     monkeypatch.setattr(ida_bytes, "is_head", lambda f: True, raising=False)
     monkeypatch.setattr(ida_bytes, "has_user_name", lambda f: False, raising=False)
-    monkeypatch.setattr(ida_bytes, "DELIT_SIMPLE", 1, raising=False)
+    monkeypatch.setattr(ida_bytes, "DELIT_DELNAMES", 8, raising=False)
+    monkeypatch.setattr(ida_bytes, "get_item_size", lambda ea: 4, raising=False)
     monkeypatch.setattr(
         ida_bytes,
         "del_items",
@@ -968,10 +1097,17 @@ def test_apply_type_redefine_range_order(monkeypatch):
         lambda h: "g_outer_aggregate" if h == 0x401000 else f"qword_{h:x}",
         raising=False,
     )
+    monkeypatch.setattr(ida_name, "SN_NOCHECK", 0x10, raising=False)
     monkeypatch.setattr(
         ida_name,
         "del_global_name",
         lambda h: events.append(("del_name", h)),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        ida_name,
+        "set_name",
+        lambda ea, name, flags: events.append(("set_name", ea, name, flags)) or True,
         raising=False,
     )
     monkeypatch.setattr(
@@ -981,15 +1117,168 @@ def test_apply_type_redefine_range_order(monkeypatch):
         raising=False,
     )
     monkeypatch.setattr(ida_typeinf, "TINFO_DEFINITE", 0x100, raising=False)
+    monkeypatch.setattr(
+        ida_auto, "auto_wait", lambda: events.append(("auto_wait",)), raising=False
+    )
 
     result = forge_api.apply_type(0x401000, "OuterAggregate", redefine_range=True)
 
     kinds = [event[0] for event in events]
     assert kinds[0] == "del_name"
-    assert kinds[-2:] == ["del_items", "apply"]
-    # the base address itself keeps its (user) name
-    assert 0x401000 not in [event[1] for event in events if event[0] == "del_name"]
+    # span delete uses DELIT_DELNAMES with the END ea (ea + size = 0x401004)
+    assert ("del_items", 0x401000, 8, 0x401004) in events
+    assert kinds[-1] == "apply"
+    assert "auto_wait" in kinds
+    # the base address keeps its own (user) name — restored after the
+    # span delete removes it (DELIT_DELNAMES clears names of deleted items)
+    assert ("set_name", 0x401000, "g_outer_aggregate", 0x10) in events
     assert result == {"ok": True, "ea": 0x401000, "type": "OuterAggregate"}
+
+
+def test_apply_type_redefine_range_del_items_end_is_span_end(monkeypatch):
+    """R2.4: the del_items 3rd argument is the END offset (ea + size) —
+    never a length — so siblings past the span survive (the eval's
+    char*[4] at 0x6000 eroded the .data tail through 0x6020+0x20)."""
+    import ida_auto
+    import ida_bytes
+    import ida_name
+    import ida_typeinf
+
+    from forge.api import members as members_mod
+
+    monkeypatch.setattr(
+        members_mod, "parse_user_tinfo", lambda *a, **k: FakeTinfo("Big", size=0x40),
+        raising=False,
+    )
+    monkeypatch.setattr(ida_bytes, "get_flags", lambda h: 1, raising=False)
+    monkeypatch.setattr(ida_bytes, "is_head", lambda f: True, raising=False)
+    monkeypatch.setattr(ida_bytes, "has_user_name", lambda f: False, raising=False)
+    monkeypatch.setattr(ida_bytes, "DELIT_DELNAMES", 0x08, raising=False)
+    monkeypatch.setattr(ida_bytes, "get_item_size", lambda ea: 0x40, raising=False)
+    calls = []
+    monkeypatch.setattr(
+        ida_bytes,
+        "del_items",
+        lambda ea, flags, end: calls.append((ea, flags, end)),
+        raising=False,
+    )
+    monkeypatch.setattr(ida_name, "get_name", lambda h: "", raising=False)
+    monkeypatch.setattr(ida_name, "SN_NOCHECK", 0x10, raising=False)
+    monkeypatch.setattr(ida_name, "set_name", lambda *a, **k: True, raising=False)
+    monkeypatch.setattr(
+        ida_typeinf, "apply_tinfo", lambda *a, **k: None, raising=False
+    )
+    monkeypatch.setattr(ida_typeinf, "TINFO_DEFINITE", 0x100, raising=False)
+    monkeypatch.setattr(ida_auto, "auto_wait", lambda: None, raising=False)
+
+    result = forge_api.apply_type(0x6000, "char *[4]", redefine_range=True)
+
+    assert result["ok"] is True
+    # 3rd argument is END = ea + size (0x40), never "length"
+    assert calls == [(0x6000, 0x08, 0x6040)]
+
+
+def test_apply_type_redefine_range_skips_span_delete_for_user_named_head(monkeypatch):
+    """R2.2: a user-named SUB-head inside the span blocks the full-span
+    delete — the user's name is never swallowed; the type still applies at
+    the head and a warning explains the partial coverage."""
+    import ida_auto
+    import ida_bytes
+    import ida_name
+    import ida_typeinf
+
+    from forge.api import members as members_mod
+
+    user_head = 0x401008
+    monkeypatch.setattr(
+        members_mod, "parse_user_tinfo", lambda *a, **k: FakeTinfo("Outer", size=0x20),
+        raising=False,
+    )
+    # has_user_name receives the FLAGS, not the address — discriminate by
+    # returning a distinct flag value for the user-named head
+    monkeypatch.setattr(
+        ida_bytes, "get_flags", lambda h: 2 if h == user_head else 1, raising=False
+    )
+    monkeypatch.setattr(ida_bytes, "is_head", lambda f: True, raising=False)
+    monkeypatch.setattr(ida_bytes, "DELIT_DELNAMES", 8, raising=False)
+    monkeypatch.setattr(
+        ida_bytes, "has_user_name", lambda f: f == 2, raising=False
+    )
+    monkeypatch.setattr(ida_bytes, "get_item_size", lambda ea: 0x20, raising=False)
+    del_calls = []
+    monkeypatch.setattr(
+        ida_bytes,
+        "del_items",
+        lambda ea, flags, end: del_calls.append((ea, flags, end)),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        ida_name,
+        "get_name",
+        lambda h: "user_slot" if h == user_head else f"qword_{h:x}",
+        raising=False,
+    )
+    monkeypatch.setattr(
+        ida_name, "del_global_name", lambda h: None, raising=False
+    )
+    applied = []
+    monkeypatch.setattr(
+        ida_typeinf,
+        "apply_tinfo",
+        lambda ea, tinfo, flags: applied.append(ea),
+        raising=False,
+    )
+    monkeypatch.setattr(ida_typeinf, "TINFO_DEFINITE", 0x100, raising=False)
+    monkeypatch.setattr(ida_auto, "auto_wait", lambda: None, raising=False)
+
+    result = forge_api.apply_type(0x401000, "OuterAggregate", redefine_range=True)
+
+    assert result["ok"] is True
+    assert del_calls == []  # no span delete — the user name must survive
+    assert applied == [0x401000]  # single-item apply only
+
+
+def test_apply_type_redefine_range_warns_on_resplit_race(monkeypatch):
+    """R2.3: when the item re-splits to a smaller item after the apply
+    (idalib deferred-analysis race), one retry runs and the result carries
+    a warning instead of silently reporting a full-span item."""
+    import ida_auto
+    import ida_bytes
+    import ida_name
+    import ida_typeinf
+
+    from forge.api import members as members_mod
+
+    monkeypatch.setattr(
+        members_mod, "parse_user_tinfo", lambda *a, **k: FakeTinfo("Outer", size=0x140),
+        raising=False,
+    )
+    monkeypatch.setattr(ida_bytes, "get_flags", lambda h: 1, raising=False)
+    monkeypatch.setattr(ida_bytes, "is_head", lambda f: True, raising=False)
+    monkeypatch.setattr(ida_bytes, "has_user_name", lambda f: False, raising=False)
+    monkeypatch.setattr(ida_bytes, "DELIT_DELNAMES", 8, raising=False)
+    monkeypatch.setattr(ida_bytes, "get_item_size", lambda ea: 1, raising=False)
+    monkeypatch.setattr(
+        ida_bytes, "del_items", lambda *a, **k: None, raising=False
+    )
+    monkeypatch.setattr(ida_name, "get_name", lambda h: "", raising=False)
+    monkeypatch.setattr(ida_name, "SN_NOCHECK", 0x10, raising=False)
+    monkeypatch.setattr(ida_name, "set_name", lambda *a, **k: True, raising=False)
+    applies = []
+    monkeypatch.setattr(
+        ida_typeinf,
+        "apply_tinfo",
+        lambda ea, tinfo, flags: applies.append(ea),
+        raising=False,
+    )
+    monkeypatch.setattr(ida_typeinf, "TINFO_DEFINITE", 0x100, raising=False)
+    monkeypatch.setattr(ida_auto, "auto_wait", lambda: None, raising=False)
+
+    result = forge_api.apply_type(0x1400060B8, "Outer", redefine_range=True)
+
+    assert result["ok"] is True
+    assert "re-split" in result["warning"]
+    assert len(applies) == 2  # span apply + one retry (early return)
 
 
 def test_apply_type_parse_failure_reports_error(monkeypatch):
@@ -1786,6 +2075,46 @@ def test_e11_set_member_unknown_name_raises(monkeypatch):
         forge_api.set_member("Coll", 0x10, member_name="nope", name="x")
 
 
+def test_e24_get_member_disambiguates_by_type(monkeypatch):
+    """E24: same offset + same name but different types — member_type
+    selects the right member (the (offset, name, type) triple match)."""
+    from forge.api import members as members_mod
+
+    monkeypatch.setattr(members_mod, "parse_user_tinfo", _sized_parse, raising=False)
+    forge_api.create_structure("Triple")
+    forge_api.add_member("Triple", 0x10, "u32", name="slot")
+    forge_api.add_member("Triple", 0x10, "u64", name="slot")
+
+    assert forge_api.get_member("Triple", 0x10, member_type="u32")["size"] == 4
+    assert forge_api.get_member("Triple", 0x10, member_type="u64")["size"] == 8
+    # name+type together still resolve
+    picked = forge_api.get_member(
+        "Triple", 0x10, member_name="slot", member_type="u32"
+    )
+    assert picked["type"] == "u32"
+    assert forge_api.get_member("Triple", 0x10, member_type="f64") is None
+
+
+def test_e24_set_member_targets_collision_by_type(monkeypatch):
+    """E24: set_member with member_type edits the right twin."""
+    from forge.api import members as members_mod
+
+    monkeypatch.setattr(members_mod, "parse_user_tinfo", _sized_parse, raising=False)
+    forge_api.create_structure("Triple")
+    forge_api.add_member("Triple", 0x10, "u32", name="slot")
+    forge_api.add_member("Triple", 0x10, "u64", name="slot")
+
+    result = forge_api.set_member(
+        "Triple", 0x10, member_type="u64", name="payload"
+    )
+
+    assert result["type"] == "u64"
+    assert result["name"] == "payload"
+    assert forge_api.get_member("Triple", 0x10, member_type="u32")["name"] == "slot"
+    with pytest.raises(forge_api.ForgeApiError):
+        forge_api.set_member("Triple", 0x10, member_type="f64", name="nope")
+
+
 def test_e6_inverse_if_picks_nearest_if_with_else(monkeypatch):
     """E6: inverse_if locates the cit_if nearest to insn_ea (treeitems
     path) instead of returning False on the first miss."""
@@ -1852,6 +2181,126 @@ def test_e6_inverse_if_skips_else_less_ifs(monkeypatch):
     monkeypatch.setattr(hexrays_mod, "decompile", fake_decompile, raising=False)
 
     assert forge_api.inverse_if(0x140001000, 0x4010) is False
+
+
+def test_remove_type_deletes_named_type(monkeypatch):
+    """E27: remove_type deletes the IDB type (ordinal path) and drops the
+    TypeMirror baseline."""
+    from forge.api import structure as structure_mod
+
+    existing = {"Recovered"}
+
+    def _fake_exists(name):
+        return name in existing
+
+    def _fake_delete(name):
+        existing.discard(name)
+        return True
+
+    monkeypatch.setattr(
+        structure_mod.Structure, "_named_type_exists", staticmethod(_fake_exists),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        structure_mod.Structure, "_delete_named_type", staticmethod(_fake_delete),
+        raising=False,
+    )
+    mirror = {"Recovered": {"hash": "x"}}
+    monkeypatch.setattr(forge_api, "_mirror_store", lambda: mirror)
+
+    result = forge_api.remove_type("Recovered")
+
+    assert result == {"ok": True, "removed": True, "name": "Recovered"}
+    assert mirror == {}  # baseline dropped
+
+
+def test_remove_type_missing_type_reports_removed_false(monkeypatch):
+    from forge.api import structure as structure_mod
+
+    def _fake_exists(name):
+        return False
+
+    monkeypatch.setattr(
+        structure_mod.Structure, "_named_type_exists", staticmethod(_fake_exists),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        structure_mod.Structure,
+        "_delete_named_type",
+        staticmethod(lambda name: True),
+        raising=False,
+    )
+    monkeypatch.setattr(forge_api, "_mirror_store", dict)
+
+    result = forge_api.remove_type("NoSuch")
+
+    assert result == {"ok": True, "removed": False, "name": "NoSuch"}
+
+
+def test_undo_type_snapshot_and_restore(monkeypatch):
+    """E17: a commit snapshots the prior declaration; undo_type restores it
+    via Structure.set_cdecl(overwrite=True) and consumes the snapshot."""
+    from forge.api import structure as structure_mod
+
+    snap = {}
+    monkeypatch.setattr(forge_api, "_UNDO_STORE", lambda: snap)
+    monkeypatch.setattr(
+        forge_api,
+        "_named_type_declaration",
+        lambda name: f"struct {name} {{ int v; }};",
+        raising=False,
+    )
+    _commit_structure_stubs(monkeypatch)
+    forge_api.create_structure("S")
+    forge_api.add_member("S", 0, "u32", name="x")
+
+    forge_api.create_type("S", overwrite=True)
+    assert "S" in snap
+    assert snap["S"]["before"] == "struct S { int v; };"
+
+    restored_calls = []
+    monkeypatch.setattr(
+        structure_mod.Structure,
+        "set_cdecl",
+        lambda self, cdecl, origin=0, *, overwrite=None: (
+            restored_calls.append((cdecl, overwrite)) or object()
+        ),
+        raising=False,
+    )
+
+    result = forge_api.undo_type("S")
+
+    assert result == {"ok": True, "restored_declaration": "struct S { int v; };"}
+    assert restored_calls == [("struct S { int v; };", True)]
+    assert snap == {}  # snapshot consumed
+
+
+def test_undo_type_removes_type_created_by_commit(monkeypatch):
+    """E17: a commit that CREATED the type (no prior declaration) undoes by
+    removing it."""
+    snap = {"S": {"before": None, "after": "struct S { int x; };"}}
+    monkeypatch.setattr(forge_api, "_UNDO_STORE", lambda: snap)
+    removed = []
+    monkeypatch.setattr(
+        forge_api,
+        "remove_type",
+        lambda name: removed.append(name) or {"ok": True, "removed": True, "name": name},
+        raising=False,
+    )
+
+    result = forge_api.undo_type("S")
+
+    assert result["removed"] is True
+    assert removed == ["S"]
+
+
+def test_undo_type_missing_snapshot_errors(monkeypatch):
+    monkeypatch.setattr(forge_api, "_UNDO_STORE", dict)
+
+    result = forge_api.undo_type("S")
+
+    assert result["ok"] is False
+    assert "no undo snapshot" in result["error"]
 
 
 # ---------------------------------------------------------------------------
