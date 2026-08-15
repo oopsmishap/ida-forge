@@ -2100,15 +2100,15 @@ def refresh_types(*, include_names: bool = False) -> dict:
                 # the name is synthesized and include_names is requested
                 existing.tinfo = tinfo
                 _is_aliased = getattr(existing, "_is_name_aliased", None)
-                    if (
-                        include_names
-                        and idb_member_name
-                        and callable(_is_aliased)
-                        and _is_aliased()
-                        and existing.name != idb_member_name
-                    ):
-                        existing.name = idb_member_name
-                        renamed.append(idb_member_name)
+                if (
+                    include_names
+                    and idb_member_name
+                    and callable(_is_aliased)
+                    and _is_aliased()
+                    and existing.name != idb_member_name
+                ):
+                    existing.name = idb_member_name
+                    renamed.append(idb_member_name)
             else:
                 structure.add_member(
                     Member(offset, tinfo, None, 0)
