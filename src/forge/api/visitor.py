@@ -234,7 +234,11 @@ class UpwardsObjectVisitor(ObjectVisitor):
 
         obj_left = ScanObject.create(self._cfunc, x_cexpr, promote_root=False)
         obj_right = ScanObject.create(self._cfunc, y_cexpr, promote_root=False)
-        if obj_left and obj_right:
+        if obj_left is not None and obj_right is not None:
+            # R3.12: capture the allocator size on the LHS lvar so a later
+            # transitive closure (e.g. ``v4 = v0; v4 = v2`` via a phi at
+            # an if/else join) doesn't fold distinct allocations.
+            self._record_alloc_size(obj_left, y_cexpr)
             self._add_object_assignment(obj_left, obj_right)
 
         if self._skip and self._is_initial_object(cexpr):
@@ -271,27 +275,79 @@ class UpwardsObjectVisitor(ObjectVisitor):
         ) == self._start_ea
 
 
+    def _record_alloc_size(self, lhs_obj, rhs_cexpr) -> None:
+        """R3.12: when ``lhs = calloc(...)`` (or any tracked allocator), tag
+        the lhs ``VariableObject`` with ``alloc_size`` so a later phi-driven
+        transitive closure doesn't fold it with an lvar of a different size.
+        """
+        if not isinstance(lhs_obj, VariableObject):
+            return
+        if getattr(lhs_obj, "alloc_size", None) is not None:
+            # First record wins — re-initialising an already-sized lvar
+        # is a separate bug surface and shouldn't override the original.
+            return
+        from forge.api.scan_object import MemoryAllocationObject
+
+        alloc = MemoryAllocationObject.create(self._cfunc, rhs_cexpr)
+        if alloc is None:
+            return
+        lhs_obj.alloc_size = alloc.size
+
     def _add_object_assignment(self, from_obj, to_obj):
         if from_obj in self._tree:
             self._tree[from_obj].add(to_obj)
         else:
             self._tree[from_obj] = {to_obj}
 
+    @staticmethod
+    def _alloc_size(obj) -> tuple:
+        """Stable key for the lvar's alloc identity — (size_or_None,).
+        Used to refuse transitive merges that would fold distinct
+        allocations (R3.12).  Duck-types on ``alloc_size`` so test fakes
+        and any object that carries the attribute are accepted.
+        """
+        if not isinstance(obj, ScanObject):
+            return ()
+        sz = getattr(obj, "alloc_size", None)
+        if isinstance(sz, int) and sz > 0:
+            return (sz,)
+        return ()
+
     def _prepare(self):
-        result = set()
-        todo = set(self._objects)
+        # R3.12: refuse to merge two VariableObjects through the
+        # transitive closure when their alloc sizes disagree (one
+        # known different from the other known, or a known different
+        # from unknown — unknown is permissive, two knowns equal is
+        # fine, two knowns unequal is rejected).
+        result: set = set()
+        todo: set = set(self._objects)
         while todo:
             obj = todo.pop()
-            result.add(obj)
-            if getattr(obj, 'id', None) == ObjectType.call_argument or obj not in self._tree:
+            obj_alloc = self._alloc_size(obj)
+            if obj_alloc and any(
+                self._alloc_size(other) and self._alloc_size(other) != obj_alloc
+                for other in result
+            ):
+                # size mismatch with an already-collected root — skip
+                # this object; do not propagate its assignments.
                 continue
-            o = self._tree[obj]
+            result.add(obj)
+            if getattr(obj, "id", None) == ObjectType.call_argument or obj not in self._tree:
+                continue
+            # R3.12: when propagating, drop any child whose known alloc
+            # size conflicts with a known root already in result.
+            new_obj_allocs = {self._alloc_size(c) for c in self._tree[obj]}
+            conflicting_sizes = {
+                sz for sz in new_obj_allocs if sz and any(
+                    self._alloc_size(other) and self._alloc_size(other) != sz
+                    for other in result
+                )
+            }
+            o = {c for c in self._tree[obj] if self._alloc_size(c) not in conflicting_sizes}
             todo |= o - result
             result |= o
         self._objects = list(result)
         self._tree.clear()
-
-
 class RecursiveObjectVisitor(ObjectVisitor):
     def __init__(
         self,

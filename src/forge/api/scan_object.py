@@ -427,15 +427,21 @@ class VariableObject(ScanObject):
     Represents a local variable in HexRays decompiled code.
     """
 
-    def __init__(self, lvar: ida_hexrays.lvar_t, index: int):
+    def __init__(self, lvar: ida_hexrays.lvar_t, index: int, *, alloc_size: int | None = None):
         super().__init__()
         self.lvar = lvar
         self.tinfo = lvar.type()
         self.name = lvar.name
         self.index = index
+        # Known allocation size for this lvar's initializing call (e.g.
+        # ``v0 = calloc(1u, 0x38u)`` -> 0x38).  ``None`` means unknown.
+        # ``alloc_size`` is consulted by the visitor's transitive-closure
+        # pass so two lvars linked through a phi (``v4 = v0; v4 = v2;``)
+        # only merge when their alloc sizes agree (R3.12 — separate
+        # allocations of different sizes must not be folded together).
+        self.alloc_size = alloc_size
         self.id = ObjectType.local_variable
         log_debug(f"Creating VariableObject {self.name}, {self.tinfo.dstr()}")
-
 
     def is_target(self, cexpr: ida_hexrays.cexpr_t) -> bool:
         """

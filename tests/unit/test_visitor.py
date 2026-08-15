@@ -713,6 +713,70 @@ def test_recursive_upwards_object_visitor_init_sets_upwards_state(monkeypatch):
     assert visitor._call_obj is obj
     assert visitor._objects == [obj]
 
+_VISITOR_MODULE_FOR_SHIM = _load_visitor_module()
+
+class _AllocVar(_VISITOR_MODULE_FOR_SHIM.ScanObject):
+    """Minimal ScanObject shim for the size-aware closure test."""
+    def __init__(self, name, alloc_size=None):
+        super().__init__()
+        self.name = name
+        self.alloc_size = alloc_size
+        # any non-call_argument value — the closure only short-circuits on
+        # ObjectType.call_argument specifically.
+        self.id = object()
+
+
+
+
+def test_upwards_prepare_merges_lvars_without_alloc_size():
+    visitor_module = _load_visitor_module()
+    visitor = visitor_module.RecursiveUpwardsObjectVisitor.__new__(
+        visitor_module.RecursiveUpwardsObjectVisitor
+    )
+    v0 = _AllocVar("v0")
+    v2 = _AllocVar("v2")
+    v4 = _AllocVar("v4")
+    visitor._objects = [v0]
+    visitor._tree = {v0: {v4}, v4: {v2}}
+    visitor._prepare()
+    names = sorted(o.name for o in visitor._objects)
+    assert names == ["v0", "v2", "v4"]
+
+
+def test_upwards_prepare_refuses_transitive_merge_when_alloc_sizes_disagree():
+    visitor_module = _load_visitor_module()
+    visitor = visitor_module.RecursiveUpwardsObjectVisitor.__new__(
+        visitor_module.RecursiveUpwardsObjectVisitor
+    )
+    # v0 = calloc(0x38);  v2 = calloc(0x2C);  v4 = v0;  v4 = v2;  ->  the
+    # closure path v2 -> v4 -> v0 should be rejected because v0 and v2
+    # have different alloc sizes (R3.12).
+    v0 = _AllocVar("v0", alloc_size=0x38)
+    v2 = _AllocVar("v2", alloc_size=0x2C)
+    v4 = _AllocVar("v4")  # unknown
+    visitor._objects = [v0]
+    visitor._tree = {v0: {v4}, v4: {v2}}
+    visitor._prepare()
+    names = sorted(o.name for o in visitor._objects)
+    # v0 and v4 stay; v2 is rejected because v4->v2 conflicts v0's size.
+    assert "v0" in names
+    assert "v4" in names
+    assert "v2" not in names
+
+
+def test_upwards_prepare_merges_lvars_with_matching_alloc_sizes():
+    visitor_module = _load_visitor_module()
+    visitor = visitor_module.RecursiveUpwardsObjectVisitor.__new__(
+        visitor_module.RecursiveUpwardsObjectVisitor
+    )
+    v1 = _AllocVar("v1", alloc_size=0x2C)
+    v2 = _AllocVar("v2", alloc_size=0x2C)
+    visitor._objects = [v1]
+    visitor._tree = {v1: {v2}}
+    visitor._prepare()
+    names = sorted(o.name for o in visitor._objects)
+    assert names == ["v1", "v2"]
+
 
 def test_recursive_upwards_check_call_only_tracks_matched_argument(monkeypatch):
     visitor_module = _load_visitor_module()
