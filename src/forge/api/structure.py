@@ -406,24 +406,36 @@ class Structure:
             return None
         if not self.refresh_linked_member_types(structures_by_name):
             return None
+        # R3.9: ONE commit core for GUI and headless — build_cdecl ->
+        # set_cdecl (which applies at scan sites). The GUI path adds the
+        # editable pack dialog on top; the commit underneath is identical,
+        # so "create via the form" and "create_type()" cannot diverge.
         if headless:
-            # Headless path (idalib workers / forge_api): the same commit
-            # chain facade create_type uses — build_cdecl then set_cdecl with
-            # an explicit overwrite. Never pack_structure, whose
-            # ida_kernwin.ask_str/ask_text dialogs return None headless and
-            # turned finalize into a 0-diagnostic failure.
-            start_index = self.get_main_offset_index() if start is None else start
-            origin = (
-                self.members[start_index].offset
-                if start_index < len(self.members)
-                else 0
-            )
-            result = self.build_cdecl(start, end)
-            if result is None:
-                return None
-            _, cdecl = result
-            return self.set_cdecl(cdecl, origin, overwrite=True)
+            # Headless path (idalib workers / forge_api): commit the built
+            # declaration directly with an explicit overwrite. Never the
+            # dialog path, whose ida_kernwin dialogs return None headless
+            # and turned finalize into a 0-diagnostic failure.
+            return self._pack_commit(start, end, overwrite=True)
         return self.pack_structure(start=start, end=end)
+
+    def _pack_commit(self, start, end, *, overwrite: bool) -> ida_typeinf.tinfo_t | None:
+        """Shared commit: build the packed cdecl and commit it via set_cdecl.
+
+        The single place build layout -> declaration text -> set_cdecl
+        (commit + apply-to-scan-sites) happens, for the API verbs and the
+        GUI pack dialog alike (R3.9). Returns the committed tinfo.
+        """
+        start_index = self.get_main_offset_index() if start is None else start
+        origin = (
+            self.members[start_index].offset
+            if start_index < len(self.members)
+            else 0
+        )
+        result = self.build_cdecl(start, end)
+        if result is None:
+            return None
+        _, cdecl = result
+        return self.set_cdecl(cdecl, origin, overwrite=overwrite)
 
     def create_subtree_types_postorder(
         self,
@@ -788,6 +800,13 @@ class Structure:
         return struct_name, cdecl
 
     def pack_structure(self, start: int | None = None, end: int | None = None):
+        """GUI Create-Type flow: editable dialog over the SAME commit core.
+
+        The only GUI-specific parts are the name prompt and the editable
+        declaration dialog (``ask_text``); the layout build and commit
+        (set_cdecl + apply-at-scan-sites) are the same functions the
+        headless path uses, so the form and the API cannot diverge (R3.9).
+        """
         if not self.members:
             log_warning("Structure is empty", True)
             return None

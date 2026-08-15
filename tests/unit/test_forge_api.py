@@ -291,6 +291,77 @@ def test_commit_failure_reason_names_void_members(monkeypatch):
     assert "forbids bare void" in reason
 
 
+def test_pack_structure_and_headless_share_commit_core(monkeypatch):
+    """R3.9: the GUI pack dialog and the headless commit build the SAME
+    declaration and land in the SAME set_cdecl — the dialog is the only
+    difference, so the two routes cannot diverge."""
+    from forge.api import structure as structure_mod
+    from forge.api.members import Member, parse_user_tinfo
+
+    calls = []
+    monkeypatch.setattr(
+        structure_mod.ida_kernwin,
+        "ask_text",
+        lambda maxsize, text, *a, **k: text,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        structure_mod.Structure,
+        "set_cdecl",
+        lambda self, cdecl, origin=0, *, overwrite=None: (
+            calls.append((cdecl, origin, overwrite)) or object()
+        ),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        structure_mod.ida_typeinf,
+        "print_tinfo",
+        lambda *a, **k: "struct P { unsigned __int32 x; };",
+        raising=False,
+    )
+
+    store = {}
+    gui = structure_mod.Structure("P")
+    api = structure_mod.Structure("P")
+    for structure in (gui, api):
+        structure.add_member(Member(0, parse_user_tinfo("u32"), None, 0))
+
+    gui.create_type_if_ready(store, headless=False)
+    api.create_type_if_ready(store, headless=True)
+
+    assert len(calls) == 2
+    gui_call, api_call = calls
+    # the GUI dialog pre-adds the pack wrapper (set_cdecl would add the
+    # same line); the headless text reaches set_cdecl unwrapped and the
+    # wrapper is added inside. Normalized, the declarations are
+    # identical, and the already-wrapped GUI text is never double-wrapped.
+    gui_text = gui_call[0].split("\n", 1)[1]
+    assert gui_call[0].startswith("#pragma pack(push, 1)")
+    assert gui_text == api_call[0]
+    assert gui_call[1] == api_call[1]
+    assert gui_call[2] is None
+    assert api_call[2] is True
+
+
+def test_commit_declaration_verb(monkeypatch):
+    """R3.9: commit_declaration is the API form of the GUI pack dialog —
+    exact text through the same set_cdecl chain, with name verification."""
+    _commit_stubs(monkeypatch, set_result=object())
+    forge_api.create_structure("S")
+    forge_api.add_member("S", 0, "u32")
+
+    wrong = forge_api.commit_declaration("S", "struct Other { int x; };")
+    assert wrong["ok"] is False
+    assert "names 'Other'" in wrong["error"]
+
+    result = forge_api.commit_declaration(
+        "S", "struct S { unsigned __int32 x; };", overwrite=True
+    )
+    assert result["ok"] is True
+    assert result["type_name"] == "S"
+    assert result["applied_sites"] == []
+
+
 def test_set_cdecl_pragma_survives_overwrite_gate(monkeypatch):
     """R3.2 (F1): the overwrite gate and the update_named_type branch
     parse the STRIPPED body (parse_decl rejects preprocessor lines),

@@ -39,6 +39,7 @@ __all__ = [
     "backfill_lumina",
     "callees_of",
     "callers_of",
+    "commit_declaration",
     "create_child_types",
     "create_field",
     "create_structure",
@@ -3486,6 +3487,57 @@ def create_type(name: str | None = None, *, overwrite: bool = False) -> dict:
         # on this commit (GUI-parity: the same apply step the form runs).
         # Empty when no scans were recorded into THIS structure — re-scan
         # (deep_scan with structure=<name>) before committing.
+        "applied_sites": list(getattr(target, "last_apply_sites", [])),
+    }
+
+
+@api(
+    group="build",
+    returns="dict",
+    example='r = forge_api.commit_declaration("Outer", "struct Outer { int x; };")',
+)
+def commit_declaration(
+    name: str, declaration: str, *, overwrite: bool = True
+) -> dict:
+    """Commit a declaration TEXT as the structure's type (R3.9).
+
+    The API form of the GUI pack dialog: the exact cdecl (as edited in
+    the form's ``ask_text`` dialog) is committed through the same
+    ``Structure.set_cdecl`` chain the headless build path uses — the
+    layout build is skipped, the declaration must name the structure,
+    and the apply-at-scan-sites step runs identically. ``#pragma pack``
+    wrapping is applied the same way (missing wrapper is added when the
+    structure packs). No dialogs ever (``overwrite=True`` default).
+
+    Returns:
+        ``{"ok": True, "type_name", "applied_sites"}`` or an error dict.
+    """
+    from forge.api.structure import Structure
+
+    _require_ida()
+    target = _resolve_structure(name)
+    declared = Structure._extract_type_name(declaration)
+    if declared != target.name:
+        return {
+            "ok": False,
+            "error": (
+                f"declaration names {declared!r}, not the store "
+                f"structure {target.name!r}"
+            ),
+        }
+    _snapshot_type_before_commit(target.name, declaration)
+    created = target.set_cdecl(declaration, target.main_offset, overwrite=overwrite)
+    if created is None:
+        return {
+            "ok": False,
+            "error": "failed to commit declaration — "
+            + _commit_failure_reason(declaration, target.name),
+        }
+    _refresh_scan_sites(target)
+    _mark_dirty()
+    return {
+        "ok": True,
+        "type_name": target.created_type_name,
         "applied_sites": list(getattr(target, "last_apply_sites", [])),
     }
 
