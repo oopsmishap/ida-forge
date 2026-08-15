@@ -24,6 +24,7 @@ import contextlib
 import importlib
 import importlib.util
 import inspect
+import re
 import sys
 
 from forge.api.store import catalog
@@ -56,6 +57,7 @@ __all__ = [
     "inverse_if",
     "is_type",
     "link_child",
+    "name_members_from_printf",
     "named_types",
     "nudge_members",
     "push_all",
@@ -477,10 +479,12 @@ def decompile(
     Returns ``None`` when the address is not in a function. The pseudocode is a
     single flattened string; ``lvars`` carries each local with its index, name,
     type declaration and whether it is a function argument; ``calls`` lists the
-    EAs of functions called from the body. ``line_range`` (1-based, inclusive)
-    or ``max_lines`` slice the pseudocode lines only — ``lvars``/``calls`` are
-    untouched. ``force=True`` clears IDA's cached cfunctions first so freshly
-    retyped globals/locals render (``clear_cached_cfuncs``).
+    EAs of functions called from the body — RAW call-expression targets,
+    IAT slots included (:func:`callees_of` resolves slots to the imported
+    functions they point at, E.23). ``line_range`` (1-based, inclusive)
+    or ``max_lines`` slice the pseudocode lines only — ``lvars``/``calls``
+    are untouched. ``force=True`` clears IDA's cached cfunctions first so
+    freshly retyped globals/locals render (``clear_cached_cfuncs``).
 
     Returns:
         dict or None.
@@ -613,6 +617,72 @@ def callers_of(ea: int, kind: str = "code") -> list[int]:
     return sorted(set(starts))
 
 
+def _import_slot_to_name(ea: int) -> str | None:
+    """The import-table name for an IAT slot (E.23), else None.
+
+    IAT slots live in ``.idata``; addresses outside it fall back to the
+    plain ``ida_name`` lookup (no name means None).
+    """
+    try:
+        import ida_name
+        import ida_segment
+
+        segment = ida_segment.getseg(ea)
+        if segment is not None and (
+            ida_segment.get_segm_name(segment) or ""
+        ).startswith(".idata"):
+            for row in imports():
+                if row["ea"] == ea:
+                    return row["name"] or None
+            return None
+        return ida_name.get_name(ea) or None
+    except Exception:  # noqa: BLE001 — slot recon is best-effort
+        return None
+
+
+def _import_slot_target_ea(ea: int) -> int | None:
+    """The imported function an IAT slot resolves to (E.23).
+
+    Reads the pointer stored AT the slot and returns its function start
+    when it lands inside a function; None when the slot has no import
+    name or does not point at a function.
+    """
+    if _import_slot_to_name(ea) is None:
+        return None
+    try:
+        import ida_funcs
+
+        from forge.api.hexrays import read_pointer
+
+        pointer = read_pointer(ea)
+        function = ida_funcs.get_func(pointer)
+        if function is not None:
+            return function.start_ea
+    except Exception:  # noqa: BLE001 — resolution is best-effort
+        return None
+    return None
+
+
+def _resolve_import_slot_callees(eas) -> list[int]:
+    """Replace IAT-slot EAs with the functions they resolve to (E.23).
+
+    The decompiler reports call targets at the IAT slot address for
+    imported calls; those slots are not functions. Every callee EA that
+    is not inside a function is replaced with the pointer stored at the
+    slot when that lands in a function; unresolvable EAs are kept as-is.
+    """
+    import ida_funcs
+
+    resolved = []
+    for ea in eas:
+        if ida_funcs.get_func(ea) is not None:
+            resolved.append(ea)
+            continue
+        target = _import_slot_target_ea(ea)
+        resolved.append(target if target is not None else ea)
+    return sorted(set(resolved))
+
+
 @api(
     group="decompile",
     returns="list[int]",
@@ -621,14 +691,18 @@ def callers_of(ea: int, kind: str = "code") -> list[int]:
 def callees_of(ea: int) -> list[int]:
     """List the functions called from the function containing ``ea``.
 
-    Reuses the decompiler's call-expression scan (``decompile(...).calls``).
-    Returns ``[]`` when ``ea`` is not in a function.
+    Reuses the decompiler's call-expression scan
+    (``:func:`decompile`'s ``calls``); IAT-slot targets are resolved to
+    the imported functions they point at (E.23). Returns ``[]`` when
+    ``ea`` is not in a function.
 
     Returns:
         sorted list of callee EAs.
     """
     result = decompile(ea)
-    return result["calls"] if result is not None else []
+    if result is None:
+        return []
+    return _resolve_import_slot_callees(result["calls"])
 
 
 @api(
@@ -653,8 +727,8 @@ def function_info(ea: int) -> dict | None:
     function = ida_funcs.get_func(ea)
     if function is None:
         return None
-    code_callers = callers_of(ea, "code")
-    data_callers = callers_of(ea, "data")
+    code_callers = _resolve_import_slot_callees(callers_of(ea, "code"))
+    data_callers = _resolve_import_slot_callees(callers_of(ea, "data"))
     return {
         "name": ida_funcs.get_func_name(ea),
         "start_ea": function.start_ea,
@@ -2324,6 +2398,7 @@ def deep_scan(
     max_depth: int | None = None,
     structure: str | None = None,
     root_type: str | None = None,
+    clear_first: bool = False,
 ) -> dict:
     """Recover the structure's members by deep-scanning a decompiled function.
 
@@ -2332,8 +2407,10 @@ def deep_scan(
     the first argument; override with ``var_name``/``var_index``/``item_ea``).
     Members are merged into the target structure in the headless store.
     ``recurse_calls`` follows values passed into called functions; ``max_depth``
-    caps recursion (None = unlimited). On an unresolvable root returns
-    ``{"ok": False, "error": ...}``.
+    caps recursion (None = unlimited). ``clear_first`` (E21) wipes the target
+    structure's members before the scan, making repeated scans converge on
+    the newest evidence instead of accumulating stale members. On an
+    unresolvable root returns ``{"ok": False, "error": ...}``.
 
     With ``structure`` None a fresh auto-named store structure is created
     (``Structure``, then ``Structure Copy``, ...). ``root_type`` retypes the
@@ -2350,6 +2427,8 @@ def deep_scan(
     from forge.api.scanner import NewDeepScanVisitor
 
     target = _target_scan_structure(structure)
+    if clear_first:
+        target.clear_members()
     cfunc = _decompile(ea)
     if cfunc is None:
         return {"ok": False, "error": f"could not decompile {hex(ea)}"}
@@ -2405,21 +2484,26 @@ def shallow_scan(
     item_ea: int | None = None,
     structure: str | None = None,
     root_type: str | None = None,
+    clear_first: bool = False,
 ) -> dict:
     """Recover a structure's members with a single-pass shallow scan.
 
     Runs ``NewShallowScanVisitor`` over the chosen root variable (same root
-    resolution and ``root_type`` retype semantics as :func:`deep_scan`;
-    with ``structure`` None a fresh auto-named structure is created).
+    resolution and ``root_type`` retype semantics as :func:`deep_scan`; with
+    ``structure`` None a fresh auto-named structure is created).
+    ``clear_first`` (E21) wipes the target structure's members before the
+    scan so repeated scans replace stale evidence.
 
     Returns:
-        ``{"structure": name, "members": [member dicts]}`` or an ok:False dict.
+        dict (see :func:`deep_scan`).
     """
     _require_ida()
     from forge.api.hexrays import decompile as _decompile
     from forge.api.scanner import NewShallowScanVisitor
 
     target = _target_scan_structure(structure)
+    if clear_first:
+        target.clear_members()
     cfunc = _decompile(ea)
     if cfunc is None:
         return {"ok": False, "error": f"could not decompile {hex(ea)}"}
@@ -2463,9 +2547,12 @@ def scan_global(ea: int, *, max_depth: int | None = None, span: int | None = Non
     Additionally (I.20), every named sub-head inside the object's byte range
     ``[ea, ea + span)`` becomes a member — stored pointers like
     ``qword_140006128`` that the visitor alone cannot attribute become
-    deterministic members. ``span`` defaults to the size of the item at
-    ``ea``. Returns ``{"ok": False, "error": ...}`` when the address has no
-    references.
+    deterministic members. ``span`` is an EXCLUSIVE tail (byte length):
+    the range covers ``[ea, ea + span)``; when the item head at the
+    boundary is data-referenced from a scanned function, the tail extends
+    by that item's size so the boundary member is kept (E.25). ``span``
+    defaults to the size of the item at ``ea``. Returns
+    ``{"ok": False, "error": ...}`` when the address has no references.
 
     Returns:
         ``{"structure": name, "functions_scanned": int, "members": [...]}``.
@@ -2513,13 +2600,96 @@ def scan_global(ea: int, *, max_depth: int | None = None, span: int | None = Non
         target,
         ea,
         span if span is not None else ida_bytes.get_item_size(ea),
+        scanned_funcs=set(xrefs),
     )
 
     return {
         "structure": struct_name,
         "functions_scanned": scanned,
-        "members": [_to_member_dict(member) for member in target.members],
+        "members": _collapse_stride_runs(
+            [_to_member_dict(member) for member in target.members]
+        ),
     }
+
+
+def _collapse_stride_runs(members: list[dict]) -> list[dict]:
+    """E16: collapse constant-stride same-type runs into one array member.
+
+    Consecutive enabled members whose type string is identical and whose
+    offsets advance by exactly the member size (``offset[i+1] -
+    offset[i] == size``) are a stride run: count >= 2 collapses the run
+    into ONE member at the run base with ``is_array=True`` and
+    ``type``/``size`` expanded for ``count`` elements. Non-array residue
+    (single members, gaps, mixed types) is preserved as-is. Operates on
+    the JSON member dicts produced by the scan verbs.
+    """
+    from forge.api.members import _build_array_tinfo
+
+    enabled = [member for member in members if member.get("enabled", True)]
+    collapsed: list[dict] = []
+    index = 0
+    while index < len(enabled):
+        member = enabled[index]
+        type_str = member.get("type")
+        stride = member.get("size")
+        if not type_str or not stride or stride <= 0:
+            collapsed.append(member)
+            index += 1
+            continue
+        run = [member]
+        end_offset = member["offset"] + stride
+        while index + len(run) < len(enabled):
+            next_member = enabled[index + len(run)]
+            if (
+                next_member.get("type") != type_str
+                or next_member.get("size") != stride
+                or next_member["offset"] != end_offset
+            ):
+                break
+            run.append(next_member)
+            end_offset += stride
+        if len(run) < 2:
+            collapsed.append(member)
+            index += 1
+            continue
+        count = len(run)
+        array_type = f"{type_str}[{count}]"
+        array_size = stride * count
+        try:
+            import ida_typeinf
+
+            tinfo = _build_array_tinfo(type_str, count)
+            if tinfo is not None:
+                rendered = tinfo.dstr()
+                if rendered:
+                    array_type = rendered
+                resolved_size = tinfo.get_size()
+                if resolved_size is not None and resolved_size not in (
+                    ida_typeinf.BADSIZE,
+                ) and resolved_size > 0:
+                    array_size = resolved_size
+        except Exception as exc:  # noqa: BLE001 — tinfo rendering is best-effort
+            from forge.util.logging import log_debug
+
+            log_debug(f"stride collapse array tinfo failed for {type_str}: {exc}")
+        collapsed.append(
+            {
+                "offset": run[0]["offset"],
+                "name": run[0].get("name", ""),
+                "type": array_type,
+                "size": array_size,
+                "enabled": True,
+                "is_array": True,
+                "comment": run[0].get("comment", ""),
+                "origin": run[0].get("origin", 0),
+                "score": run[0].get("score"),
+                "array": count,
+            }
+        )
+        index += count
+    # disabled members never join runs but must stay in the listing
+    disabled = [member for member in members if not member.get("enabled", True)]
+    return sorted(collapsed + disabled, key=lambda member: member.get("offset", 0))
 
 
 def _head_name_without_address(name: str) -> str:
@@ -2530,20 +2700,39 @@ def _head_name_without_address(name: str) -> str:
     return match.group(1) if match else name
 
 
-def _add_named_sub_heads(target, ea: int, span: int):
+def _add_named_sub_heads(target, ea: int, span: int, scanned_funcs: set | None = None):
     """I.20: synthesize members for named sub-heads inside a global span.
 
     Every named item in ``[ea, ea + span)`` (excluding the base itself) that
     has no member yet becomes a ``u8``/``u16``/``u32``/``u64`` (or
     ``u8[N]``) member named after the head's short name without its address
     prefix. Deterministic superset of the GUI's stored-address handling.
+
+    E.25: ``span`` is an EXCLUSIVE tail — ``[ea, ea + span)``. When the item
+    head AT ``ea + span`` is data-referenced from one of ``scanned_funcs``
+    (an address at the boundary feeding the scan), the end extends by that
+    item's size so the boundary member is not lost.
     """
     import ida_bytes
+    import ida_funcs
     import ida_idaapi
     import ida_name
+    import ida_xref
 
     sizes = {1: "u8", 2: "u16", 4: "u32", 8: "u64"}
     end = ea + span
+    if scanned_funcs:
+        tail = ea + span
+        reference = ida_xref.get_first_dref_to(tail)
+        if reference not in (ida_idaapi.BADADDR, None):
+            source_function = ida_funcs.get_func(reference)
+            if (
+                source_function is not None
+                and source_function.start_ea in scanned_funcs
+            ):
+                tail_item_size = ida_bytes.get_item_size(tail)
+                if tail_item_size and tail_item_size > 0:
+                    end = tail + tail_item_size
     head = ea
     while True:
         head = ida_bytes.next_head(head, end)
@@ -3023,8 +3212,204 @@ def finalize_all() -> list:
 # --------------------------------------------------------------------------- #
 # naming
 # --------------------------------------------------------------------------- #
+_SPECIFIER_RE = re.compile(
+    r"%(?:[+ #0\-]*)?(?:\d+|\*)?(?:\.(?:\d+|\*))?(?:hh|h|ll|l|z|t|j|L)?([a-zA-Z%])"
+)
+_WORD_TAIL_RE = re.compile(r"([A-Za-z_][A-Za-z0-9_]*)\s*[=:]?\s*$")
+_SYNTHESIZED_NAME_RE = re.compile(r"(?:i|u|f)[0-9a-fA-F_]*")
+
+
+def _is_synthesized_member_name(name: str) -> bool:
+    """True when ``name`` is forge's auto-generated form (``u32_10``,
+    ``i64_a``) or the generic ``field`` fallback — never a user name."""
+    return bool(_SYNTHESIZED_NAME_RE.fullmatch(name)) or bool(
+        re.fullmatch(r"field_[0-9a-fA-F_]*", name)
+    )
+
+
+def _format_token_labels(format_bytes) -> list[str | None]:
+    """The word preceding each conversion specifier in a printf literal.
+
+    ``"score=%d flags=%x"`` → ``["score", "flags"]``; a specifier that is
+    not preceded by an identifier (``"%d"``) yields None — the slot still
+    counts (arg ORDER is what matters), only the name is undecidable.
+    ``%%`` is not a slot. Other specifiers (``%n``, ``%e``...) consume a
+    slot too — the member then keeps its synthesized name.
+    """
+    if isinstance(format_bytes, (bytes, bytearray, memoryview)):
+        try:
+            text = bytes(format_bytes).decode("utf-8", "replace")
+        except Exception:  # noqa: BLE001 — undecodable literals yield no labels
+            return []
+    else:
+        text = str(format_bytes or "")
+    tokens: list[str | None] = []
+    cursor = 0
+    for match in _SPECIFIER_RE.finditer(text):
+        if match.group(1) == "%":
+            cursor = match.end()
+            continue
+        label = text[cursor : match.start()]
+        cursor = match.end()
+        word = _WORD_TAIL_RE.search(label)
+        tokens.append(word.group(1) if word else None)
+    return tokens
+
+
+def _printf_call_expressions(cfunc) -> list:
+    """The call cexprs of printf-family imports in ``cfunc`` (E14).
+
+    Walks treeitems like the other ctree scans, falling back to a
+    ctree-visitor walk when treeitems is empty (the live 9.4 shape).
+    A call counts when its target EA resolves to an imported name ending
+    in ``printf``/``sprintf``/``snprintf``/``vsnprintf``.
+    """
+    import ida_hexrays
+
+    import_name_by_ea = {row["ea"]: row["name"] or "" for row in imports()}
+    ctype_mod = getattr(ida_hexrays, "ctype", None)
+    if ctype_mod is None:
+        from forge.api.hexrays import ctype as ctype_mod
+
+    call_op = getattr(ctype_mod, "call", None)
+    printf_suffixes = ("printf", "sprintf", "snprintf", "vsnprintf")
+    calls: list = []
+
+    def _is_printf_call(cexpr) -> bool:
+        if call_op is not None and getattr(cexpr, "op", None) != call_op:
+            return False
+        callee_ea = getattr(getattr(cexpr, "x", None), "obj_ea", None)
+        name = import_name_by_ea.get(callee_ea) or ""
+        return name.endswith(printf_suffixes)
+
+    treeitems = getattr(cfunc, "treeitems", None)
+    if treeitems:
+        for item in treeitems:
+            specific = getattr(item, "it", None) or item
+            to_specific = getattr(specific, "to_specific_type", None)
+            if callable(to_specific):
+                specific = to_specific()
+            if _is_printf_call(specific):
+                calls.append(specific)
+        return calls
+
+    walker_cls = getattr(ida_hexrays, "ctree_visitor_t", None)
+    if walker_cls is None:
+        return calls
+
+    class _CallWalker(walker_cls):
+        def __init__(self):
+            try:
+                walker_cls.__init__(self, 0)
+            except TypeError:  # pragma: no cover — binding drift
+                walker_cls.__init__(self, None)
+            self.found = []
+
+        def visit_expr(self, expr):
+            if _is_printf_call(expr):
+                self.found.append(expr)
+            return 0
+
+    walker = _CallWalker()
+    body = getattr(cfunc, "body", None)
+    if body is not None:
+        try:
+            walker.apply_to(body, None)
+        except Exception:  # noqa: BLE001 — walk is best-effort
+            return calls
+    return walker.found
+
+
 @api(
     group="naming",
+    returns="dict",
+    example='r = forge_api.name_members_from_printf("Player", 0x1400014F0)',
+)
+def name_members_from_printf(structure: str, ea: int) -> dict:
+    """Name members from the function's printf format string (E14).
+
+    Locates the first ``printf``/``sprintf``/``snprintf``/``vsnprintf``
+    call in the function containing ``ea``, reads its format-string
+    literal, and walks the call's varargs in slot order. Each vararg that
+    is a ``memptr`` (``obj->member``) and lands on a store member whose
+    name is still the synthesized pattern (``u32_10`` / ``field_8``) is
+    named after the label the literal gives that slot (``score=%d
+    flags=%x`` → members ``score``, ``flags``). User-named members are
+    NEVER overwritten; unresolvable slots are skipped.
+
+    Returns:
+        ``{"ok": True, "renamed": [names]}`` or an error dict.
+    """
+    from forge.api.hexrays import ctype as _ctype
+    from forge.api.hexrays import decompile as _decompile
+
+    target = _resolve_structure(structure)
+    cfunc = _decompile(ea)
+    if cfunc is None:
+        return {"ok": False, "error": f"could not decompile {hex(ea)}"}
+    calls = _printf_call_expressions(cfunc)
+    if not calls:
+        return {
+            "ok": False,
+            "error": "no printf-family call found in the function",
+        }
+    call = calls[0]
+    args = list(getattr(call, "a", []) or [])
+    if not args:
+        return {"ok": False, "error": "printf call has no arguments"}
+
+    format_arg = args[0]
+    format_ea = (
+        getattr(format_arg, "obj_ea", None)
+        if getattr(format_arg, "op", None) == _ctype.obj
+        else None
+    )
+    if format_ea in (None, -1):
+        return {"ok": False, "error": "format string is not a literal"}
+
+    import ida_bytes
+
+    try:
+        format_bytes = ida_bytes.get_strlit_contents(format_ea, -1, 0)
+    except TypeError:  # pragma: no cover — 2-arg form on some builds
+        format_bytes = ida_bytes.get_strlit_contents(format_ea, -1)
+    if format_bytes is None:
+        return {"ok": False, "error": "format string is not a literal"}
+
+    tokens = _format_token_labels(format_bytes)
+    renamed = []
+    for slot, token in enumerate(tokens):
+        if token is None:
+            continue
+        argument_index = 1 + slot
+        if argument_index >= len(args):
+            break
+        argument = args[argument_index]
+        # only x->member varargs carry naming evidence
+        if getattr(argument, "op", None) != _ctype.memptr:
+            continue
+        member_offset = getattr(argument, "m", None)
+        if not isinstance(member_offset, int) or member_offset < 0:
+            continue
+        base_var = getattr(getattr(argument, "x", None), "v", None)
+        base_name = getattr(base_var, "name", None)
+        if not base_name:
+            continue
+        try:
+            _resolve_scan_root(cfunc, var_name=base_name)
+        except ForgeApiError:
+            continue
+        member = target.get_member_by_offset(member_offset)
+        if member is None or not _is_synthesized_member_name(member.name):
+            continue
+        member.name = token
+        renamed.append(token)
+    _mark_dirty()
+    return {"ok": True, "renamed": renamed}
+
+
+@api(
+    group="decompile",
     returns="dict",
     example='r = forge_api.rename_ea(0x140001000, "run_struct_sections"); r["name"]',
 )
@@ -3352,6 +3737,11 @@ def scan_from_allocation(
     rows = guess_allocation(ea, var_name=var_name, var_index=var_index, item_ea=item_ea)
     allocation = next((row for row in rows if row["kind"] == "HEAP"), None)
     if allocation is None:
+        # E.22: a helper-mediated row always carries kind HEAP with
+        # callee set; when the direct HEAP row is missing but a callee
+        # row exists, treat it as the allocation row.
+        allocation = next((row for row in rows if row.get("callee")), None)
+    if allocation is None:
         return {
             "ok": False,
             "error": f"no heap allocation found for variable in {hex(ea)}",
@@ -3361,11 +3751,13 @@ def scan_from_allocation(
     create_structure(struct_name)
     # O1: heap buffers whose root variable is already typed as a struct
     # pointer (e.g. ``ArrayCell *cells``) scan as typed memptr chains and
-    # collapse to offset-0 noise; a byte-semantic void * root recovers the
+    # collapse to offset-0 noise; a byte-level void * root recovers the
     # element lattice. Retype only when no explicit root_type was given,
-    # and restore the analyst's type afterwards.
+    # and restore the analyst's type afterwards. Helper-mediated rows
+    # (E.22: ``size_hint is None``) SKIP the void * retype — the helper's
+    # return is already a typed pointer and the analyst-owned type stays.
     restore_type = None
-    if root_type is None:
+    if root_type is None and allocation.get("size_hint") is not None:
         restore_type = _allocation_root_prior_type(ea, allocation["var"])
         if restore_type:
             root_type = "void *"
@@ -3391,7 +3783,7 @@ def scan_from_allocation(
         "ok": True,
         "allocation": allocation,
         "structure": struct_name,
-        "members": members,
+        "members": _collapse_stride_runs(members),
     }
 
 
@@ -3423,7 +3815,11 @@ def guess_allocation(
         "callee": int | None}`` — ``size_hint`` is the folded byte size of
         the allocator call (``None`` when it could not be proven constant);
         ``callee`` is the function whose body supplied the allocation when
-        the assignment went through a non-allocator helper (I.25).
+        the assignment went through a non-allocator helper (I.25). Helper-
+        mediated rows (E.22) may carry ``size_hint=None`` with ``callee``
+        set: the helper's return was pointer-typed but the allocator
+        assignment inside it could not be proven statically — the scan
+        then proceeds from the returned variable.
     """
     _require_ida()
     from forge.api.hexrays import decompile as _decompile

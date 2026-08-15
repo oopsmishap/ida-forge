@@ -137,6 +137,102 @@ def test_parse_left_assignee_scales_nested_index_offsets():
     assert offset == 16
 
 
+def test_scanned_structure_member_applies_type_via_udt(monkeypatch):
+    """F.1: ScannedStructureMemberObject.apply_type finds the udt member
+    by struct_offset, sets its type and commits via set_udt_details."""
+    import ida_typeinf
+
+    scanner_module = _load_scanner_module()
+    calls = []
+
+    class _FakeStructTinfo:
+        def __init__(self, *a, **k):
+            pass
+
+        def get_named_type(self, til, name):
+            calls.append(("get_named_type", name))
+            return True
+
+        def get_udt_details(self, udt):
+            calls.append(("details",))
+            udt.extend(
+                [
+                    SimpleNamespace(
+                        offset=8,
+                        name="member_8",
+                        set_type=lambda t: calls.append(("set_type", t.dstr())),
+                    )
+                ]
+            )
+            return True
+
+        def set_udt_details(self, udt):
+            calls.append(("set_udt_details",))
+            return True
+
+    monkeypatch.setattr(ida_typeinf, "tinfo_t", _FakeStructTinfo, raising=False)
+
+    obj = scanner_module.ScannedStructureMemberObject(
+        "World", 8, "member_8", 0x401000, 0
+    )
+    obj.apply_type(FakeType("u32"))
+
+    assert ("get_named_type", "World") in calls
+    assert ("set_type", "u32") in calls
+    assert ("set_udt_details",) in calls
+
+
+def test_scanned_structure_member_not_applicable_skips(monkeypatch):
+    """F.1: the _applicable guard keeps failed-scan remnants inert."""
+    import ida_typeinf
+
+    scanner_module = _load_scanner_module()
+    monkeypatch.setattr(
+        ida_typeinf,
+        "tinfo_t",
+        lambda *a, **k: SimpleNamespace(
+            get_named_type=lambda til, name: (_ for _ in ()).throw(
+                AssertionError("must not load the struct for a !applicable obj")
+            ),
+            get_udt_details=lambda udt: False,
+            set_udt_details=lambda udt: False,
+        ),
+        raising=False,
+    )
+
+    obj = scanner_module.ScannedStructureMemberObject(
+        "World", 8, "member_8", 0x401000, 0, applicable=False
+    )
+    obj.apply_type(FakeType("u32"))  # must not raise / must not touch IDB
+
+
+def test_scanned_structure_member_apply_skips_missing_offset(monkeypatch):
+    """F.1: an offset that is not a udt member applies nothing — no crash."""
+    import ida_typeinf
+
+    scanner_module = _load_scanner_module()
+
+    class _FakeStructTinfo:
+        def __init__(self, *a, **k):
+            pass
+
+        def get_named_type(self, til, name):
+            return True
+
+        def get_udt_details(self, udt):
+            return True  # empty udt
+
+        def set_udt_details(self, udt):
+            return True
+
+    monkeypatch.setattr(ida_typeinf, "tinfo_t", _FakeStructTinfo, raising=False)
+
+    obj = scanner_module.ScannedStructureMemberObject(
+        "World", 8, "member_8", 0x401000, 0
+    )
+    obj.apply_type(FakeType("u32"))  # must not raise
+
+
 def _make_variable_object(scanner_module, lvar, **kwargs):
     """Build a ScannedVariableObject with a stub env suitable for apply_type."""
 

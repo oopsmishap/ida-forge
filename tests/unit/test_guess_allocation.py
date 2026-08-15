@@ -270,6 +270,139 @@ def test_guess_allocation_callee_matches_define_then_return_by_var_index(monkeyp
     ]
 
 
+def test_guess_allocation_callee_alias_chain_two_hops(monkeypatch, _real_hexrays):
+    """E.22: `return v` where `v = w` and `w = calloc(...)` — the direct
+    return match misses (the RHS is a plain var), the ≤2-hop alias chain
+    finds the calloc inside the helper."""
+    import ida_funcs
+
+    cfunc = SimpleNamespace(
+        entry_ea=0x401000,
+        body=SimpleNamespace(find_parent_of=lambda expr: None),
+    )
+    obj = SimpleNamespace(id=ObjectType.local_variable, ea=0x5000, name="row")
+
+    visitor = guess_allocation_module.GuessAllocationVisitor(cfunc, obj)
+    monkeypatch.setattr(
+        guess_allocation_module,
+        "ctype",
+        SimpleNamespace(asg=1, ref=2, ret=3, call=5, var=4),
+    )
+    monkeypatch.setattr(
+        visitor,
+        "parent_expr",
+        lambda: SimpleNamespace(op=1, y=SimpleNamespace(op=5, x=SimpleNamespace(obj_ea=0x402000))),
+    )
+    monkeypatch.setattr(visitor, "get_line", lambda: "row = chain_node_new(...)")
+
+    def _fake_create(_cfunc, _expr):
+        called_for = getattr(getattr(_expr, "x", None), "obj_ea", None)
+        if called_for == 0x6000:  # the calloc inside the helper
+            return SimpleNamespace(ea=0x401300, size=40)
+        return None
+
+    monkeypatch.setattr(
+        guess_allocation_module.MemoryAllocationObject, "create", _fake_create
+    )
+    monkeypatch.setattr(
+        ida_funcs, "get_func", lambda ea: SimpleNamespace(start_ea=0x402000), raising=False
+    )
+    v = SimpleNamespace(idx=7)
+    w = SimpleNamespace(idx=9)
+    monkeypatch.setattr(
+        _real_hexrays,
+        "decompile",
+        lambda ea: SimpleNamespace(
+            treeitems=[
+                # `return v;` — no direct allocator assignment for v
+                SimpleNamespace(
+                    to_specific_type=None,
+                    op=3,
+                    x=SimpleNamespace(ea=0x404048, v=v),
+                ),
+                # `v = w;` — hop 1: a plain var move
+                SimpleNamespace(
+                    to_specific_type=None,
+                    op=1,
+                    x=SimpleNamespace(ea=0x404010, v=v),
+                    y=SimpleNamespace(op=4, v=w),
+                ),
+                # `w = calloc(...);` — hop 2: the real allocation
+                SimpleNamespace(
+                    to_specific_type=None,
+                    op=1,
+                    x=SimpleNamespace(ea=0x404020, v=w),
+                    y=SimpleNamespace(op=5, x=SimpleNamespace(obj_ea=0x6000)),
+                ),
+            ]
+        ),
+    )
+
+    visitor._manipulate(SimpleNamespace(), obj)
+
+    assert visitor._data == [
+        [0x401300, "row", "row = chain_node_new(...)", "HEAP", 40, 0x402000]
+    ]
+
+
+def test_guess_allocation_callee_pointer_return_fallback_row(monkeypatch, _real_hexrays):
+    """E.22: the helper's return is pointer-typed but the allocation is not
+    provable — a HEAP row with size_hint None + callee is still emitted."""
+    import ida_funcs
+
+    cfunc = SimpleNamespace(
+        entry_ea=0x401000,
+        body=SimpleNamespace(find_parent_of=lambda expr: None),
+    )
+    obj = SimpleNamespace(id=ObjectType.local_variable, ea=0x5000, name="node")
+
+    visitor = guess_allocation_module.GuessAllocationVisitor(cfunc, obj)
+    monkeypatch.setattr(
+        guess_allocation_module,
+        "ctype",
+        SimpleNamespace(asg=1, ref=2, ret=3, call=5, var=4),
+    )
+    monkeypatch.setattr(
+        visitor,
+        "parent_expr",
+        lambda: SimpleNamespace(op=1, y=SimpleNamespace(op=5, x=SimpleNamespace(obj_ea=0x402000))),
+    )
+    monkeypatch.setattr(visitor, "get_line", lambda: "node = chain_node_new(...)")
+    monkeypatch.setattr(
+        guess_allocation_module,
+        "find_expr_address",
+        lambda _cexpr, _parents: 0x402000,
+    )
+    monkeypatch.setattr(
+        guess_allocation_module.MemoryAllocationObject,
+        "create",
+        lambda _cfunc, _expr: None,
+    )
+    monkeypatch.setattr(
+        ida_funcs, "get_func", lambda ea: SimpleNamespace(start_ea=0x402000), raising=False
+    )
+    ptr_type = SimpleNamespace(is_ptr=lambda: True)
+    monkeypatch.setattr(
+        _real_hexrays,
+        "decompile",
+        lambda ea: SimpleNamespace(
+            treeitems=[
+                SimpleNamespace(
+                    to_specific_type=None,
+                    op=3,
+                    x=SimpleNamespace(ea=0x404040, type=ptr_type),
+                )
+            ]
+        ),
+    )
+
+    visitor._manipulate(SimpleNamespace(), obj)
+
+    assert visitor._data == [
+        [0x402000, "node", "node = chain_node_new(...)", "HEAP", None, 0x402000]
+    ]
+
+
 def test_guess_allocation_callee_descent_failure_degrades_to_no_row(monkeypatch, _real_hexrays):
     """I.25: a broken callee decompile must not crash the visitor."""
     import ida_funcs

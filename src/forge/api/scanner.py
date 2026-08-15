@@ -244,13 +244,63 @@ class ScannedStructureMemberObject(ScannedObject):
         self._offset = struct_offset
 
     def apply_type(self, tinfo: ida_typeinf.tinfo_t) -> None:
+        """Apply ``tinfo`` to the udt member at ``struct_offset`` (F.1).
+
+        Loads the udt details of the member's structure type, finds the
+        member by its byte offset, replaces its type via
+        ``udt_member.set_type`` and commits with ``set_udt_details``.
+        Best-effort: any failure logs the reason; the warning that used
+        to say "not supported yet" only remains when nothing could be
+        applied.
+        """
         if not self._applicable:
             return
-        # TODO: implement changing structure member types
-        log_warning(
-            "Changing structure member types is not supported yet. "
-            f"Address - {hex(self.ea)}"
-        )
+        try:
+            struct_tinfo = ida_typeinf.tinfo_t()
+            if not struct_tinfo.get_named_type(
+                ida_typeinf.get_idati(), self._name
+            ):
+                log_warning(
+                    f"Structure {self._name} is not a known type; "
+                    f"member {self.name} type was not applied"
+                )
+                return
+            udt = ida_typeinf.udt_type_data_t()
+            if not struct_tinfo.get_udt_details(udt):
+                log_warning(
+                    f"Structure {self._name} has no udt details; "
+                    f"member {self.name} type was not applied"
+                )
+                return
+            member = next(
+                (
+                    udt_member
+                    for udt_member in udt
+                    if getattr(udt_member, "offset", None) == self._offset
+                ),
+                None,
+            )
+            if member is None:
+                log_warning(
+                    f"Structure {self._name} has no member at offset "
+                    f"0x{self._offset:x}; type was not applied"
+                )
+                return
+            member.set_type(tinfo)
+            if not struct_tinfo.set_udt_details(udt):
+                log_warning(
+                    f"set_udt_details failed for {self._name} member "
+                    f"{self.name} @ 0x{self._offset:x}"
+                )
+                return
+            log_debug(
+                f"Applied type {tinfo.dstr()} to {self._name} member "
+                f"{self.name} @ {hex(self.ea)}"
+            )
+        except Exception as exc:  # noqa: BLE001 — apply is best-effort
+            log_warning(
+                f"Failed to apply type to {self._name} member {self.name}: {exc}"
+            )
 
 
 class ScanVisitor(ObjectVisitor):

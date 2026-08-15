@@ -547,6 +547,44 @@ def _scan_cfunc(root_name, root_type):
     )
 
 
+def test_deep_scan_clear_first_converges_on_newest_evidence(monkeypatch, _real_hexrays):
+    """E21: clear_first wipes the target's members before the scan, so
+    repeated scans replace stale evidence instead of accumulating it."""
+    from forge.api.members import Member
+
+    visits = {"n": 0}
+
+    class _Vis:
+        def __init__(self, *args, **kwargs):
+            self.structure = args[3]  # (cfunc, origin, obj, structure)
+
+        def process(self):
+            visits["n"] += 1
+            self.structure.add_member(
+                Member(0x10 * visits["n"], FakeTinfo("u64"), None, 0)
+            )
+
+    monkeypatch.setattr(
+        _real_hexrays, "decompile", lambda ea: _scan_cfunc("a1", "__int64"),
+        raising=False,
+    )
+    monkeypatch.setattr(members_mod, "parse_user_tinfo", lambda decl: FakeTinfo("u64"), raising=False)
+    from importlib import import_module as _import
+
+    scanner_mod = _import("forge.api.scanner")
+    monkeypatch.setattr(scanner_mod, "NewDeepScanVisitor", _Vis, raising=False)
+    forge_api.create_structure("S")
+
+    first = forge_api.deep_scan(0x401000, var_name="a1", structure="S")
+    assert len(first["members"]) == 1
+
+    merged = forge_api.deep_scan(0x401000, var_name="a1", structure="S")
+    assert [m["offset"] for m in merged["members"]] == [0x10, 0x20]
+
+    cleared = forge_api.deep_scan(0x401000, var_name="a1", structure="S", clear_first=True)
+    assert [m["offset"] for m in cleared["members"]] == [0x30]
+
+
 def test_deep_scan_auto_creates_structure_and_auto_retypes_root(monkeypatch, _real_hexrays):
     """I.10/I.8: a bare deep_scan on an empty store auto-creates
     ``Structure`` (then ``Structure Copy``) and an ``__int64`` root is
@@ -1348,6 +1386,80 @@ def test_scan_from_allocation_orchestrates(monkeypatch):
     assert calls[1] == ("create_type", {"overwrite": True})
 
 
+def test_scan_from_allocation_helper_row_skips_void_retype(monkeypatch):
+    """E.22: a helper-mediated HEAP row (size_hint None + callee) skips the
+    void * retype trick — the analyst's root type stays and deep_scan runs
+    with root_type=None."""
+    rows = [
+        {
+            "ea": 0x402000,
+            "var": "a1",
+            "line": "a1 = chain_node_new()",
+            "kind": "HEAP",
+            "size_hint": None,
+            "callee": 0x1400020F0,
+        }
+    ]
+    monkeypatch.setattr(forge_api, "guess_allocation", lambda *a, **k: rows)
+    monkeypatch.setattr(
+        forge_api,
+        "_allocation_root_prior_type",
+        lambda *a, **k: (_ for _ in ()).throw(
+            AssertionError("auto-retype must be skipped for helper rows")
+        ),
+        raising=False,
+    )
+    scanned = {}
+    restored = []
+    monkeypatch.setattr(
+        forge_api,
+        "deep_scan",
+        lambda ea, *, root_type=None, structure="", **k:
+            scanned.update(root_type=root_type) or {"structure": structure, "members": []},
+    )
+    monkeypatch.setattr(forge_api, "to_vtable", lambda *a, **k: {}, raising=False)
+    monkeypatch.setattr(
+        forge_api, "set_lvar_types", lambda *a, **k: restored.append(1), raising=False
+    )
+
+    result = forge_api.scan_from_allocation(
+        0x1400014F0, var_name="a1", name="DeepChainNode"
+    )
+
+    assert result["ok"] is True
+    assert scanned["root_type"] is None
+    assert restored == []
+    assert result["allocation"]["callee"] == 0x1400020F0
+
+
+def test_scan_from_allocation_uses_callee_row_without_heap_kind(monkeypatch):
+    """E.22: when no row is kind HEAP but a row carries callee, that row
+    drives the scan (helper-mediated allocation, kind-agnostic)."""
+    rows = [
+        {
+            "ea": 0x402000,
+            "var": "a1",
+            "line": "a1 = helper()",
+            "kind": "STACK",
+            "size_hint": None,
+            "callee": 0x1400020F0,
+        }
+    ]
+    monkeypatch.setattr(forge_api, "guess_allocation", lambda *a, **k: rows)
+    scanned = []
+    monkeypatch.setattr(
+        forge_api,
+        "deep_scan",
+        lambda ea, **k: scanned.append(k.get("root_type")) or {"structure": k["structure"], "members": []},
+    )
+    monkeypatch.setattr(forge_api, "to_vtable", lambda *a, **k: {}, raising=False)
+
+    result = forge_api.scan_from_allocation(0x1400014F0, var_name="a1")
+
+    assert result["ok"] is True
+    assert result["allocation"]["callee"] == 0x1400020F0
+
+
 def test_scan_from_allocation_reports_missing_heap(monkeypatch):
     """I.23: no heap allocation for the variable -> an error dict, and no
     structure is created."""
@@ -1583,6 +1695,123 @@ def test_scan_global_adds_named_sub_heads(monkeypatch, _real_hexrays):
     assert members["dword"]["type"] == "u32"
 
 
+def test_scan_global_extends_exclusive_tail_for_boundary_ref(monkeypatch, _real_hexrays):
+    """E.25: span is an EXCLUSIVE tail; when the item head at the boundary
+    is data-referenced from a scanned function, the tail extends by that
+    item's size so the boundary member survives."""
+    import sys as _sys
+
+    import ida_bytes
+    import ida_funcs
+    import ida_name
+    import ida_xref
+
+    heads = {0x1400A4060: ("qword_1400a4060", 8)}
+
+    def _item_size(h):
+        if h in heads:
+            return heads[h][1]
+        return 0x80 if h == 0x1400A4000 else 0
+
+    def _next_head(ea, end):
+        candidates = sorted(h for h in heads if ea < h < end)
+        return candidates[0] if candidates else -1
+
+    monkeypatch.setattr(ida_bytes, "get_item_size", _item_size, raising=False)
+    monkeypatch.setattr(ida_bytes, "next_head", _next_head, raising=False)
+    monkeypatch.setattr(
+        ida_name, "get_short_name", lambda ea: "obj_1400a4000", raising=False
+    )
+    monkeypatch.setattr(
+        ida_name, "get_name", lambda h: heads.get(h, ("", 0))[0], raising=False
+    )
+    monkeypatch.setattr(
+        ida_xref, "get_first_dref_to", lambda ea: 0x401000 if ea == 0x1400A4060 else -1,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        ida_funcs,
+        "get_func",
+        lambda ea: SimpleNamespace(start_ea=0x401000) if ea == 0x401000 else None,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        _real_hexrays,
+        "get_funcs_referencing_address",
+        lambda ea: {0x401000},
+        raising=False,
+    )
+    monkeypatch.setattr(
+        _real_hexrays,
+        "decompile",
+        lambda ea: SimpleNamespace(entry_ea=0x401000),
+        raising=False,
+    )
+
+    class _FakeVisitor:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def process(self):
+            pass
+
+    monkeypatch.setattr(
+        _sys.modules.get("forge.api.scanner"), "NewDeepScanVisitor", _FakeVisitor, raising=False
+    )
+
+    result = forge_api.scan_global(0x1400A4000, span=0x60)
+
+    members = {m["name"]: m for m in result["members"]}
+    assert members["qword"]["offset"] == 0x60
+    assert members["qword"]["type"] == "u64"
+
+
+def test_collapse_stride_runs_merges_regular_runs(monkeypatch):
+    """E16: a 33-member constant-stride run collapses into one array
+    member (is_array + count) at the run base."""
+    members = [
+        {
+            "offset": index * 12,
+            "name": f"cell_{index:x}",
+            "type": "Cell",
+            "size": 12,
+            "enabled": True,
+            "comment": "",
+            "origin": 0,
+        }
+        for index in range(33)
+    ]
+
+    collapsed = forge_api._collapse_stride_runs(members)
+
+    assert len(collapsed) == 1
+    first = collapsed[0]
+    assert first["offset"] == 0
+    assert first["is_array"] is True
+    assert first["array"] == 33
+    assert first["type"] == "Cell[33]"
+
+
+def test_collapse_stride_runs_preserves_non_runs(monkeypatch):
+    """E16: gaps, mixed types and singletons are preserved untouched."""
+    members = [
+        {"offset": 0x0, "name": "a", "type": "u32", "size": 4, "enabled": True},
+        {"offset": 0x4, "name": "b", "type": "u32", "size": 4, "enabled": True},
+        {"offset": 0x10, "name": "c", "type": "u64", "size": 8, "enabled": True},
+        {"offset": 0x20, "name": "d", "type": "u32", "size": 4, "enabled": False},
+    ]
+
+    collapsed = forge_api._collapse_stride_runs(members)
+
+    # 0x0+0x4 collapse (stride 4); the gap breaks the run; the disabled
+    # member is not part of any run but still reported
+    assert len(collapsed) == 3
+    assert collapsed[0]["array"] == 2
+    assert collapsed[0]["type"] == "u32[2]"
+    assert collapsed[1]["name"] == "c"
+    assert collapsed[2]["name"] == "d"
+
+
 def test_scan_global_sub_heads_skip_existing_member(monkeypatch, _real_hexrays):
     """I.20: an offset that already has a member is not overwritten."""
     import sys as _sys
@@ -1735,6 +1964,40 @@ def test_callees_of_reuses_decompile_calls(monkeypatch, _real_hexrays):
     assert forge_api.callees_of(0x400000) == []
 
 
+def test_callees_of_resolves_iat_slots_to_functions(monkeypatch, _real_hexrays):
+    """E.23: a callee EA that is an IAT slot (not a function) resolves to
+    the pointer stored at the slot when it lands in a function."""
+    import ida_funcs
+
+    monkeypatch.setattr(forge_api, "decompile", lambda ea: {"calls": [0x180001000]})
+    monkeypatch.setattr(
+        ida_funcs,
+        "get_func",
+        lambda ea: (
+            None
+            if ea == 0x180001000
+            else SimpleNamespace(start_ea=0x140002000, end_ea=0x140002040)
+        ),
+        raising=False,
+    )
+    monkeypatch.setattr(forge_api, "_import_slot_to_name", lambda ea: "printf", raising=False)
+    monkeypatch.setattr(_real_hexrays, "read_pointer", lambda ea: 0x140002000, raising=False)
+
+    assert forge_api.callees_of(0x401000) == [0x140002000]
+
+
+def test_callees_of_keeps_unresolvable_slot_ea(monkeypatch):
+    """E.23: a callee EA that cannot be resolved stays as-is (no silent
+    dropping — the raw slot is honest when nothing better is provable)."""
+    import ida_funcs
+
+    monkeypatch.setattr(forge_api, "decompile", lambda ea: {"calls": [0x180001000]})
+    monkeypatch.setattr(ida_funcs, "get_func", lambda ea: None, raising=False)
+    monkeypatch.setattr(forge_api, "_import_slot_to_name", lambda ea: None, raising=False)
+
+    assert forge_api.callees_of(0x401000) == [0x180001000]
+
+
 def test_function_info_aggregates_recon(monkeypatch, _real_hexrays):
     """I.13: function_info aggregates the xref walk + prototype + calls."""
     import ida_funcs
@@ -1752,11 +2015,19 @@ def test_function_info_aggregates_recon(monkeypatch, _real_hexrays):
         0x400010: (0x400000, 0x400120),
         0x401120: (0x401120, 0x401140),
         0x140006358: (0x140006350, 0x140006378),
+        # E.23: the IAT-slot pass re-queries already-resolved EAs, so the
+        # function-start addresses must answer too.
+        0x140006350: (0x140006350, 0x140006378),
+        0x401000: (0x401000, 0x401000),
     }
     monkeypatch.setattr(
         ida_funcs,
         "get_func",
-        lambda ea: SimpleNamespace(start_ea=table[ea][0], end_ea=table[ea][1]),
+        lambda ea: (
+            SimpleNamespace(start_ea=table[ea][0], end_ea=table[ea][1])
+            if ea in table
+            else None
+        ),
         raising=False,
     )
 
@@ -2382,6 +2653,95 @@ def test_add_member_accepts_inline_union_type(monkeypatch):
 # ---------------------------------------------------------------------------
 # Round-2 review regressions (2026-08-13)
 # ---------------------------------------------------------------------------
+
+def test_name_members_from_printf_uses_format_labels(monkeypatch, _real_hexrays):
+    """E14: the format literal's labels name synthesized members at the
+    matching memptr arg offsets; hand-named members and non-member args
+    are never touched."""
+    import ida_bytes
+
+    import forge.api.hexrays as hx  # real module under the fixture
+
+    forge_api.create_structure("Player")
+    forge_api.add_member("Player", 0x00, "u64")  # u64_0
+    forge_api.add_member("Player", 0x08, "u64")  # u64_8
+    forge_api.set_member("Player", 0x08, name="reserved")  # user name
+    forge_api.add_member("Player", 0x10, "u64")  # u64_10
+    forge_api.add_member("Player", 0x18, "u64")  # u64_18
+
+    monkeypatch.setattr(
+        forge_api,
+        "imports",
+        lambda *a, **k: [{"ea": 0x180001000, "name": "printf"}],
+        raising=False,
+    )
+    monkeypatch.setattr(
+        ida_bytes,
+        "get_strlit_contents",
+        lambda *a, **k: b"score=%u flags=%p name=%s label=%s",
+        raising=False,
+    )
+
+    def _memptr(offset):
+        return SimpleNamespace(
+            op=hx.ctype.memptr,
+            x=SimpleNamespace(op=hx.ctype.var, v=SimpleNamespace(name="p")),
+            m=offset,
+        )
+
+    cfunc = SimpleNamespace(
+        entry_ea=0x401000,
+        get_lvars=lambda: [
+            SimpleNamespace(name="p", type=lambda: FakeTinfo("u64 *")),
+        ],
+        argidx=(),
+        treeitems=[
+            SimpleNamespace(
+                to_specific_type=lambda: SimpleNamespace(
+                    op=hx.ctype.call,
+                    x=SimpleNamespace(obj_ea=0x180001000),
+                    a=[
+                        SimpleNamespace(op=hx.ctype.obj, obj_ea=0x40101100),
+                        _memptr(0x00),
+                        _memptr(0x08),
+                        _memptr(0x10),
+                        _memptr(0x18),
+                        _memptr(0x20),  # no store member at 0x20
+                    ],
+                )
+            )
+        ],
+    )
+    monkeypatch.setattr(_real_hexrays, "decompile", lambda ea: cfunc, raising=False)
+
+    result = forge_api.name_members_from_printf("Player", 0x401000)
+
+    assert result == {"ok": True, "renamed": ["score", "name", "label"]}
+    assert forge_api.get_member("Player", 0x00)["name"] == "score"
+    assert forge_api.get_member("Player", 0x08)["name"] == "reserved"
+    assert forge_api.get_member("Player", 0x10)["name"] == "name"
+    assert forge_api.get_member("Player", 0x18)["name"] == "label"
+    # the 0x20 member never existed — no phantom naming
+
+
+def test_name_members_from_printf_no_printf_call(monkeypatch, _real_hexrays):
+    """E14: no printf-family call in the function → a loud error."""
+    cfunc = SimpleNamespace(entry_ea=0x401000, treeitems=[], get_lvars=list, argidx=())
+    monkeypatch.setattr(
+        forge_api,
+        "imports",
+        lambda *a, **k: [{"ea": 0x180001000, "name": "malloc"}],
+        raising=False,
+    )
+    monkeypatch.setattr(_real_hexrays, "decompile", lambda ea: cfunc, raising=False)
+    forge_api.create_structure("S")
+    forge_api.add_member("S", 0, "u32")
+
+    result = forge_api.name_members_from_printf("S", 0x401000)
+
+    assert result["ok"] is False
+    assert "printf" in result["error"]
+
 
 def test_rename_ea_renames_function_or_global(monkeypatch):
     """Round-2 request #1: the naming-core verb — ida_name.set_name with
