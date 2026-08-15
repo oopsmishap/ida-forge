@@ -2,6 +2,21 @@
 
 All notable changes are tracked here. Format: date — change set (branch/commit).
 
+## 2026-08-15 — R3.4 structure-builder GUI OnCreate fix (PySide6 EditTriggers)
+
+`StructureBuilderForm` crashed on open under IDA's PySide6:
+`setEditTriggers(int)` rejected the plain-int flag combination the form
+passed (`qt_flag_value` OR'ing into an int). Fix:
+- `forge.util.qt.qt_combined_flags(*flags, flags_type=None)` — combines
+  `qt_flag_value` ints (no shim RuntimeWarning) and wraps the result in
+  the binding's flag type when callable (PySide6 accepts the typed
+  form; non-constructible/missing types fall back to the int, which
+  PyQt5 accepts). `qt_item_flags` delegates to it (same behavior).
+- form.py `_configure_table` passes `EditTrigger` as the flags type.
+- Verified live in the GUI worker: pre-fix expression reproduces the
+  user's TypeError; fixed call is accepted with zero shim warnings.
+  654 tests green, ruff clean.
+
 ## 2026-08-15 — R3.3 eval-task ground-truth gate
 
 The eval agent was peeking at `tests/fixtures/c_pure_structs/` mid-run

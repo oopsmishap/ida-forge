@@ -72,3 +72,44 @@ def test_qt_item_flags_mixed_enum_shapes(qt_module):
         SimpleNamespace(value=4), _PyQt5StyleEnum(8)
     )
     assert combined == 12
+
+
+def test_qt_combined_flags_wraps_typed_flag(qt_module):
+    """R3.4: typed setters (PySide6 setEditTriggers) reject plain ints —
+    qt_combined_flags wraps the combined value in the binding's type."""
+    wrapped = []
+
+    def _flag_type(value):
+        wrapped.append(value)
+        return ("EditTriggers", value)
+
+    result = qt_module.qt_combined_flags(
+        SimpleNamespace(value=4),
+        SimpleNamespace(value=8),
+        flags_type=_flag_type,
+    )
+    assert result == ("EditTriggers", 12)
+    assert wrapped == [12]
+
+
+def test_qt_combined_flags_falls_back_when_type_rejects_int(qt_module):
+    """R3.4: a flags type that cannot be constructed from the int (or is
+    missing) leaves the plain int — PyQt5 accepts that form."""
+    class _RejectingType:
+        def __call__(self, value):
+            raise TypeError("int form not supported")
+
+    result = qt_module.qt_combined_flags(
+        SimpleNamespace(value=4), flags_type=_RejectingType()
+    )
+    assert result == 4
+
+    result = qt_module.qt_combined_flags(SimpleNamespace(value=2))
+    assert result == 2
+
+
+def test_qt_combined_flags_ignores_none_and_int_members(qt_module):
+    result = qt_module.qt_combined_flags(
+        None, SimpleNamespace(value=16), _PyQt5StyleEnum(4)
+    )
+    assert result == 20

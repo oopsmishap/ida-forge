@@ -90,27 +90,45 @@ def qt_flag_value(flag):
     PySide6's enums do not support bitwise ``|`` directly (the PyQt5 shim
     that provides legacy class-attribute access warns about it); every
     consumer that ORs Qt flags must go through this helper (or
-    :func:`qt_item_flags`) so the operation happens on plain ints.
+    :func:`qt_combined_flags`) so the operation happens on plain ints.
     """
     if flag is None:
         return 0
     return int(getattr(flag, "value", flag))
 
 
-def qt_item_flags(*flags):
-    """Combine Qt item flags into a value compatible with ``QTableWidgetItem.setFlags``.
+def qt_combined_flags(*flags, flags_type=None):
+    """Combine Qt flag members into a value a typed setter accepts.
 
-    Uses :func:`qt_flag_value` so the combination works on plain ints in both
-    bindings; the integer form is accepted by ``setFlags`` either way.
+    ORs :func:`qt_flag_value` ints — never the enum members themselves,
+    so the PyQt5-shim RuntimeWarning stays silent — then wraps the
+    result in ``flags_type`` when it is callable. PySide6 rejects plain
+    ints for typed setters (``setEditTriggers(int)`` raises TypeError),
+    while the flag type constructed from the int is accepted silently.
+    Bindings without an int-constructible type (PyQt5 accepts the int
+    directly) fall back to the plain int.
     """
     combined = 0
     for flag in flags:
         combined |= qt_flag_value(flag)
 
-    item_flags = getattr(QtCore.Qt, "ItemFlags", None)
-    if callable(item_flags):
-        return item_flags(combined)
+    if callable(flags_type):
+        try:
+            return flags_type(combined)
+        except (TypeError, ValueError):
+            pass
     return combined
+
+
+def qt_item_flags(*flags):
+    """Combine Qt item flags into a value compatible with ``QTableWidgetItem.setFlags``.
+
+    Uses :func:`qt_combined_flags` so the combination works on plain
+    ints in both bindings; the integer form is accepted by ``setFlags``
+    either way.
+    """
+    item_flags = getattr(QtCore.Qt, "ItemFlags", None)
+    return qt_combined_flags(*flags, flags_type=item_flags)
 
 
 def qt_exec(widget, *args, **kwargs):

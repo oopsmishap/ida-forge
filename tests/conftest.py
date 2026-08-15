@@ -343,6 +343,24 @@ def _qt_flag_value(flag):
     return int(getattr(flag, "value", flag))
 
 
+def _qt_combined_flags(*flags, flags_type=None):
+    combined = 0
+    for flag in flags:
+        if flag is None:
+            continue
+        value = getattr(flag, "value", flag)
+        try:
+            combined |= int(value)
+        except (TypeError, ValueError):
+            continue
+    if callable(flags_type):
+        try:
+            return flags_type(combined)
+        except (TypeError, ValueError):
+            pass
+    return combined
+
+
 _stub_module(
     "forge.util.qt",
     QtCore=_DummyQtNamespace(),
@@ -354,6 +372,7 @@ _stub_module(
     else widget.exec_(*args, **kwargs),
     qt_item_flags=_qt_item_flags,
     qt_flag_value=_qt_flag_value,
+    qt_combined_flags=_qt_combined_flags,
 )
 def _collect_ctree_items_near_ea(cfunc, ea: int, *, exhaustive: bool = False):
     """Faithful behavioral double of hexrays.collect_ctree_items_near_ea.
