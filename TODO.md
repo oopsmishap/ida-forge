@@ -90,6 +90,30 @@ longer in the store; the ordinal heal covers them if they reappear via
 > `607c3ab`, live-verified**) and E.15 (plain scan loop; its real work is
 > F.2). This section tracks only items with real design/implementation.
 
+### Recovery-eval findings (2026-08-13, report:
+`H:/re/_random/c_structs/docs/forge_api_recovery_eval_output.md`) — FIXED
+in commit `45b9d2a` (live-verified on the fixture) unless noted:
+
+- **Gap 1 — keyword/parser commit errors are loud now**:
+  `_commit_failure_reason` checks C keywords + `idc_parse_types` error
+  count; `create_type`/`finalize` failures carry the real reason (live:
+  `'inline' is a C keyword — the IDB type parser rejects it`). The
+  `inline`-tag struct itself is impossible in the IDB parser — rename
+  only.
+- **Gap 2 — helper-aware allocation (E.22) STILL OPEN**: scans stop at
+  `v1 = chain_node_new(...)` wrappers; the callee row never fires.
+- **Gap 3 — deep_scan/shallow_scan restore the root retype** when a scan
+  yields no evidence (previously a failed scan left the lvar retyped).
+- **Gap 4 — `apply_type(redefine_range=True)` covers the WHOLE span**:
+  one `create_struct` item over the region + `auto_wait` for plain UDTs
+  (live: `dispatch` re-applied as a 104-byte struct item); skipped when
+  user-named sub-heads would be swallowed.
+- **Gap 5 — pack re-parses named-reference text**: scanner-copied
+  member tinfos (e.g. inline-child) rebind the fresh size after the
+  child type is re-filed; parents no longer pin the old 48-byte child.
+- **Gap 6 — `decompile(force=True)` already clears the cfunc cache** —
+  no work needed.
+
 ### E.21–E.30 — round-2 review findings (2026-08-13, report: second half of
 `docs/forge_api_evaluation_output.md`)
 
