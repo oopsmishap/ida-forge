@@ -16,6 +16,10 @@ dishonest). The eval task doc now declares ground truth a HARD GATE:
   strings, xrefs); "diverges from the header" is not a scanner failure —
   the header is the score sheet, not the analysis input.
 - Scoring/Phase 4: the ground-truth table is built at Phase 4 only.
+- `skills/ida-forge-api/SKILL.md` (synced to the installed skill)
+  carries the same pattern: ground truth closed until the analysis
+  passes are done (First Rules + workflow step 9); "differs from the
+  header" is not a scanner failure — dig deeper in the binary instead.
 
 ## 2026-08-15 — R3.2 recovery-eval gap-fix wave (F1–F7)
 

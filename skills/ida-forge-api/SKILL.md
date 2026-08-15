@@ -41,6 +41,14 @@ commit → apply → mirror.
   and survive store wipes.
 - Workers idle-drop after ~20 s: one script per execute, re-run on
   drops. The plugin dir symlinks to the repo `src/`.
+- **Ground truth stays closed until the analysis is done.** If the task
+  has source truth for the target (headers, `fixture.h`-style specs,
+  reference structs), it is the SCORE SHEET, not the analysis input.
+  Do not open it for member lists, offsets, names, sizes, or "what the
+  scanner missed" while recovering — recover from binary evidence only
+  (disassembly, decompilation, format strings, xrefs). Cross-check
+  against ground truth at the very END, after the commit/apply passes.
+  (R3.3)
 
 ## 2. When to use which
 
@@ -105,7 +113,11 @@ commit → apply → mirror.
    `scan_from_allocation` now teleports into wrapper helpers
    (`v = node_new(...)` with the calloc inside): the helper's body is
    scanned via the allocator feeding its first returned lvar; only
-   helpers whose allocator cannot be proven need manual disassembly.
+   helpers whose allocator cannot be proven need manual disassembly —
+   and only from BINARY evidence. "The layout differs from the header"
+   is NOT a scanner failure and NOT a reason to hand-write members from
+   the spec: re-run with more roots / disassemble deeper / use the
+   format strings. Ground truth stays closed until step 9.
 4. De-noise: scanners emit hypotheses + byte-granular junk — trim with
    `remove_members` / `set_member(enabled=False)`, keep evidence-based
    names.
@@ -117,6 +129,9 @@ commit → apply → mirror.
 7. Retype: `set_lvar_types` on section runners; rename functions with
    `rename_ea`.
 8. Verify: `decompile(ea, force=True)` shows `x->member` in pseudocode.
+9. ONLY NOW cross-check against ground truth (headers/specs), fix
+   real divergences by re-scanning or evidence-based edits, and list
+   any hand-built member with the missed-evidence reason.
 
 ## 5. IDA 9.4 / idalib notes (already absorbed — don't fight them)
 
