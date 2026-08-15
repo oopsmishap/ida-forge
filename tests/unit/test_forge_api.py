@@ -269,6 +269,28 @@ def test_build_cdecl_skips_void_typed_members(monkeypatch):
     assert "unsigned __int32" in cdecl
 
 
+def test_commit_failure_reason_names_void_members(monkeypatch):
+    """R3.8: when the parser rejects a declaration, the reason names the
+    bare-void members (IDA's "Void type is forbidden here" names none);
+    void * members are NOT flagged."""
+    import ida_typeinf
+
+    monkeypatch.setattr(
+        ida_typeinf,
+        "idc_parse_types",
+        lambda cdecl, flags: 2,
+        raising=False,
+    )
+    reason = forge_api._commit_failure_reason(
+        "struct S {\n    void field_8;\n    void *fine;\n    void list[4];\n};",
+        "S",
+    )
+    assert "field_8" in reason
+    assert "list" in reason
+    assert "fine" not in reason
+    assert "forbids bare void" in reason
+
+
 def test_set_cdecl_pragma_survives_overwrite_gate(monkeypatch):
     """R3.2 (F1): the overwrite gate and the update_named_type branch
     parse the STRIPPED body (parse_decl rejects preprocessor lines),

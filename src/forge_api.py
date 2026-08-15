@@ -3311,9 +3311,30 @@ def _commit_failure_reason(cdecl: str, name: str) -> str:
     except Exception:  # noqa: BLE001 — parser probe is best-effort
         errors = -1
     if errors > 0:
+        # R3.8: IDA's parser prints "Void type is forbidden here" for
+        # bare-void members without naming them — find them in the text
+        # so the failure is actionable. ``void *``/``void **`` are legal;
+        # only a member whose TYPE token resolves to bare void is not.
+        void_members = []
+        for line in cdecl.splitlines():
+            body = line.strip().rstrip(";").strip()
+            if not body or body.startswith(("struct", "#")):
+                continue
+            # "u64 gap_4[4];" -> name token(s) after the type; only bare
+            # "void NAME" members are forbidden — "void *p" is legal.
+            head = body.split()
+            if len(head) >= 2 and head[0] == "void" and not head[1].startswith("*"):
+                void_members.append(head[1].lstrip("*").split("[")[0])
+        extra = ""
+        if void_members:
+            extra = (
+                f" — {len(void_members)} void-typed member(s): "
+                f"{', '.join(void_members)} (IDA forbids bare void; "
+                "set a real type or disable the member)"
+            )
         return (
             f"IDB type parser rejected the declaration "
-            f"({errors} error(s)) — reserved keyword or unresolved member type"
+            f"({errors} error(s)) — reserved keyword or unresolved member type{extra}"
         )
     return "type parser accepted the declaration but no type materialized"
 
