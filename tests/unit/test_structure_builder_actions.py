@@ -257,7 +257,10 @@ def test_prompt_scan_depth_parses_input(monkeypatch):
     assert action._prompt_scan_depth() == 0
 
     monkeypatch.setattr(ida_kernwin, "ask_str", lambda dflt, hist, title: "not-a-number")
-    assert action._prompt_scan_depth() == 3  # falls back to the configured default
+    from forge.features.structure_builder.config import StructureBuilderConfig
+
+    default_depth = StructureBuilderConfig()["default_deep_scan_depth"]
+    assert action._prompt_scan_depth() == default_depth  # falls back to the config
 
     monkeypatch.setattr(ida_kernwin, "ask_str", lambda dflt, hist, title: "7")
     assert action._prompt_scan_depth() == 7
