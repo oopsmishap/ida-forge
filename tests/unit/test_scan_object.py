@@ -14,6 +14,8 @@ from forge.api.scan_object import (
     StructureReferenceObject,
     VariableObject,
     _extract_offset_expression,
+    _make_offset_scan_object,
+    _safe_struct_name,
 )
 
 
@@ -166,6 +168,60 @@ def test_global_variable_and_call_argument_targets_match_expected_expression():
 
     assert GlobalVariableObject(0x1234).is_target(global_expr) is True
     assert CallArgumentObject(0x5678, 0).is_target(call_expr) is True
+
+def test_safe_struct_name_rejects_void_and_integral_aliases():
+    # Hexrays' dstr() of a void-pointer pointee, a void lvar, or any
+    # integral scalar returns these strings. Treating them as struct names
+    # produces "struct void { ... }" downstream and triggers "Void type is
+    # forbidden here" from the parser per affected site.
+    assert _safe_struct_name(FakeType("void")) is None
+    assert _safe_struct_name(FakeType("void *", pointed=FakeType("void"))) is None
+    assert _safe_struct_name(FakeType("void[N]")) is None
+    assert _safe_struct_name(FakeType("const void *", pointed=FakeType("void"))) is None
+    assert _safe_struct_name(FakeType("nullptr")) is None
+    assert _safe_struct_name(FakeType("_DWORD")) is None
+    assert _safe_struct_name(FakeType("_QWORD[4]")) is None
+    # real struct names survive untouched
+    assert _safe_struct_name(FakeType("MyStruct")) == "MyStruct"
+    assert _safe_struct_name(FakeType("MyStruct *", pointed=FakeType("MyStruct"))) == "MyStruct *"
+    # defensive defaults
+    assert _safe_struct_name(None) is None
+    assert _safe_struct_name(SimpleNamespace(dstr=lambda: "")) is None
+
+
+def test_scan_object_create_returns_none_for_void_memptr_and_memref(monkeypatch):
+    """A ``void *`` access must not be turned into a StructureReferenceObject
+    carrying the literal struct name ``"void"`` — that gets fed to the parser
+    later and produces "Void type is forbidden here" + dialog spam per row.
+    """
+    cfunc = FakeCfunc([FakeLvar("arg0")])
+    monkeypatch.setattr(ScanObject, "get_expression_address", staticmethod(lambda _cfunc, expr: expr.ea))
+
+    ptr_expr = FakeExpr(
+        ctype.memptr,
+        m=8,
+        x=SimpleNamespace(type=FakeType("void *", pointed=FakeType("void"))),
+        type=FakeType("field_t"),
+        ea=0x30,
+    )
+    assert ScanObject.create(cfunc, ptr_expr) is None
+
+    ref_expr = FakeExpr(
+        ctype.memref,
+        m=4,
+        x=SimpleNamespace(type=FakeType("void")),
+        type=FakeType("field_t"),
+        ea=0x40,
+    )
+    assert ScanObject.create(cfunc, ref_expr) is None
+
+
+def test_make_offset_scan_object_skips_void_base(monkeypatch):
+    base = SimpleNamespace(tinfo=FakeType("void *", pointed=FakeType("void")), name="x", ea=0x100)
+    assert _make_offset_scan_object(base, 0x10) is base
+    # integral alias as the base must also yield no reference object
+    base2 = SimpleNamespace(tinfo=FakeType("_QWORD"), name="y", ea=0x200)
+    assert _make_offset_scan_object(base2, 0x8) is base2
 
 
 

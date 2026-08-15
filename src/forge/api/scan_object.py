@@ -104,11 +104,45 @@ def _type_name_matches(tinfo, expected_name: str) -> bool:
     return _type_identity_key(tinfo.dstr()) == _type_identity_key(expected_name)
 
 
+def _safe_struct_name(tinfo):
+    """Return a non-void struct name suitable for use as a StructureReferenceObject id.
+
+    Hexrays' ``tinfo.dstr()`` of ``void *``'s pointee, of a ``void`` lvar, or of any
+    integral scalar returns ``"void"`` (or one of the IDA integral aliases like
+    ``_BYTE``/``_QWORD``).  Treating those as struct names produces ``struct void { ... }``
+    later in the pack path, which the IDA parser rejects with ``"Void type is forbidden here"``
+    and a modal "Bad declaration" dialog per affected site.  Returning ``None`` lets the
+    caller fall back to the base object so the row stores no struct reference at all.
+    """
+    if tinfo is None:
+        return None
+    try:
+        name = tinfo.dstr()
+    except Exception:  # noqa: BLE001 — degraded tinfo on a void/integral alias
+        return None
+    if not name:
+        return None
+    stripped = name.strip()
+    # bare 'void' / 'void &' / 'void *' / 'void[N]' / 'const void *' / typedefs thereof.
+    # Head tokens may be qualifiers ('const', 'volatile') so match any token == 'void'
+    # AND the bracketed-array variant.
+    tokens = stripped.split()
+    if "void" in tokens or "nullptr" in tokens:
+        return None
+    if stripped.startswith(("void[", "void ")):
+        return None
+    # integral aliases produced by Hexrays for non-UDT members
+    if stripped in {"_BYTE", "_WORD", "_DWORD", "_QWORD", "_OWORD"}:
+        return None
+    if stripped.startswith(("_BYTE[", "_WORD[", "_DWORD[", "_QWORD[", "_OWORD[")):
+        return None
+    return stripped
+
+
 def _strip_casts_and_refs(expr):
     while expr is not None and hasattr(expr, "op") and expr.op in (ctype.cast, ctype.ref):
         expr = expr.x
     return expr
-
 
 
 def _extract_offset_expression(expr, offset: int = 0, scale: int = 1, ctype_ops=None):
@@ -214,7 +248,7 @@ def _make_offset_scan_object(base_obj, offset: int):
     if base_tinfo is None or offset == 0:
         return base_obj
 
-    struct_name = base_tinfo.dstr()
+    struct_name = _safe_struct_name(base_tinfo)
     if not struct_name:
         return base_obj
 
@@ -313,11 +347,17 @@ class ScanObject:
             result.ea = ScanObject.get_expression_address(cfunc, cexpr)
         elif cexpr.op == ctype.memptr:
             t = cexpr.x.type.get_pointed_object()
-            result = StructurePointerObject(t.dstr(), cexpr.m)
+            ptr_name = _safe_struct_name(t)
+            if ptr_name is None:
+                return None
+            result = StructurePointerObject(ptr_name, cexpr.m)
             result.name = get_member_name(t, cexpr.m)
         elif cexpr.op == ctype.memref:
             t = cexpr.x.type
-            result = StructureReferenceObject(t.dstr(), cexpr.m)
+            ref_name = _safe_struct_name(t)
+            if ref_name is None:
+                return None
+            result = StructureReferenceObject(ref_name, cexpr.m)
             result.name = get_member_name(t, cexpr.m)
         elif cexpr.op == ctype.obj:
             result = GlobalVariableObject(cexpr.obj_ea)
