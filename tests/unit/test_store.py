@@ -149,6 +149,53 @@ def test_catalog_persistence_pack_round_trip():
     assert legacy_structure.pack == 1
 
 
+def test_catalog_persistence_scan_sites_round_trip():
+    """R3.6: scan-evidence rows ride the catalog's netnode payload —
+    plain rows survive serialize/reload (no live scan objects needed on
+    reload) and last_applied rides along."""
+    from forge.api.members import Member, parse_user_tinfo
+    from forge.api.store import StructureCatalog, _live_scan_site_rows
+    from forge.api.structure import Structure
+
+    class _Site:
+        __hash__ = object.__hash__
+
+        def __init__(self, func_ea, name, ea):
+            self.func_ea = func_ea
+            self.name = name
+            self.ea = ea
+            self.tinfo = None
+
+    structure = Structure("S")
+    member = Member(0, parse_user_tinfo("u32"), None, 0)
+    member.scanned_variables = {
+        _Site(0x140001610, "v1", 0x140001000)
+    }
+    structure.add_member(member)
+    structure.last_apply_sites = [
+        {"func_ea": 0x140001610, "var": "v1", "ea": 0x140000000, "type": "S *"}
+    ]
+    structure.scan_sites_rows = _live_scan_site_rows(structure)
+
+    payload = StructureCatalog()._serialize(structure)
+    assert payload["scan_sites"] == [
+        {
+            "func_ea": 0x140001610,
+            "var": "v1",
+            "ea": 0x140001000,
+            "type": None,
+            "member_offset": 0,
+        }
+    ]
+    assert payload["last_applied"] == [
+        {"func_ea": 0x140001610, "var": "v1", "ea": 0x140000000, "type": "S *"}
+    ]
+
+    restored = StructureCatalog()._deserialize(payload)
+    assert restored.scan_sites_rows == payload["scan_sites"]
+    assert restored.last_apply_sites == payload["last_applied"]
+
+
 def test_catalog_persistence_vtable_member_round_trip(monkeypatch):
     """I.28: vtable members survive the round trip as VirtualTables."""
     import ida_name

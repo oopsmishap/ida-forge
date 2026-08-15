@@ -129,6 +129,15 @@ Working as intended — do not work around these:
   store never held — rename via `rename_member(name, offset, new_name)`
   (R3.2 F2). The store is NOT changed: rename AFTER the last
   `create_type(overwrite=True)` re-commit, or the rename is lost.
+- Scan evidence is visible and persistent (R3.5/R3.6): `scan_sites(
+  name)` lists every recorded site (func_ea/var, stored in the IDB's
+  netnodes — survives worker drops and warm reopens), and every
+  `create_type`/`finalize` result reports `applied_sites` — the sites
+  the pointer type was actually applied to on that commit. An empty
+  `applied_sites` with scans recorded means the evidence is NOT
+  attached to the committed structure (hand-rebuilt members carry no
+  scan objects): re-scan into the store structure, then commit;
+  `reapply(name)` re-runs the apply step.
 - Hex-Rays only renders global member access when the reach is
   `lea reg, stru_xxx.field`; literal-address `qword_...` operands stay
   untyped (compiler artifact — workaround: apply the type at the
@@ -206,14 +215,28 @@ report those as found gaps.
    ORDER per struct: (a) run the scanner first — `deep_scan` with a root
    type from the allocation site, or `scan_global`/`scan_from_allocation`
    where they fit; (b) record the call's output in the report, whatever
-   it produced (even "no evidence" rows count as the attempt); (c) only
-   then hand-build/disassemble what the scanners genuinely cannot see
-   (helper-allocated nodes like `chain_node_new`, arrays, nested
-   inlines), judged from the BINARY alone (disassembly, decompilation,
-   format strings, xrefs — the header stays closed per Rule 7) and
-   report each manual build — type, why the scanner missed it — in the
-   gaps section; (d) name members from the format-string evidence
-   (`name_members_from_printf` before hand-naming).
+   it produced (even "no evidence" rows count as the attempt);
+   (c) **check coverage** — `scan_sites(name)` lists every recorded
+   evidence site (persisted in the IDB's netnodes, so it survives
+   drops); when the struct is used elsewhere (other allocation sites,
+   `callers_of`/`callees_of` of the runner, globals by xref) and the
+   list misses them, scan those roots INTO the same store structure
+   (`deep_scan(..., structure=name)`); (d) `auto_resolve` collisions,
+   trim junk (`remove_members`/`set_member(enabled=False)`), name
+   members from format-string evidence (`name_members_from_printf`);
+   (e) only then hand-build/disassemble what the scanners genuinely
+   cannot see (helper-allocated nodes, arrays, nested inlines), judged
+   from the BINARY alone (disassembly, decompilation, format strings,
+   xrefs — the header stays closed per Rule 7) and report each manual
+   build — type, why the scanner missed it — in the gaps section;
+   (f) **commit with the evidence attached** — `create_type` applies
+   the pointer type at every recorded scan site (the same apply step
+   the GUI form runs); its result's `applied_sites` must be non-empty
+   when scans recorded evidence — a commit reporting `applied_sites:
+   []` means the scans were NOT attached to this store structure
+   (hand-rebuilt members carry no scan objects): re-scan into the
+   structure before committing. `reapply(name)` re-runs the apply step
+   after any re-commit. (R3.5/R3.6.)
 3. **Apply** — `finalize`/`create_type` (children first), `apply_type(
    ..., redefine_range=True)` on every global region (one call covers the
    whole span),`set_lvar_types` on the section runners so the pseudocode

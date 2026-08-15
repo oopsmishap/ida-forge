@@ -2,6 +2,37 @@
 
 All notable changes are tracked here. Format: date — change set (branch/commit).
 
+## 2026-08-15 — R3.5/R3.6 scan-evidence visibility + IDB persistence
+
+The eval agent scanned structures, then hand-rebuilt them via
+`add_member` and committed with no way to see that the type was never
+applied to scan evidence (every commit reported nothing about it; the
+DB ended with committed-but-unapplied types). Fix:
+
+- `create_type`/`finalize` results now report `applied_sites` — every
+  scan site the committed pointer type was applied to (the same apply
+  step the GUI form runs, `_apply_scanned_variable_types`, which now
+  records each applied site). `reapply` records too.
+- New `scan_sites(name)` verb — the recorded evidence sites per store
+  structure (func_ea/var/ea/type/member_offset); the coverage check in
+  the scan → auto_resolve → commit flow ("is this used elsewhere":
+  callers/callees/xrefs of the runner).
+- **Scan metadata is stored in the IDB via netnodes** (the store.py
+  catalog pattern): scan-site rows and the last-applied record ride the
+  catalog's `Storage("Structures")` payload (`_serialize` derives them
+  from the live member scan objects; `_deserialize` restores them), so
+  `scan_sites` answers after worker drops, warm reopens and store
+  rebuilds. Live-proven: scan+commit → close → warm reopen → 8/8 sites
+  and last-applied restored from the i64's netnodes.
+- Deep/shallow/global/from-allocation scans refresh the persisted
+  rows; `_mark_dirty()` write-through per the catalog convention.
+- Eval task doc Phase 2 + SKILL.md workflow now spell the flow: scan →
+  `scan_sites` coverage (scan missing usage sites into the SAME store
+  structure) → `auto_resolve` → commit and CHECK `applied_sites` is
+  non-empty (empty = evidence not attached — re-scan, never hand-rebuild
+  first) → fixup/rename → verify.
+- 659 tests green, ruff clean.
+
 ## 2026-08-15 — R3.4 structure-builder GUI OnCreate fix (PySide6 EditTriggers)
 
 `StructureBuilderForm` crashed on open under IDA's PySide6:

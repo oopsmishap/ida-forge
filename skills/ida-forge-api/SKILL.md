@@ -72,7 +72,9 @@ commit → apply → mirror.
 - **scan**: decompile(ea, force), signature, deep_scan / shallow_scan
   (ea + var_name/var_index/item_ea + structure + root_type + recurse_calls/
   max_depth), scan_global(ea, span), guess_allocation(ea, var_name),
-  scan_from_allocation(ea, var_name=..., name=..., root_type=..., commit=).
+  scan_from_allocation(ea, var_name=..., name=..., root_type=..., commit=),
+  scan_sites(name) — recorded evidence sites per store structure
+  (persisted in the IDB; the coverage check before committing).
 - **build/apply**: create_type (overwrite=True UPDATES in place via
   `update_named_type` — the ordinal survives, applied items never
   dangle; non-placeholder existing types abort when overwrite=False),
@@ -117,19 +119,31 @@ commit → apply → mirror.
    and only from BINARY evidence. "The layout differs from the header"
    is NOT a scanner failure and NOT a reason to hand-write members from
    the spec: re-run with more roots / disassemble deeper / use the
-   format strings. Ground truth stays closed until step 9.
-4. De-noise: scanners emit hypotheses + byte-granular junk — trim with
-   `remove_members` / `set_member(enabled=False)`, keep evidence-based
-   names.
-5. Commit: `create_type(name, overwrite=True)` / `finalize` — children
-   before parents, or just re-commit (the parent re-binds member types
-   automatically). NEVER delete: there is no type-delete verb; correct a
-   committed layout in place and re-commit.
-6. Globals: `apply_type(ea, "Name", redefine_range=True)`.
-7. Retype: `set_lvar_types` on section runners; rename functions with
+   format strings. Ground truth stays closed until step 10.
+4. Check coverage — `scan_sites(name)` lists every recorded evidence
+   site (func_ea + var, persisted in the IDB's netnodes — survives
+   drops and reopens). If the struct is used elsewhere (other
+   allocation sites, `callers_of`/`callees_of` of the runner, globals
+   by xref) and the list misses them, scan those roots INTO the same
+   store structure (`deep_scan(..., structure=name)`). Hand-built
+   members carry no scan objects — a structure built only by
+   `add_member` has no sites and nothing to apply.
+5. `auto_resolve` collisions; trim junk with `remove_members` /
+   `set_member(enabled=False)`; name members from printf evidence
+   (`name_members_from_printf`).
+6. Commit: `create_type(name, overwrite=True)` / `finalize` — the
+   commit applies the pointer type at EVERY recorded scan site (the
+   same "apply globally" step the GUI form runs; `reapply(name)`
+   re-runs it). CHECK the result: `applied_sites` must be non-empty
+   when step 4 listed sites — an empty list means the evidence is not
+   attached; re-scan into the structure, never hand-rebuild first.
+   Children before parents. NEVER delete: there is no type-delete verb;
+   correct a committed layout in place and re-commit.
+7. Globals: `apply_type(ea, "Name", redefine_range=True)`.
+8. Retype: `set_lvar_types` on section runners; rename functions with
    `rename_ea`.
-8. Verify: `decompile(ea, force=True)` shows `x->member` in pseudocode.
-9. ONLY NOW cross-check against ground truth (headers/specs), fix
+9. Verify: `decompile(ea, force=True)` shows `x->member` in pseudocode.
+10. ONLY NOW cross-check against ground truth (headers/specs), fix
    real divergences by re-scanning or evidence-based edits, and list
    any hand-built member with the missed-evidence reason.
 

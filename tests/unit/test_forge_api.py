@@ -271,6 +271,105 @@ def test_create_structure_validate_pack_raises():
         forge_api.create_structure("BadPack2", pack="1")
 
 
+def test_scan_sites_reports_persisted_and_live_rows(monkeypatch):
+    """R3.6: scan_sites answers from the persisted netnode rows; falls
+    back to the live member scan objects when nothing is persisted."""
+    forge_api.create_structure("Sites")
+    forge_api.add_member("Sites", 0, "u32", name="count")
+
+    structure = forge_api._resolve_structure("Sites")
+    structure.scan_sites_rows = [
+        {
+            "func_ea": 0x140001610,
+            "var": "v1",
+            "ea": 0x140001000,
+            "type": None,
+            "member_offset": 0,
+        }
+    ]
+    assert forge_api.scan_sites("Sites") == structure.scan_sites_rows
+
+    # no persisted rows yet — derive from the live scan objects
+    structure.scan_sites_rows = []
+    structure.members[0].scanned_variables = {
+        _FakeScanSite(0x1400020F0, "node", 0x140001F10)
+    }
+    rows = forge_api.scan_sites("Sites")
+    assert rows == [
+        {
+            "func_ea": 0x1400020F0,
+            "var": "node",
+            "ea": 0x140001F10,
+            "type": None,
+            "member_offset": 0,
+        }
+    ]
+
+
+def test_refresh_scan_sites_recomputes_rows(monkeypatch):
+    """R3.6: _refresh_scan_sites copies the live member scan objects into
+    the persisted row list (the catalog payload then carries them)."""
+    from forge.api.store import _live_scan_site_rows
+
+    forge_api.create_structure("Fresh")
+    forge_api.add_member("Fresh", 0, "u32", name="count")
+    structure = forge_api._resolve_structure("Fresh")
+    structure.members[0].scanned_variables = {
+        _FakeScanSite(0x140001610, "v0", 0x140001000)
+    }
+
+    forge_api._refresh_scan_sites(structure)
+
+    assert structure.scan_sites_rows == _live_scan_site_rows(structure)
+    assert structure.scan_sites_rows[0]["var"] == "v0"
+
+
+def test_create_type_reports_applied_sites_key(monkeypatch):
+    """R3.5: a commit's result carries applied_sites (empty without scan
+    records — the visibility that tells the agent to re-scan into the
+    structure)."""
+    _commit_stubs(monkeypatch, set_result=object())
+    forge_api.create_structure("S")
+    forge_api.add_member("S", 0, "u32")
+
+    result = forge_api.create_type("S", overwrite=True)
+
+    assert result["ok"] is True
+    assert result["applied_sites"] == []
+
+
+class _FakeScanSite:
+    """Hashable stand-in for a scan object (SimpleNamespace is unhashable
+    on 3.14 and cannot live in member.scanned_variables sets)."""
+
+    def __init__(self, func_ea, name, ea, tinfo=None):
+        self.func_ea = func_ea
+        self.name = name
+        self.ea = ea
+        self.tinfo = tinfo
+
+    def apply_type(self, *args, **kwargs):
+        return None
+
+
+def test_create_type_persists_scan_sites_after_commit(monkeypatch):
+    """R3.6: a successful commit re-persists the scan rows (netnode
+    payload) so the IDB holds them after the worker drops."""
+    _commit_stubs(monkeypatch, set_result=object())
+    forge_api.create_structure("S")
+    forge_api.add_member("S", 0, "u32")
+    structure = forge_api._resolve_structure("S")
+    structure.members[0].scanned_variables = {
+        _FakeScanSite(0x140001000, "a1", 0x140001000)
+    }
+
+    result = forge_api.create_type("S", overwrite=True)
+
+    assert result["ok"] is True
+    seen = {row["var"] for row in structure.scan_sites_rows}
+    assert "a1" in seen
+
+
 def test_create_type_re_resolves_placeholder_member_sizes(monkeypatch):
     """R2.1 (priority #1): a member added while its type was still the
     1-byte seed placeholder packs with the child's REAL size after the
@@ -545,7 +644,12 @@ def test_finalize_headless_commits_with_type_name(monkeypatch):
 
     result = forge_api.finalize("S")
 
-    assert result == {"ok": True, "type_name": "S", "skipped": []}
+    assert result == {
+        "ok": True,
+        "type_name": "S",
+        "skipped": [],
+        "applied_sites": [],
+    }
 
 
 def test_finalize_reports_error_when_commit_fails(monkeypatch):

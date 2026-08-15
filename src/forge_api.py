@@ -79,6 +79,7 @@ __all__ = [
     "scan_from_allocation",
     "scan_global",
     "scan_returned",
+    "scan_sites",
     "set_current",
     "set_func_proto",
     "set_lvar_types",
@@ -2584,6 +2585,18 @@ def _scan_result(target) -> dict:
     }
 
 
+def _refresh_scan_sites(target) -> None:
+    """Recompute the structure's persisted scan-site rows (R3.6).
+
+    Call after any scan merges evidence into ``target``: the rows land in
+    the catalog's netnode payload on the next ``_mark_dirty``, so
+    :func:`scan_sites` answers from the DB after any reopen/rebuild.
+    """
+    from forge.api.store import _live_scan_site_rows
+
+    target.scan_sites_rows = _live_scan_site_rows(target)
+
+
 @api(
     group="scan",
     returns="dict",
@@ -2668,6 +2681,7 @@ def deep_scan(
         # The retype produced no evidence at all — undo it so the lvar is
         # not silently re-typed by a failed scan (gap #3).
         _restore_root_type(cfunc, obj, prior_type)
+    _refresh_scan_sites(target)
     _mark_dirty()
     return _scan_result(target)
 
@@ -2780,6 +2794,8 @@ def reapply(name: str | None = None) -> dict:
     _require_ida()
     import ida_typeinf
 
+    from forge.api.structure import Structure
+
     target = _resolve_structure(name)
     type_name = target.created_type_name or target.name
     tinfo = ida_typeinf.tinfo_t()
@@ -2790,17 +2806,23 @@ def reapply(name: str | None = None) -> dict:
 
     applied = 0
     skipped = []
+    applied_rows = []
     for scan_object in target.get_unique_scanned_variables(target.main_offset):
         if scan_object is None:
             continue
         try:
             scan_object.apply_type(pointer_of)
             applied += 1
+            applied_rows.append(Structure._scan_site_row(scan_object))
         except Exception as exc:  # noqa: BLE001 — one bad object must not stop the rest
             skipped.append(getattr(scan_object, "name", "<unnamed>"))
             from forge.util.logging import log_debug
 
             log_debug(f"reapply failed for {scan_object!r}: {exc}")
+    # R3.6: record the re-application in the netnode payload.
+    target.last_apply_sites = applied_rows
+    _refresh_scan_sites(target)
+    _mark_dirty()
     return {"applied": applied, "skipped": skipped}
 
 
@@ -2863,6 +2885,7 @@ def shallow_scan(
     visitor.process()
     if prior_type and pre_count == 0 and len(target.members) == 0:
         _restore_root_type(cfunc, obj, prior_type)
+    _refresh_scan_sites(target)
     _mark_dirty()
     return _scan_result(target)
 
@@ -2935,6 +2958,9 @@ def scan_global(ea: int, *, max_depth: int | None = None, span: int | None = Non
         span if span is not None else ida_bytes.get_item_size(ea),
         scanned_funcs=set(xrefs),
     )
+
+    _refresh_scan_sites(target)
+    _mark_dirty()
 
     return {
         "structure": struct_name,
@@ -3204,6 +3230,39 @@ _C_KEYWORDS = frozenset(
 )
 
 
+@api(
+    group="scan",
+    returns="list[dict]",
+    example='sites = forge_api.scan_sites("ChainNode")',
+)
+def scan_sites(name: str | None = None) -> list:
+    """The scan-evidence sites of a store structure, from the IDB (R3.6).
+
+    Every location the scans attached to members of ``name`` — the same
+    sites `create_type` applies the committed pointer type to. The rows
+    are persisted in the database's netnodes (catalog payload), so they
+    survive worker drops, warm reopens and store rebuilds. Coverage
+    check for the scan → auto_resolve → commit flow: after scanning,
+    list the sites; if the struct is used elsewhere (other allocation
+    sites, callers of the runner, globals by xref) and the list misses
+    them, scan those roots INTO the same structure before committing.
+    Empty for hand-built structures that were never scanned into —
+    commit then reports ``applied_sites: []``.
+
+    Each row is ``{"func_ea", "var", "ea", "type", "member_offset"}``.
+
+    Returns:
+        list of site dicts.
+    """
+    target = _resolve_structure(name)
+    persisted = getattr(target, "scan_sites_rows", None) or []
+    if persisted:
+        return list(persisted)
+    from forge.api.store import _live_scan_site_rows
+
+    return _live_scan_site_rows(target)
+
+
 def _validate_member_name(name: str) -> None:
     """Reject C-keyword member names (R2.6).
 
@@ -3390,11 +3449,20 @@ def create_type(name: str | None = None, *, overwrite: bool = False) -> dict:
                 + _commit_failure_reason(cdecl, target.name),
             }
         return {"ok": False, "error": "type already exists (overwrite disabled)"}
+    # R3.6: persist the commit's applied-site record in the netnode
+    # payload (survives drops; the eval can check the DB outcome).
+    _refresh_scan_sites(target)
+    _mark_dirty()
     return {
         "ok": True,
         "type_name": target.created_type_name,
         "declaration": cdecl,
         "skipped": [m.name for m in target.members if not m.enabled],
+        # R3.5: every scan-evidence site the pointer type was applied to
+        # on this commit (GUI-parity: the same apply step the form runs).
+        # Empty when no scans were recorded into THIS structure — re-scan
+        # (deep_scan with structure=<name>) before committing.
+        "applied_sites": list(getattr(target, "last_apply_sites", [])),
     }
 
 
@@ -3767,10 +3835,15 @@ def finalize(name: str | None = None) -> dict:
                 f"struct {target.name} {{ }};", target.name
             ),
         }
+    # R3.6: persist the commit's applied-site record (netnode payload).
+    _refresh_scan_sites(target)
+    _mark_dirty()
     return {
         "ok": True,
         "type_name": target.created_type_name,
         "skipped": [m.name for m in target.members if not m.enabled],
+        # R3.5: sites the pointer type got applied to on this commit.
+        "applied_sites": list(getattr(target, "last_apply_sites", [])),
     }
 
 
@@ -4715,6 +4788,9 @@ def scan_from_allocation(
             members = _merge_member_rows(
                 members, callee_scan.get("members", [])
             )
+
+    _refresh_scan_sites(_structures[struct_name])
+    _mark_dirty()
 
     if vtable_addr is not None:
         to_vtable(struct_name, 0, vtable_addr)

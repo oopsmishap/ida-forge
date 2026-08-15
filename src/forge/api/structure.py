@@ -97,6 +97,12 @@ class Structure:
         # R3.2 (recovery eval round 2, F1): store structures pack byte
         # layouts by default (pack=1); None opts out (natural alignment).
         self.pack: int | None = 1
+        # R3.5: sites the last commit applied the pointer type to
+        # (populated by _apply_scanned_variable_types).
+        self.last_apply_sites: list[dict] = []
+        # R3.6: persisted scan-evidence rows (netnode-backed via the
+        # catalog payload); survives worker drops and store rebuilds.
+        self.scan_sites_rows: list[dict] = []
         self.provenance: StructureProvenance = StructureProvenance()
         self.parent_relationships: list[StructureRelationship] = []
         self.child_relationships: list[StructureRelationship] = []
@@ -789,11 +795,18 @@ class Structure:
         tinfo = self._load_named_type(structure_name)
         if tinfo is None:
             log_error(f"Created type {structure_name}, but failed to load it back.")
+            self.last_apply_sites = []
             return None
 
         ptr_tinfo = ida_typeinf.tinfo_t()
         ptr_tinfo.create_ptr(tinfo)
 
+        # R3.5: record every site the type just got applied to, so the
+        # facade can report commit visibility (create_type's
+        # ``applied_sites``). A commit with zero sites means the store
+        # members carry no scanned variables — re-scan INTO this
+        # structure before committing.
+        applied: list[dict] = []
         seen_targets: set[tuple] = set()
         for scan_object in self.get_unique_scanned_variables(origin):
             target_key = (
@@ -803,8 +816,35 @@ class Structure:
             if target_key in seen_targets:
                 continue
             seen_targets.add(target_key)
-            scan_object.apply_type(ptr_tinfo)
+            try:
+                scan_object.apply_type(ptr_tinfo)
+            except Exception as exc:  # noqa: BLE001 — one bad site must not abort the apply
+                from forge.util.logging import log_debug
+
+                log_debug(
+                    f"apply failed for {scan_object!r} after commit: {exc}"
+                )
+                continue
+            applied.append(self._scan_site_row(scan_object))
+        self.last_apply_sites = applied
         return tinfo
+
+    @staticmethod
+    def _scan_site_row(scan_object) -> dict:
+        tinfo = getattr(scan_object, "tinfo", None)
+        type_str = None
+        dstr = getattr(tinfo, "dstr", None)
+        if callable(dstr):
+            try:
+                type_str = dstr()
+            except Exception:  # noqa: BLE001 — degraded tinfo
+                type_str = None
+        return {
+            "func_ea": getattr(scan_object, "func_ea", idaapi.BADADDR),
+            "var": getattr(scan_object, "name", None),
+            "ea": getattr(scan_object, "ea", idaapi.BADADDR),
+            "type": type_str,
+        }
 
     def set_cdecl(
         self, cdecl: str, origin: int = 0, *, overwrite: bool | None = None

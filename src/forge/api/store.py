@@ -19,6 +19,51 @@ from forge.util.logging import log_warning
 _STORAGE_KEY = "Structures"
 
 
+def _live_scan_site_rows(structure) -> list:
+    """Site rows derived from the members' live scan objects (R3.6).
+
+    Plain JSON rows only (the T1.1 rule: never live tinfo handles) —
+    ``{"func_ea", "var", "ea", "type", "member_offset"}`` per recorded
+    scan-object site, deduplicated like the apply step does.
+    """
+    from forge.api.structure import Structure
+
+    rows: list = []
+    seen: set = set()
+    for member in structure.members:
+        for scan_object in getattr(member, "scanned_variables", None) or ():
+            key = (
+                getattr(scan_object, "func_ea", None),
+                getattr(scan_object, "name", None),
+            )
+            if key in seen or key == (None, None):
+                continue
+            seen.add(key)
+            try:
+                row = Structure._scan_site_row(scan_object)
+            except Exception as exc:  # noqa: BLE001 — one degenerate object degrades
+                from forge.util.logging import log_debug
+
+                log_debug(f"scan-site row failed for {scan_object!r}: {exc}")
+                continue
+            row["member_offset"] = getattr(member, "offset", 0)
+            rows.append(row)
+    return rows
+
+
+def _scan_sites_payload(structure) -> list:
+    """The persisted scan-site rows for a structure.
+
+    Live member scan objects win (a fresh scan updates the model); with
+    no live objects — e.g. right after a catalog reload — the previously
+    persisted rows are kept so a re-snapshot never erases them.
+    """
+    rows = _live_scan_site_rows(structure)
+    if rows:
+        return rows
+    return list(getattr(structure, "scan_sites_rows", None) or [])
+
+
 class StructureCatalog:
     """Dict-like store of :class:`Structure` with write-through persistence."""
 
@@ -104,6 +149,11 @@ class StructureCatalog:
             "created_type_name": structure.created_type_name,
             "is_auto_named": structure.is_auto_named,
             "pack": structure.pack,
+            # R3.6: scan-evidence sites ride the catalog's netnode payload —
+            # plain rows only (the T1.1 rule: never live tinfo handles), so
+            # scan_sites() answers from the DB after any reopen/rebuild.
+            "scan_sites": _scan_sites_payload(structure),
+            "last_applied": list(getattr(structure, "last_apply_sites", [])),
             "provenance": provenance,
             "members": members,
             "child_relationships": [
@@ -128,6 +178,8 @@ class StructureCatalog:
         structure.is_auto_named = raw.get("is_auto_named", False)
         # R3.2: existing persisted catalogs default to packed (no migration).
         structure.pack = raw.get("pack", 1)
+        structure.scan_sites_rows = list(raw.get("scan_sites") or [])
+        structure.last_apply_sites = list(raw.get("last_applied") or [])
         prov = raw.get("provenance") or {}
         known = set(StructureProvenance.__dataclass_fields__)
         structure.provenance = StructureProvenance(
