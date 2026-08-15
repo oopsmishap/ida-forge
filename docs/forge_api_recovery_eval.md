@@ -3,11 +3,37 @@
 ## Mission
 
 Reverse the fixture's **type surface, completely**: every struct, every
-global, and every pointer type flowing through functions. This is not a
-feature-exercise (that was rounds 1–2). Forge API is the type toolchain —
-use it to **recover, apply, and rename types**; ida-domain may be used
-freely for anything else, and no "break-out" accounting is required. The
-score is the only thing that matters: recovered vs ground truth.
+global, and every pointer type flowing through functions. The type work
+goes through the **forge_api facade**; everything else is plain IDA
+programming. The final score measures only what was recovered vs ground
+truth.
+
+## Why forge_api (and when to use it)
+
+forge_api is a **headless facade for the structure-builder / type-recovery
+workflow** — it packages the plugin's store and scanners into
+deterministic, executable calls: build a struct in the store
+(`create_structure`/`add_member`), scan evidence out of decompiled code
+(`deep_scan`/`scan_global`/`scan_from_allocation`), resolve collisions,
+name things (`set_lvar_types`/`rename_local`/`rename_ea`), commit to the
+IDB (`create_type`/`finalize`), apply to globals
+(`apply_type(..., redefine_range=True)`), and mirror between store and
+til (`push_type`/`import_types`/`refresh_types`). That is its whole job.
+
+**It is not a general-purpose IDA replacement.** It deliberately leaves
+analysis to the platform: disassembly, xrefs, strings, function discovery,
+data reads, undo — everything outside the type workflow — is
+**ida-domain API** (the `db`/`ida_domain` objects, `idc`, and raw `ida_*`
+modules). Use the right tool per action:
+
+| Action | Tool |
+|---|---|
+| Build/edit a store structure, scan it, name members, commit its type, apply it to a global, retype locals, rename functions | **forge_api** verbs |
+| Disassemble, walk xrefs, read strings/data, enumerate functions/segments, auto-analysis, output, file I/O, anything not type-shaped | **ida-domain** (normal IDA usage) |
+| A type operation forge cannot do (or does wrong) | ida-domain, and note it in the report |
+
+There is no "break-out" accounting and no penalty for ida-domain — the
+report's interest is only whether *type* recovery had gaps.
 
 ## Target
 
@@ -42,10 +68,10 @@ Score the final IDB state with an MCP script (read types via
   `Kid *` member named `first` beats `u64` + `first`). All types from the
   header must be present and committed in the IDB.
 - **Globals (20%)**: each global renders as its struct type
-  (`apply_type(..., redefine_range=True)` — note: this now covers the
-  WHOLE byte span as one struct item, no manual `create_struct` needed),
-  arrays recognized (`u32[2]`, `Stack2[2]`), no stray qword/blob fallbacks
-  in `decompile`.
+  (`apply_type(..., redefine_range=True)` — this now covers the WHOLE
+  byte span as one struct item, no manual `create_struct` needed), arrays
+  recognized (`u32[2]`, `Stack2[2]`), no stray qword/blob fallbacks in
+  `decompile`.
 - **Pointer flow (20%)**: locals/args carrying the recovered types are
   retyped (`set_lvar_types`) and the decompiled pseudocode shows member
   access (`parent->magic`, `node->payload[0]`) — sampled over the
@@ -66,6 +92,9 @@ Working as intended — do not work around these:
 - Re-committing a parent after its child struct changed re-binds member
   types automatically (inline children included).
 
+Your primary grind: committing your recoveries in the IDB so globals
+render and pseudocode shows real member access.
+
 One known gap (tracked as E.22): `guess_allocation`/`scan_from_allocation`
 do **not** follow wrapper helper allocations (`v1 = chain_node_new(...)` —
 the `calloc` sits inside the callee). Compensate with `deep_scan` +
@@ -73,42 +102,40 @@ disassembly of the helper, and report it as a found gap.
 
 ## Rules
 
-1. Forge first for the **type verbs** (create_structure/add_member/
-   deep_scan/scan_global/scan_from_allocation/guess_allocation/
-   create_type/finalize/apply_type/set_lvar_types/rename_local/rename_ea).
-   If a type verb is missing or broken in forge, do it via ida-domain and
-   note it — that note is a finding, not a penalty.
-2. Everything else (function discovery, disassembly, string reads,
-   name cleanup) is free-form: ida-domain, idc, raw ida_*.
-3. One script per execute — idle workers drop after ~20 s lease (the ~20-s
-   lease; a drop is a re-run, not a loss). Determinism comes from the cold
-   open (above), not from clearing.
-4. When forge gets a type wrong (wrong member set/offsets), fix it in
-   the store and re-commit (`create_type(overwrite=True)`) — the point is
-   the end state, not the path.
+1. Type workflow first: whatever the recovery task needs that forge
+   already does, use forge's verbs. Stop short of fighting forge for
+   things it genuinely lacks — the score counts the end state, not the
+   purity of the toolchain.
+2. ida-domain (`db`, `idc`, raw `ida_*`) is the general-purpose API and
+   is in play at all times. Use it for recon, disassembly, strings, data
+   reads, and for any type operation forge can't do (report those).
+3. One script per execute — idle workers drop after ~20 s lease; a drop
+   is a clean re-run (cold-open determinism), not a loss.
+4. When forge gets a type wrong (wrong member set/offsets), fix it in the
+   store and re-commit (`create_type(overwrite=True)`) — the point is the
+   end state, not the path.
 
 ## Phases
 
 1. **Recon** — map functions, globals, and every printf format string
-   (they carry member names). Plan which section runner feeds which
-   struct.
-2. **Recover** — per section: find the allocation site /
-   `scan_from_allocation` or `deep_scan` with root retype; hand-build or
+   (they carry member name evidence). Plan which section runner feeds
+   which struct. (ida-domain work.)
+2. **Recover** — per section: find the allocation site with
+   `scan_from_allocation` or `deep_scan` with a root type; hand-build or
    disassemble what the scanners miss (helper-allocated nodes like
    `chain_node_new`, arrays, nested inlines); name members from the
-   format-string evidence.
+   format-string evidence (forge naming + idc reads).
 3. **Apply** — `finalize`/`create_type` (children first), `apply_type(
    ..., redefine_range=True)` on every global region (one call covers the
-   whole span), `set_lvar_types` on the section runners so the pseudocode
+   whole span),`set_lvar_types` on the section runners so the pseudocode
    renders struct access.
 4. **Score** — the MCP scoring script vs the ground-truth table; fix
-   anything fixable, re-score.
+   anything fixable, re-score, re-commit.
 5. **Report** — `docs/forge_api_recovery_eval_output.md` in this repo
-   (the round-1 report lives at
-   `H:/re/_random/c_structs/docs/forge_api_recovery_eval_output.md`) with:
-   accuracy table (per struct/global/function + total %), every
+   (round-1 lives at `H:/re/_random/c_structs/docs/forge_api_recovery_eval_output.md`)
+   with: accuracy table (per struct/global/function + total %), every
    incorrect/missing item with the forge call that failed to produce it,
-   and the ranked forge gaps that caused misses (these feed the TODO).
+   and the ranked forge gaps (these feed the TODO list).
 
 ## Acceptance
 
