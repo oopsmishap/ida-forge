@@ -481,6 +481,29 @@ def test_memory_allocation_object_create_handles_direct_and_casted_calls(monkeyp
     assert via_cast.scan_root_function_name == "sub_1000"
 
 
+def test_scan_object_create_with_promote_root_false_leaves_root_unset(monkeypatch):
+    """A mid-walk ScanObject.create (visitor step, assignment tracking) must
+    NOT promote the lvar to a new scan root — that promotion is what causes
+    a ``v0->field = v2`` LHS to be picked up as a fresh scan root when the
+    scan was started on ``v2``.
+    """
+    cfunc = FakeCfunc([FakeLvar("v2")], entry_ea=0x401000)
+    monkeypatch.setattr(
+        ScanObject,
+        "get_expression_address",
+        staticmethod(lambda _cfunc, expr: expr.ea),
+    )
+    var_expr = FakeExpr(ctype.var, v=SimpleNamespace(idx=0), ea=0x401020)
+    obj = ScanObject.create(cfunc, var_expr, promote_root=False)
+    assert obj is not None
+    assert obj.name == "v2"
+    assert obj.scan_root_function_ea == -1  # BADADDR sentinel from __init__
+    assert obj.scan_root_ea == -1
+    # And the default behaviour (promote_root=True) still promotes.
+    promoted = ScanObject.create(cfunc, var_expr)
+    assert promoted.scan_root_function_ea == 0x401000
+    assert promoted.scan_root_ea == 0x401020
+
 
 
 def test_memory_allocation_object_create_multiplies_calloc_size(monkeypatch):

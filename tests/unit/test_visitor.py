@@ -380,7 +380,7 @@ def test_recursive_downwards_object_visitor_inherits_scan_root(monkeypatch):
     monkeypatch.setattr(
         visitor_module.ScanObject,
         "create",
-        staticmethod(lambda _cfunc, expr: child_obj if expr is x_expr else None),
+        staticmethod(lambda _cfunc, expr, *, promote_root=True: child_obj if expr is x_expr else None),
     )
 
     visitor.visit_expr(asg_expr)
@@ -426,7 +426,7 @@ def test_recursive_downwards_object_visitor_adds_child_from_assigned_member(monk
     monkeypatch.setattr(
         visitor_module.ScanObject,
         "create",
-        staticmethod(lambda _cfunc, expr: child_obj if expr is y_expr else None),
+        staticmethod(lambda _cfunc, expr, *, promote_root=True: child_obj if expr is y_expr else None),
     )
 
     visitor.visit_expr(asg_expr)

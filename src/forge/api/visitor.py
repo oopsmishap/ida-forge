@@ -93,7 +93,7 @@ class DownwardsObjectVisitor(ObjectVisitor):
         if base_expr is None:
             return None
 
-        scan_object = ScanObject.create(self._cfunc, base_expr)
+        scan_object = ScanObject.create(self._cfunc, base_expr, promote_root=False)
         if scan_object is None:
             return None
 
@@ -232,8 +232,8 @@ class UpwardsObjectVisitor(ObjectVisitor):
         x_cexpr = cexpr.x
         y_cexpr = cexpr.y.x if cexpr.y.op == ctype.cast else cexpr.y
 
-        obj_left = ScanObject.create(self._cfunc, x_cexpr)
-        obj_right = ScanObject.create(self._cfunc, y_cexpr)
+        obj_left = ScanObject.create(self._cfunc, x_cexpr, promote_root=False)
+        obj_right = ScanObject.create(self._cfunc, y_cexpr, promote_root=False)
         if obj_left and obj_right:
             self._add_object_assignment(obj_left, obj_right)
 

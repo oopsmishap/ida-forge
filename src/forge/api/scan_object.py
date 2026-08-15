@@ -316,12 +316,21 @@ class ScanObject:
             self.scan_root_function_name = other.scan_root_function_name
 
     @staticmethod
-    def create(cfunc: ida_hexrays.cfunc_t, arg):
+    def create(cfunc: ida_hexrays.cfunc_t, arg, *, promote_root: bool = True):
         """
         Creates a ScanObject based on the given argument.
 
         :param cfunc: The cfunc_t object.
         :param arg: The argument to create a ScanObject from.
+        :param promote_root: When False, the returned object does NOT have
+            ``set_scan_root`` called on it (its root metadata stays
+            ``BADADDR``/``None``).  Pass False from any caller that creates
+            objects mid-walk to track references inside an existing scan root
+            without promoting the lvar to a new root — that promotion is what
+            causes the ``v0->field = v2`` LHS to be picked up as a separate
+            scan root when the scan is started on ``v2``.  Top-level scan
+            entry points (structure-builder actions, child-scan, guess-allocation)
+            pass True (the default).
         :return: The created ScanObject or None.
         """
         if isinstance(arg, ida_hexrays.ctree_item_t):
@@ -368,11 +377,12 @@ class ScanObject:
         result.tinfo = cexpr.type
         result.ea = ScanObject.get_expression_address(cfunc, cexpr)
         result.func_ea = getattr(cfunc, "entry_ea", idaapi.BADADDR)
-        result.set_scan_root(
-            cfunc.entry_ea,
-            expression_ea=result.ea,
-            function_name=getattr(ida_funcs, "get_func_name", lambda ea: f"sub_{ea:x}")(cfunc.entry_ea),
-        )
+        if promote_root:
+            result.set_scan_root(
+                cfunc.entry_ea,
+                expression_ea=result.ea,
+                function_name=getattr(ida_funcs, "get_func_name", lambda ea: f"sub_{ea:x}")(cfunc.entry_ea),
+            )
 
         return result
 
