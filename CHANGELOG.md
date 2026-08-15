@@ -2,7 +2,28 @@
 
 All notable changes are tracked here. Format: date — change set (branch/commit).
 
-## 2026-08-15 — R3.8 reopening apply + void/apply-noise fixes
+## 2026-08-15 — R3.9 one commit core for GUI and API
+
+The GUI "Create Type" and `forge_api.create_type` ran different routes
+(`pack_structure`: editable dialog + overwrite prompt vs the facade's
+direct build+commit), which is how GUI behavior drifted from the API
+(the void-member pack mystery, apply differences). Unification:
+
+- `Structure.create_type_if_ready` routes BOTH modes through one
+  `_pack_commit` (build_cdecl → set_cdecl with the apply-at-scan-sites
+  step); headless commits `overwrite=True`, the GUI keeps only its two
+  UI overlays (name prompt + editable `ask_text` dialog) and commits
+  the exact dialog text through the same `set_cdecl` chain.
+- New API verb `commit_declaration(name, declaration)` — the pack
+  dialog as an API call: commit exact text (name-verified), no
+  dialogs, applies at scan sites, reports `applied_sites`. Every GUI
+  task now has an API equivalent.
+- Parity unit tests: headless and GUI pack produce the identical
+  declaration (the pack wrapper moves from the dialog to set_cdecl and
+  is never doubled); `commit_declaration` round-trip + wrong-name
+  rejection. 666 tests green, ruff clean.
+
+## 2026-08-15 — R3.8/R3.8.1 reopening apply + void/apply-noise fixes
 
 Reports: in the GUI, "Create Type" created the type but applied nothing,
 and IDA kept printing "Void type is forbidden here". Findings & fixes:

@@ -134,9 +134,12 @@ commit → apply → mirror.
 6. Commit: `create_type(name, overwrite=True)` / `finalize` — the
    commit applies the pointer type at EVERY recorded scan site (the
    same "apply globally" step the GUI form runs; `reapply(name)`
-   re-runs it). CHECK the result: `applied_sites` must be non-empty
-   when step 4 listed sites — an empty list means the evidence is not
-   attached; re-scan into the structure, never hand-rebuild first.
+   re-runs it, and `commit_declaration(name, cdecl)` commits an exact
+   declaration text — the GUI pack dialog as an API call). CHECK the
+   result: `applied_sites` must be non-empty when step 4 listed sites
+   — an empty list means the evidence is not attached; re-scan into
+   the structure, never hand-rebuild first. The GUI form and the API
+   share ONE commit core (R3.9) — behavior cannot diverge.
    Children before parents. NEVER delete: there is no type-delete verb;
    correct a committed layout in place and re-commit.
 7. Globals: `apply_type(ea, "Name", redefine_range=True)`.
