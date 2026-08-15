@@ -90,7 +90,22 @@ Working as intended — do not work around these:
 - `deep_scan`/`shallow_scan` restore the root's previous type when the
   scan yields no evidence, so a failed scan leaves no retype behind.
 - Re-committing a parent after its child struct changed re-binds member
-  types automatically (inline children included).
+  types automatically (inline children included) — but ONLY when the
+  parent pack already knew the child sizes. If a member was added while
+  its type was still the 1-byte seed placeholder, the wrong size is
+  baked into the layout and re-commit does NOT recover it: re-point the
+  member (`set_member(parent, off, type=child)`), then re-`create_type`.
+  (R2.1: this exact poisoning chain-shifted `Outer`'s grid/dispatch/
+  stacks.)
+- `apply_type(..., redefine_range=True)` skips the full-span item when
+  the head already has a user name — apply before naming, or use
+  ida-domain `del_items(DELIT_DELNAMES)` + `apply_tinfo(TINFO_DEFINITE)`
+  + `set_name`, which also survives the idalib re-split race. (R2.2/R2.3.)
+- `apply_type`'s `del_items` cleanup takes an END offset, not a size —
+  overlapping spans can erode the .data tail; keep applications to
+  non-overlapping ranges. (R2.4.)
+- `int32`/`uintN` shorthand does not parse in member types — use
+  `__intN`/`unsigned __intN`. (R2.5.)
 
 Your primary grind: committing your recoveries in the IDB so globals
 render and pseudocode shows real member access.

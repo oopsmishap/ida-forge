@@ -8,9 +8,13 @@ below), the **E.1–E.11 bug fixes**, and the **round-2 review fixes**
 loudness) — is in. Two evaluation rounds done; the round-2 review scored
 the facade 8/10 ("genuinely productive") with the pain concentrated in
 attribution depth + missing verbs — those are the open items below. The
-commit-level record lives in `CHANGELOG.md`.
+**recovery-eval round 2 (2026-08-15) scored 99/100** on the cold fixture
+(20/20 types, 5/5 globals, 10/10 flows; report:
+`docs/forge_api_recovery_eval_output.md`) and filed the ranked gaps in
+the **R2 section** below. The commit-level record lives in
+`CHANGELOG.md`.
 
-Baselines: `python -m pytest -q` → 573 passing; `python -m ruff check src
+Baselines: `python -m pytest -q` → 577 passing; `python -m ruff check src
 tests` → clean; branch `forge-api` clean working tree.
 
 ## Evaluation findings — forge_api review, 2026-08-13
@@ -155,6 +159,57 @@ in commit `45b9d2a` (live-verified on the fixture) unless noted:
 - **E.16 update — array/stride evidence.** `Stack2[2]`, `u32[2]` dims
   and `u8[16]`/`xmmword` blobs were all hand-fixed in round 2;
   `scan_global` emitted the blobs, not the arrays.
+
+### Recovery-eval round 2 — ranked gaps (2026-08-15, score 99/100, report:
+`docs/forge_api_recovery_eval_output.md`; §8 of the report)
+
+Second full recovery pass on the cold fixture. The scan half was skipped
+deliberately (E.22 wrapper shape + disassembly was evidence-complete); the
+store/commit/apply/mirror halves ran through forge. Ranked from §8:
+
+- **R2.1 — placeholder-size poison at pack (highest priority).** Adding a
+  member whose store-name resolves only to the seed `char _placeholder`
+  (1 B) packs the parent from that size and corrupts the whole layout
+  (observed: `Inline` first@16 → second@104; `Outer` bag 16→1 B so grid
+  shifted +0x10, dispatch +0x20, stacks +0x88). `create_type(parent)`
+  re-pack does NOT resolve the -1 sizes after the child commits — the
+  `45b9d2a` re-bind only helped when the parent pack already knew the
+  sizes. Workaround today: `set_member(parent, off, type=child)` then
+  re-`create_type`. Fix target: resolve store names to committed types at
+  pack time.
+- **R2.2 — `apply_type(redefine_range=True)` suppressed on user-named
+  heads.** A named global stays a 1-byte head; the full-span struct item
+  only materializes for unnamed heads — the user-name guard eats
+  multi-field globals. Workaround: apply before naming, or ida-domain
+  `apply_tinfo` after `del_items(DELIT_DELNAMES)`.
+- **R2.3 — struct-item lifetime race in idalib.** `create_struct` /
+  `apply_type` items at global heads get re-split to 1-byte items by
+  deferred auto-analysis whenever the engine re-sees dense code refs
+  (observed repeatedly, even after `auto_wait`). Robust path:
+  `del_items(DELIT_DELNAMES, span)` + `apply_tinfo(tinfo, TINFO_DEFINITE)`
+  + `set_name` — persists through save/reopen (verified).
+- **R2.4 — `apply_type` `del_items(ea, DELIT_SIMPLE, ea+size)` semantics
+  erode the .data tail.** The 3rd arg is an absolute END offset, but the
+  facade reads it as a byte size: applying `char *[4]` at 0x6000 deleted
+  items through 0x6020+0x20 and sibling structs came back as 1-byte
+  unknowns. Size-vs-end double-check in the facade.
+- **R2.5 — `int32` silently dropped by the member-type parser.** The
+  member vanishes without error (`__int32` works). Alias or loud error
+  for the C `intN/uintN` typedef family.
+- **R2.6 — C-keyword member names dropped from the cdecl without
+  error.** (member named `inline` etc. — no message). Rename or loud
+  error, mirroring the E.21 keyword check for type names.
+- **R2.7 — E.22 (known, OPEN)** — wrapper-helper allocations
+  (`make_chain`/`kv_append`/`build_grid` allocate inside callees);
+  scanners don't follow. Compensate with `deep_scan` on the helper +
+  manual construction from disassembly.
+
+Round-2 delta vs round 1: `g_banner` corrected `char[21]` → `char[22]`
+(22-byte banner, applied + persisted); `Variant.as` remains a `u64`
+member — the union's four tags (`as_u32/as_i32/as_f32/as_ptr`) are not
+represented because the forge store has no union member type; offsets
+exact, needs the IDT path (`id`-domain) + re-commit of `ItemStack`/`Outer`
+for full member-type credit.
 
 ### E-feat — ranked (round 1)
 
