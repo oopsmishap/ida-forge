@@ -268,6 +268,23 @@ def test_build_cdecl_skips_void_typed_members(monkeypatch):
     assert "void" not in cdecl
     assert "unsigned __int32" in cdecl
 
+    # R3.10: a member with NO tinfo (None) renders as bare `void` through
+    # tinfo_t(None) — same "Void type is forbidden here" rejection, and
+    # is_void() is not callable on None. Must be skipped like void.
+    structure = structure_mod.Structure("W")
+    structure.add_member(
+        Member(0, None, None, 0)
+    )
+    structure.add_member(
+        Member(8, parse_user_tinfo("u32"), None, 0)
+    )
+    structure.pack = 1
+    result = structure.build_cdecl()
+    assert result is not None
+    _, cdecl = result
+    assert "void" not in cdecl
+    assert "unsigned __int32" in cdecl
+
 
 def test_commit_failure_reason_names_void_members(monkeypatch):
     """R3.8: when the parser rejects a declaration, the reason names the

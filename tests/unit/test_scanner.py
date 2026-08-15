@@ -676,6 +676,114 @@ def test_get_member_discards_negative_offset():
     assert result is None
 
 
+def test_extract_member_skips_bare_variable_assignment_writes(monkeypatch):
+    """R3.10: `v0 = calloc(...)` / `v4 = v0` re-bind the POINTER; they are
+    not member-0 writes. The old code planted `void*`/`test*` rows at
+    offset 0 for every root assignment (and phi-merge `v4 = v0` aliases
+    polluted the scanned structure with the alias's own rows)."""
+    scanner_module = _load_scanner_module()
+    visitor = scanner_module.ScanVisitor.__new__(scanner_module.ScanVisitor)
+    scanner_module.ctype = SimpleNamespace(
+        cast=1, ref=2, ptr=3, idx=4, add=5, num=6, asg=7, var=8, ne=9, eq=10,
+        memptr=11,
+    )
+
+    called = []
+    visitor._get_member = lambda *a, **k: called.append((a, k)) or "member"
+    visitor._extract_obj_ea = lambda *a, **k: None
+
+    # `v0 = <rhs>` — assignee is the bare variable itself
+    leaf = SimpleNamespace(
+        op=scanner_module.ctype.var,
+        v=SimpleNamespace(name="v0"),
+        type=SimpleNamespace(dstr=lambda: "void *"),
+    )
+    asg = SimpleNamespace(op=scanner_module.ctype.asg, x=leaf, y=SimpleNamespace())
+    context = scanner_module.ParentExpressionContext([asg])
+    obj = SimpleNamespace(name="v0")
+
+    result = visitor._extract_member(leaf, obj, 0, context)
+
+    assert result is None
+    assert called == []
+
+
+def test_extract_member_preserves_real_member_assignment_writes(monkeypatch):
+    """R3.10 (companion): a REAL member write `v0->field_8 = x` still
+    extracts — the skip only fires for the bare variable as assignee."""
+    scanner_module = _load_scanner_module()
+    visitor = scanner_module.ScanVisitor.__new__(scanner_module.ScanVisitor)
+    scanner_module.ctype = SimpleNamespace(
+        cast=1, ref=2, ptr=3, idx=4, add=5, num=6, asg=7, var=8, ne=9, eq=10,
+        memptr=11,
+    )
+
+    captured = {}
+
+    def fake_get_member(offset, cexpr, obj, tinfo, obj_ea=None):
+        captured["offset"] = offset
+        captured["tinfo"] = tinfo
+        return "member"
+
+    visitor._get_member = fake_get_member
+    visitor._extract_obj_ea = lambda *a, **k: None
+
+    # `v0->field_8 = rhs` — assignee is a memptr, NOT the bare variable
+    leaf = SimpleNamespace(
+        op=scanner_module.ctype.var,
+        v=SimpleNamespace(name="v0"),
+        type=SimpleNamespace(dstr=lambda: "void *"),
+    )
+    member_access = SimpleNamespace(
+        op=scanner_module.ctype.memptr, x=leaf, m=8,
+    )
+    cast = SimpleNamespace(
+        op=scanner_module.ctype.cast,
+        x=member_access,
+        type=SimpleNamespace(dstr=lambda: "u64"),
+    )
+    asg = SimpleNamespace(op=scanner_module.ctype.asg, x=cast, y=SimpleNamespace())
+    context = scanner_module.ParentExpressionContext([asg])
+    obj = SimpleNamespace(name="v0")
+
+    result = visitor._extract_member(leaf, obj, 0, context)
+
+    assert result == "member"
+    assert captured["offset"] == 8
+    assert captured["tinfo"] is cast.type or captured["tinfo"] is asg.x.type
+
+
+def test_extract_member_skips_null_comparison_of_bare_variable():
+    """R3.10: `v0 != nullptr` / `v0 == 0` reads the POINTER, not member 0.
+    The null-check compare planted a `u64:0x0` row for every allocation.
+    Comparison contexts with no member-access wrapper are not member
+    reads."""
+    scanner_module = _load_scanner_module()
+    visitor = scanner_module.ScanVisitor.__new__(scanner_module.ScanVisitor)
+    scanner_module.ctype = SimpleNamespace(
+        cast=1, ref=2, ptr=3, idx=4, add=5, num=6, asg=7, var=8, ne=9, eq=10,
+        memptr=11, cit_empty=100,
+    )
+
+    called = []
+    visitor._get_member = lambda *a, **k: called.append((a, k)) or "member"
+    visitor._obj_has_no_member_wrapper = lambda first_parent: True
+
+    leaf = SimpleNamespace(
+        op=scanner_module.ctype.var,
+        v=SimpleNamespace(name="v0"),
+        type=SimpleNamespace(dstr=lambda: "test *"),
+    )
+    ne = SimpleNamespace(op=scanner_module.ctype.ne, x=leaf)
+    context = scanner_module.ParentExpressionContext([ne])
+    obj = SimpleNamespace(name="v0")
+
+    result = visitor._extract_member(leaf, obj, 0, context)
+
+    assert result is None
+    assert called == []
+
+
 def test_manipulate_prefers_pointer_context_even_without_pointer_tinfo(monkeypatch):
     scanner_module = _load_scanner_module()
     visitor = scanner_module.ScanVisitor.__new__(scanner_module.ScanVisitor)

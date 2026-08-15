@@ -2,6 +2,34 @@
 
 All notable changes are tracked here. Format: date — change set (branch/commit).
 
+## 2026-08-15 — R3.10 scan-pollution + None-tinfo void guards
+
+User report (GUI pack on the fixture): "Void type is forbidden here"
+spam still appearing per packed member, and a v0 scan "picked up v2 to
+be the same origin". Findings and fixes:
+
+- **Pack-side void hardening (None-tinfo members)**: a member whose
+  `tinfo` is `None` rendered as a bare `void` through
+  `ida_typeinf.tinfo_t(None)` — `create_udt` accepts it silently and
+  `print_tinfo` emits `void name;`, which the commit parse rejects
+  with "Void type is forbidden here" (same failure the R3.8 skip
+  diagnosed for is_void members, but the None case never reached it).
+  `build_cdecl` now skips None-tinfo members exactly like void-typed
+  ones (loud warning naming the member); `get_udt_member` substitutes
+  `u64` for direct udt assembly; `Member.size`/`effective_size` no
+  longer crash on a None tinfo.
+- **Scan pollution from bare-variable writes**: `v0 = calloc(...)` and
+  phi-merge aliases (`v4 = v0` where v4 = phi(v0, v2)) were parsed as
+  member-0 writes, planting bogus `void*`/`test*` rows at offset 0
+  (the "picked up v2" symptom) and, on repeated scans, duplicate
+  member rows whose pack then tripped the parser. Only member-access
+  assignees (`v0->field_N = ...`, `LODWORD(v0->field_0) = ...`)
+  extract now; `v0 != nullptr`/`== 0` comparisons no longer create
+  `u64:0x0` members.
+- Regression tests: None-tinfo member skipped at pack; bare-variable
+  assignment skips; real member writes still extract; null-comparison
+  skip. Suite green, ruff clean.
+
 ## 2026-08-15 — R3.9 one commit core for GUI and API
 
 The GUI "Create Type" and `forge_api.create_type` ran different routes

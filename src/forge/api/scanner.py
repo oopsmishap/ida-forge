@@ -339,6 +339,33 @@ class ScannedStructureMemberObject(ScannedObject):
             )
 
 
+def _is_bare_variable_assignee(x) -> bool:
+    """True when ``x`` is the bare variable (optionally under cast/ref
+    wrappers) with no member-access node anywhere in the chain.
+
+    ``v0 = calloc(...)`` / ``v4 = v0`` are pointer re-bindings, not
+    member-0 writes. ``v0->field_8 = x`` has a memptr node and is NOT
+    bare. ``LODWORD(v0->field_0) = y`` is a cast of a memptr — also not
+    bare.
+    """
+    member_ops = (
+        getattr(ctype, "memptr", None),
+        getattr(ctype, "memref", None),
+        getattr(ctype, "dot", None),
+        getattr(ctype, "idx", None),
+        getattr(ctype, "add", None),
+    )
+    walk = x
+    while walk is not None and hasattr(walk, "op"):
+        if walk.op in member_ops:
+            return False
+        if walk.op in (getattr(ctype, "cast", None), getattr(ctype, "ref", None)):
+            walk = getattr(walk, "x", None)
+            continue
+        return walk.op == getattr(ctype, "var", None)
+    return False
+
+
 class ScanVisitor(ObjectVisitor):
     def __init__(
         self,
@@ -607,6 +634,23 @@ class ScanVisitor(ObjectVisitor):
 
         return self._extract_member(cexpr, obj, offset, context)
 
+    @staticmethod
+    def _obj_has_no_member_wrapper(first_parent) -> bool:
+        """True when ``first_parent`` is not a member-access node.
+
+        ``memptr``/``dot``/``idx``/``add`` wrappers mean the expression
+        reads a structure field; anything else (a bare ``ne``/``eq``
+        comparison, a call, a cast) reads the variable itself.
+        """
+        if first_parent is None:
+            return True
+        return first_parent.op not in (
+            getattr(ctype, "memptr", None),
+            getattr(ctype, "dot", None),
+            ctype.idx,
+            ctype.add,
+        )
+
     def _extract_member(
         self,
         cexpr: ida_hexrays.cexpr_t,
@@ -617,6 +661,20 @@ class ScanVisitor(ObjectVisitor):
         log_debug(
             f"Extracting member: {obj.name}, parents: '{ctype_to_str(context.ops)}'"
         )
+
+        # R3.10: `v0 != nullptr` / `v0 == 0` reads the POINTER, not member
+        # 0. The `ne`/`eq` parent of the bare variable (reached from both
+        # the pointer and the plain-expression entry points) planted a
+        # `u64:0x0` row for every null-checked allocation. Comparison
+        # contexts with no member-access wrapper are not member reads.
+        if offset == 0 and (
+            context.op_at(0) in (getattr(ctype, "ne", None), getattr(ctype, "eq", None))
+            and self._obj_has_no_member_wrapper(context.expr_at(0))
+        ):
+            log_debug(
+                f"Skipping comparison of {obj.name} with no member access context"
+            )
+            return None
 
         asg_index = None
         for index, op in enumerate(context.ops):
@@ -629,6 +687,18 @@ class ScanVisitor(ObjectVisitor):
                 parsed_assignee = self._parse_left_assignee(assignment_parent.x, 0)
                 if parsed_assignee is not None:
                     _assignee, assignee_offset = parsed_assignee
+                    if _is_bare_variable_assignee(assignment_parent.x):
+                        # R3.10: the ROOT variable itself as assignee
+                        # (`v0 = calloc(...)`, `v4 = v0`) is a POINTER
+                        # re-binding, not a structure member write. Treating
+                        # it as member 0 planted bogus `void*`/`test*` rows
+                        # (and phi-merge `v4 = v0` aliases polluted the root
+                        # struct). Only member-access assignees count.
+                        log_debug(
+                            f"assignee is the scanned variable {obj.name}; "
+                            "no member extracted"
+                        )
+                        return None
                     obj_ea = self._extract_obj_ea(getattr(assignment_parent, "y", None))
                     log_debug("assignment to object")
                     return self._get_member(

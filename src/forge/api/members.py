@@ -346,6 +346,8 @@ class AbstractMember:
 
     @property
     def size(self):
+        if self.tinfo is None:
+            return 1
         size = self.tinfo.get_size()
         return size if size != ida_typeinf.BADSIZE else 1
 
@@ -492,6 +494,11 @@ class Member(AbstractMember):
         has no size at all.
         """
         pack_tinfo = self._resolve_pack_tinfo() or self.tinfo
+        if pack_tinfo is None:
+            # R3.10: a member with no tinfo at all has no size; the pack
+            # path skips it (build_cdecl), but size queries from collision
+            # walking must not crash on it either.
+            return getattr(self, "size", 1)
         try:
             size = pack_tinfo.get_size()
         except Exception:  # noqa: BLE001 — degraded tinfos have no size
@@ -509,6 +516,14 @@ class Member(AbstractMember):
             else self.name
         )
         pack_tinfo = self._resolve_pack_tinfo() or self.tinfo
+        if pack_tinfo is None:
+            # R3.10: tinfo_t(None) materializes as a bare `void` in the
+            # udt — create_udt accepts it silently and print_tinfo emits
+            # `void name;`, which the commit parse then rejects with
+            # "Void type is forbidden here". None-tinfo members are
+            # skipped by build_cdecl already; this keeps direct
+            # udt assembly safe too.
+            pack_tinfo = types["u64"].type
         udt_member.type = ida_typeinf.tinfo_t(pack_tinfo)
         if array_size:
             array_data = ida_typeinf.array_type_data_t()

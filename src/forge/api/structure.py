@@ -755,13 +755,19 @@ class Structure:
             # — IDA's parser rejects it ("Void type is forbidden here")
             # with a message that says nothing about WHICH member. Skip
             # it loudly so the failure is diagnosable instead.
+            # R3.10: a member with NO tinfo at all renders as bare `void`
+            # through tinfo_t(None) — same parser failure, and is_void()
+            # is not callable on it. Treat None like void.
             member_tinfo = getattr(member, "tinfo", None)
             is_void = getattr(member_tinfo, "is_void", None)
-            if callable(is_void) and is_void():
+            if member_tinfo is None or (callable(is_void) and is_void()):
+                reason = (
+                    "has no type (tinfo is None)" if member_tinfo is None else "is void-typed"
+                )
                 log_warning(
-                    f"Skipping void-typed member {member.name} at "
-                    f"0x{member.offset:x} in {struct_name} — IDA forbids "
-                    "void members; set a real type or disable the member."
+                    f"Skipping member {member.name} at 0x{member.offset:x} "
+                    f"in {struct_name} — {reason}; IDA forbids committing "
+                    "it; set a real type or disable the member."
                 )
                 continue
 
