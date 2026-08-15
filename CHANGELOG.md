@@ -2,6 +2,66 @@
 
 All notable changes are tracked here. Format: date — change set (branch/commit).
 
+## 2026-08-15 — ALL-forge-TODOs closure wave (`726dd8b`, `01cee06`, `91b95a6`, `b93eaf1`, `cb55b3f`)
+
+Every open item (R2.1–R2.6, E.13–E.29, F.1–F.8) implemented in the
+facade + support modules; 632 tests green (was 577), ruff clean, eight
+live probes green against the fixture worker.
+
+### Parse / pack / apply (Phase A)
+- `intN`/`uintN` member type aliases (R2.5); C-keyword member names
+  fail loudly (`_validate_member_name`, R2.6).
+- `Member.effective_size()` — pack-time sizes come from the FRESH pack
+  tinfo; placeholder-size poison gone from `get_udt_member`,
+  `build_cdecl`, `calculate_array_size` (R2.1, priority #1). Live:
+  1-byte stored member packs at the child's real 40 B, no chain shift.
+- `apply_type(redefine_range=True)` rewritten: DELIT_DELNAMES whole-
+  span delete, `apply_tinfo(TINFO_DEFINITE)` + `auto_wait`, size
+  verify/retry with an honest `warning`, base-name restore (R2.2/R2.3);
+  3rd `del_items` argument pinned to the END ea (R2.4, recorder test).
+  Live: `g_main_outer` 320 B / `g_static_grid` 16 B items persist over
+  save/reopen; span-end sibling intact; `g_main_outer.name[16]` renders.
+- `remove_type` (E.27, ordinal delete + TypeMirror cleanup).
+- `undo_type` (E.17) with pre-commit cdecl snapshots in `create_type`/
+  `finalize`/`push_type`.
+
+### Non-UDT + unions (Phase B)
+- `create_typedef` (E.29) — `typedef <decl> <name>;` via the pure IDB
+  write, `ida_hexrays.create_typedef` fallback; live `DispatchFn` ok.
+- Inline union member types (E.28) parse via the `<union> __forge_member;`
+  branch; live `VariantT` 16 B with all four tags committed.
+- Mirror honesty (E.26): `import_types` `skipped` is a
+  `{name: reason}` dict; `refresh_types(include_names=)` adopts IDB
+  names for synthesized store names.
+
+### Scanning (Phase C)
+- `deep_scan`/`shallow_scan(clear_first=)` (E.21).
+- Helper-mediated allocation (E.22/I.25): callee-body alias chain
+  (≤2 `v = w` hops) + pointer-return fallback row (`size_hint=None`,
+  `callee` set); `scan_from_allocation` skips the void\* retype trick
+  for helper rows. Live: `guess_allocation` on the fixture returns a
+  HEAP row (calloc size folded to 40) and the scan commits.
+- IAT-slot callee resolution (E.23) in `callees_of`/`function_info`;
+  `scan_global` exclusive-tail extension (E.25); stride-run collapse to
+  arrays (E.16); `name_members_from_printf` (E.14, live: PointerParent
+  `parent`/`magic`/`count` from `log_msg` formats);
+  `ScannedStructureMemberObject.apply_type` implemented (F.1).
+
+### Orchestration + hygiene (Phase D)
+- `recover()` (F.8+E.13) — scan → commit → root retype → reapply; live
+  committed `DeepChainNodeR` and re-decompile renders member access.
+- `reapply` (E.19); E.20 tweak batch (a–f); `decompile_many` (F.2);
+  `scan_returned` (F.3, `iter_returned_exprs` moved to
+  `forge.api.hexrays`); `export_store`/`import_store` (F.5);
+  `forge.api.ctree_transform` DSL + `SilentIfSwapper` move (F.6);
+  `backfill_lumina` (F.7); `split_flags` (E.18, byte-aligned only).
+- Live 9.4 hardening found by the probes: treeitems statements expose
+  no bodies — all statement walkers fall through to the ctree visit;
+  `to_specific_type` is a property on live items (not a method) and
+  `creturn.expr` carries the return value; printf format literals sit
+  under casts and memptr bases carry lvar idx (name resolved from the
+  lvar table).
+
 ## 2026-08-15 — recovery-eval round 2 (99/100) + skill/docs
 
 ### Evaluation
