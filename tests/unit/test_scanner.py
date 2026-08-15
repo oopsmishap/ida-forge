@@ -153,6 +153,9 @@ def test_scanned_structure_member_applies_type_via_udt(monkeypatch):
             calls.append(("get_named_type", name))
             return True
 
+        def is_udt(self):
+            return True
+
         def get_udt_details(self, udt):
             calls.append(("details",))
             udt.extend(
@@ -219,6 +222,9 @@ def test_scanned_structure_member_apply_skips_missing_offset(monkeypatch):
         def get_named_type(self, til, name):
             return True
 
+        def is_udt(self):
+            return True
+
         def get_udt_details(self, udt):
             return True  # empty udt
 
@@ -229,6 +235,61 @@ def test_scanned_structure_member_apply_skips_missing_offset(monkeypatch):
 
     obj = scanner_module.ScannedStructureMemberObject(
         "World", 8, "member_8", 0x401000, 0
+    )
+    obj.apply_type(FakeType("u32"))  # must not raise
+
+
+def test_scanned_structure_member_integral_pointee_skips_silently(monkeypatch):
+    """F.1/R3.7: integral pointees (_DWORD casts) carry no udt — the apply
+    skips at debug level instead of warning that the "structure" is not a
+    known type (IDA's til has no _DWORD named type; it's cast syntax)."""
+    import ida_typeinf
+
+    scanner_module = _load_scanner_module()
+
+    def _fail_load(*a, **k):
+        raise AssertionError("integral pointee must not load a struct")
+
+    monkeypatch.setattr(
+        ida_typeinf,
+        "tinfo_t",
+        lambda *a, **k: SimpleNamespace(
+            get_named_type=lambda til, name: False,
+            is_udt=_fail_load,
+            get_udt_details=_fail_load,
+            set_udt_details=_fail_load,
+        ),
+        raising=False,
+    )
+
+    for name in ("_DWORD", "_QWORD", "unsigned __int32"):
+        obj = scanner_module.ScannedStructureMemberObject(
+            name, 4, "member_4", 0x401000, 0
+        )
+        obj.apply_type(FakeType("u32"))  # must not raise, no IDB touch
+
+
+def test_scanned_structure_member_named_scalar_skips(monkeypatch):
+    """R3.7: a named type that exists but is not a struct/union applies
+    nothing (scalar typedef pointees) — debug-level skip, no warning."""
+    import ida_typeinf
+
+    scanner_module = _load_scanner_module()
+
+    class _FakeScalarTinfo:
+        def get_named_type(self, til, name):
+            return name == "MyDword"
+
+        def is_udt(self):
+            return False
+
+        def get_udt_details(self, udt):
+            raise AssertionError("scalar pointee must not read udt details")
+
+    monkeypatch.setattr(ida_typeinf, "tinfo_t", _FakeScalarTinfo, raising=False)
+
+    obj = scanner_module.ScannedStructureMemberObject(
+        "MyDword", 4, "member_4", 0x401000, 0
     )
     obj.apply_type(FakeType("u32"))  # must not raise
 

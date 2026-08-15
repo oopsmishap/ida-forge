@@ -229,6 +229,29 @@ class ScannedVariableObject(ScannedObject):
         )
 
 
+# Integral pseudo/named spellings that never denote a struct — casts
+# like ``*(_DWORD *)p + n`` make the scanner record member evidence
+# against the pointee NAME; applying "member types" into a scalar is
+# meaningless (and the IDA til does not even carry ``_DWORD`` as a
+# named type — it is Hex-Rays cast syntax, resolved by parse_decl
+# through the R2.5 alias map, never by get_named_type).
+_INTEGRAL_POINTEE_NAMES = frozenset(
+    {
+        "_BYTE", "_WORD", "_DWORD", "_QWORD", "_OWORD",
+        "BYTE", "WORD", "DWORD", "QWORD", "OWORD",
+        "BOOL", "BOOLEAN", "CHAR", "UCHAR",
+        "void", "bool", "char", "signed char", "unsigned char",
+        "short", "unsigned short", "int", "unsigned int",
+        "long", "unsigned long", "long long", "unsigned long long",
+        "__int8", "__int16", "__int32", "__int64", "__int128",
+        "unsigned __int8", "unsigned __int16", "unsigned __int32",
+        "unsigned __int64", "unsigned __int128",
+        "float", "double", "long double",
+        "u8", "u16", "u32", "u64", "u128", "i8", "i16", "i32", "i64",
+    }
+)
+
+
 class ScannedStructureMemberObject(ScannedObject):
     def __init__(
         self,
@@ -251,7 +274,8 @@ class ScannedStructureMemberObject(ScannedObject):
         ``udt_member.set_type`` and commits with ``set_udt_details``.
         Best-effort: any failure logs the reason; the warning that used
         to say "not supported yet" only remains when nothing could be
-        applied.
+        applied. Integral pointees (``*(_DWORD *)p`` casts) have no
+        udt to edit — those skips are debug-level, not warnings.
         """
         if not self._applicable:
             return
@@ -260,9 +284,21 @@ class ScannedStructureMemberObject(ScannedObject):
             if not struct_tinfo.get_named_type(
                 ida_typeinf.get_idati(), self._name
             ):
+                if self._name in _INTEGRAL_POINTEE_NAMES:
+                    log_debug(
+                        f"{self._name} is an integral pointee, not a "
+                        f"struct; member {self.name} apply skipped"
+                    )
+                    return
                 log_warning(
                     f"Structure {self._name} is not a known type; "
                     f"member {self.name} type was not applied"
+                )
+                return
+            if not struct_tinfo.is_udt():
+                log_debug(
+                    f"{self._name} is not a struct/union; member "
+                    f"{self.name} apply skipped"
                 )
                 return
             udt = ida_typeinf.udt_type_data_t()

@@ -2,6 +2,23 @@
 
 All notable changes are tracked here. Format: date — change set (branch/commit).
 
+## 2026-08-15 — R3.7 integral-pointee member-apply noise fix
+
+Recurring `WARNING: Structure _DWORD is not a known type; member ...
+type was not applied` during commits/reapply: scans of cast-heavy
+bodies record member evidence against integral pointees
+(`*(_DWORD *)p + k`), and `ScannedStructureMemberObject.apply_type`
+tried to edit a "struct" named `_DWORD` — which is Hex-Rays cast
+syntax, not a til type (live-verified: `get_named_type(…, "_DWORD")`
+is False on the fixture; `_DWORD` only parses via the R2.5 alias map).
+Fix:
+- `apply_type` skips at debug level when the pointee name is an
+  integral spelling (`_BYTE.._QWORD`, `__intN`, `unsigned __intN`,
+  `uN`/`iN`, natives) and when the named type exists but is not a
+  struct/union (scalar typedefs). Real missing-struct warnings stay.
+- Live: chain scan + commit + reapply → 0 warnings before/after fix
+  (was N warnings per pass); 661 tests green, ruff clean.
+
 ## 2026-08-15 — R3.5/R3.6 scan-evidence visibility + IDB persistence
 
 The eval agent scanned structures, then hand-rebuilt them via
