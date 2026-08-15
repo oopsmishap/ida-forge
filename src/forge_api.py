@@ -1066,6 +1066,7 @@ def apply_type(
     import re as _re
 
     import ida_bytes
+    import ida_idaapi
     import ida_name
     import ida_typeinf
 
@@ -1084,6 +1085,7 @@ def apply_type(
     if redefine_range:
         size = tinfo.get_size()
         if size is not None and size > 0 and size != ida_typeinf.BADSIZE:
+            user_named = False
             for head in range(ea, ea + size):
                 if head == ea:
                     continue
@@ -1095,9 +1097,40 @@ def apply_type(
                 # Keep user-typed names; strip the auto qword_/xmmword_
                 # shadowing names so the struct owns the range.
                 if hasattr(ida_bytes, "has_user_name") and ida_bytes.has_user_name(flags):
+                    user_named = True
                     continue
                 ida_name.del_global_name(head)
             ida_bytes.del_items(ea, ida_bytes.DELIT_SIMPLE, ea + size)
+            # Recovery-eval gap #4 (2026-08-13): apply_tinfo(definite) only
+            # redefines the FIRST item; the rest of a multi-field global
+            # stays scalar until auto-analysis re-splits it (and idalib
+            # races the item back to 1 B without auto_wait). For plain
+            # UDTs, create the full-size struct item over the whole span,
+            # then settle analysis. Skip when user-named sub-heads would
+            # be swallowed.
+            is_udt = getattr(tinfo, "is_udt", None)
+            spans_struct = (
+                callable(is_udt)
+                and is_udt()
+                and not user_named
+            )
+            if spans_struct:
+                try:
+                    import ida_auto
+
+                    tid = tinfo.get_tid() if hasattr(tinfo, "get_tid") else 0
+                    if (
+                        tid
+                        and tid != ida_idaapi.BADADDR
+                        and ida_bytes.create_struct(ea, size, tid)
+                    ):
+                        ida_auto.auto_wait()
+                except Exception as exc:  # noqa: BLE001 — fall back to single-item apply
+                    from forge.util.logging import log_debug
+
+                    log_debug(
+                        f"create_struct fallback needed for {hex(ea)}: {exc}"
+                    )
 
     ida_typeinf.apply_tinfo(ea, tinfo, ida_typeinf.TINFO_DEFINITE)
     return {"ok": True, "ea": ea, "type": tinfo.dstr()}
@@ -2118,6 +2151,44 @@ def _apply_root_retype(cfunc, obj, target_decl: str):
     return _decompile(getattr(cfunc, "entry_ea", None) or 0)
 
 
+def _root_prior_type(obj) -> str | None:
+    """The lvar's type string BEFORE a scan retype (for restore-on-fail)."""
+    lvar = getattr(obj, "lvar", None)
+    if lvar is None:
+        return None
+    try:
+        current = lvar.type()
+        if current is None:
+            return None
+        return current.dstr()
+    except Exception:  # noqa: BLE001 — unqueryable lvar type: nothing to restore
+        return None
+
+
+def _restore_root_type(cfunc, obj, prior_decl: str) -> None:
+    """Best-effort undo of ``_apply_root_retype`` (recovery-eval gap #3)."""
+    if not prior_decl:
+        return
+    lvar = getattr(obj, "lvar", None)
+    if lvar is None:
+        return
+    try:
+        from forge.api.hexrays import set_lvar_type
+        from forge.api.members import parse_user_tinfo
+
+        tinfo = parse_user_tinfo(prior_decl)
+        if tinfo is None:
+            return
+        if set_lvar_type(cfunc, lvar, tinfo):
+            from forge.api.hexrays import mark_cfunc_dirty as _dirty
+
+            _dirty(getattr(cfunc, "entry_ea", None) or 0)
+    except Exception as exc:  # noqa: BLE001 — restore is best-effort
+        from forge.util.logging import log_debug
+
+        log_debug(f"root restore failed: {exc}")
+
+
 def _resolve_scan_root(
     cfunc, *, var_name: str | None = None, var_index: int | None = None, item_ea: int | None = None
 ):
@@ -2209,6 +2280,7 @@ def deep_scan(
     obj = _resolve_scan_root(cfunc, var_name=var_name, var_index=var_index, item_ea=item_ea)
     if obj is None:
         return {"ok": False, "error": "could not resolve a scan root (default: first argument)"}
+    prior_type = _root_prior_type(obj)
     root_decl = _root_retype_target(obj, root_type)
     if root_decl is not None:
         refreshed = _apply_root_retype(cfunc, obj, root_decl)
@@ -2218,10 +2290,15 @@ def deep_scan(
                 cfunc, var_name=var_name, var_index=var_index, item_ea=item_ea
             )
             if obj is None:
+                # Recovery-eval gap #3 (2026-08-13): a retype that cannot be
+                # scanned must not be left on the lvar — restore the prior
+                # type so a failed scan is invisible to the analyst.
+                _restore_root_type(refreshed, prior_type)
                 return {
                     "ok": False,
                     "error": "could not resolve a scan root after retype",
                 }
+    pre_count = len(target.members)
     visitor = NewDeepScanVisitor(
         cfunc,
         target.main_offset,
@@ -2231,6 +2308,10 @@ def deep_scan(
         max_depth=max_depth,
     )
     visitor.process()
+    if prior_type and pre_count == 0 and len(target.members) == 0:
+        # The retype produced no evidence at all — undo it so the lvar is
+        # not silently re-typed by a failed scan (gap #3).
+        _restore_root_type(cfunc, obj, prior_type)
     _mark_dirty()
     return _scan_result(target)
 
@@ -2269,6 +2350,7 @@ def shallow_scan(
     obj = _resolve_scan_root(cfunc, var_name=var_name, var_index=var_index, item_ea=item_ea)
     if obj is None:
         return {"ok": False, "error": "could not resolve a scan root (default: first argument)"}
+    prior_type = _root_prior_type(obj)
     root_decl = _root_retype_target(obj, root_type)
     if root_decl is not None:
         refreshed = _apply_root_retype(cfunc, obj, root_decl)
@@ -2278,12 +2360,16 @@ def shallow_scan(
                 cfunc, var_name=var_name, var_index=var_index, item_ea=item_ea
             )
             if obj is None:
+                _restore_root_type(refreshed, prior_type)
                 return {
                     "ok": False,
                     "error": "could not resolve a scan root after retype",
                 }
+    pre_count = len(target.members)
     visitor = NewShallowScanVisitor(cfunc, target.main_offset, obj, target)
     visitor.process()
+    if prior_type and pre_count == 0 and len(target.members) == 0:
+        _restore_root_type(cfunc, obj, prior_type)
     _mark_dirty()
     return _scan_result(target)
 
@@ -2404,6 +2490,47 @@ def _add_named_sub_heads(target, ea: int, span: int):
 # --------------------------------------------------------------------------- #
 # build / apply / finalize
 # --------------------------------------------------------------------------- #
+_C_RESERVED_KEYWORDS = frozenset(
+    {
+        "_Alignas", "_Alignof", "auto", "bool", "break", "case", "char",
+        "const", "continue", "default", "do", "double", "else", "enum",
+        "extern", "float", "for", "goto", "if", "inline", "int", "long",
+        "register", "restrict", "return", "short", "signed", "sizeof",
+        "static", "struct", "switch", "typedef", "union", "unsigned",
+        "void", "volatile", "while",
+    }
+)
+
+
+def _commit_failure_reason(cdecl: str, name: str) -> str:
+    """Explain why committing ``cdecl`` as ``name`` failed.
+
+    Recovery-eval gap #1 (2026-08-13): a store struct named ``inline``
+    committed nothing while the facade reported only "failed to recreate
+    type after delete" — the IDB parser rejects reserved-keyword tags
+    (and other malformed declarations) without an error channel. Probe
+    the parser and name to hand back a real reason.
+    """
+    import ida_typeinf
+
+    if name in _C_RESERVED_KEYWORDS:
+        return (
+            f"{name!r} is a C keyword — the IDB type parser rejects it; "
+            "rename the structure (e.g. inline -> inline_node)"
+        )
+    errors = 0
+    try:
+        errors = ida_typeinf.idc_parse_types(cdecl, 0) or 0
+    except Exception:  # noqa: BLE001 — parser probe is best-effort
+        errors = -1
+    if errors > 0:
+        return (
+            f"IDB type parser rejected the declaration "
+            f"({errors} error(s)) — reserved keyword or unresolved member type"
+        )
+    return "type parser accepted the declaration but no type materialized"
+
+
 def _is_forge_placeholder_type(name: str) -> bool:
     """True when ``name`` is a lazy placeholder this plugin seeded earlier.
 
@@ -2475,7 +2602,8 @@ def create_type(name: str | None = None, *, overwrite: bool = False) -> dict:
         if overwrite is True:
             return {
                 "ok": False,
-                "error": "failed to recreate type after delete (see IDA log)",
+                "error": "failed to recreate type after delete — "
+                + _commit_failure_reason(cdecl, target.name),
             }
         return {"ok": False, "error": "type already exists (overwrite disabled)"}
     return {
@@ -2544,7 +2672,13 @@ def finalize(name: str | None = None) -> dict:
     if tinfo is None:
         if unresolved:
             return {"ok": False, "unresolved": unresolved}
-        return {"ok": False, "error": "failed to create type (see IDA log for reason)"}
+        return {
+            "ok": False,
+            "error": "failed to create type — "
+            + _commit_failure_reason(
+                f"struct {target.name} {{ }};", target.name
+            ),
+        }
     return {
         "ok": True,
         "type_name": target.created_type_name,

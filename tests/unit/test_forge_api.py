@@ -203,14 +203,21 @@ def test_create_type_overwrite_validates_declaration_before_delete(monkeypatch):
 
 def test_create_type_overwrite_reports_failed_recreate(monkeypatch):
     """R10: overwrite=True where set_cdecl still fails (delete/recreate
-    failure) returns the distinct recreate error, never "already exists"."""
+    failure) returns the distinct recreate error, never "already exists";
+    since the recovery eval (2026-08-13) it carries the parser reason."""
     _commit_stubs(monkeypatch, parses=True, set_result=None)
     forge_api.create_structure("S")
     forge_api.add_member("S", 0, "u32")
 
     result = forge_api.create_type("S", overwrite=True)
 
-    assert result == {"ok": False, "error": "failed to recreate type after delete (see IDA log)"}
+    assert result == {
+        "ok": False,
+        "error": (
+            "failed to recreate type after delete — "
+            "type parser accepted the declaration but no type materialized"
+        ),
+    }
 
 
 def test_create_type_overwrite_success_returns_type_name(monkeypatch):
@@ -291,7 +298,10 @@ def test_finalize_reports_error_when_commit_fails(monkeypatch):
 
     assert result == {
         "ok": False,
-        "error": "failed to create type (see IDA log for reason)",
+        "error": (
+            "failed to create type — "
+            "type parser accepted the declaration but no type materialized"
+        ),
     }
     assert "unresolved" not in result
 
@@ -462,7 +472,10 @@ def test_deep_scan_root_type_hint_overrides_integral_auto(monkeypatch, _real_hex
 
     forge_api.deep_scan(0x401000, var_name="a1", root_type="World *")
 
-    assert retyped == ["World *"]
+    # Gap #3 (recovery eval 2026-08-13): the stub scan produces no
+    # evidence, so the root retype is undone — a failed scan must not
+    # leave the lvar re-typed.
+    assert retyped == ["World *", "__int64"]
 
 
 def test_deep_scan_skips_retype_for_pointer_root(monkeypatch, _real_hexrays):
@@ -1919,3 +1932,45 @@ def test_nudge_members_unknown_offsets_are_loud(monkeypatch):
 
     assert result["ok"] is False
     assert "0x18" in result["error"]
+
+
+def _commit_fails(monkeypatch):
+    from forge.api import structure as structure_mod
+
+    _commit_structure_stubs(monkeypatch)
+    monkeypatch.setattr(
+        structure_mod.Structure,
+        "set_cdecl",
+        lambda self, cdecl, origin=0, *, overwrite=None: None,
+        raising=False,
+    )
+
+
+def test_create_type_reports_keyword_tag_plainly(monkeypatch):
+    """Recovery-eval gap #1: `struct inline` is silently rejected by the
+    IDB parser; the facade must say the name is a C keyword, not the
+    generic 'failed to recreate'."""
+    _commit_fails(monkeypatch)
+    forge_api.create_structure("inline")
+
+    result = forge_api.create_type("inline", overwrite=True)
+
+    assert result["ok"] is False
+    assert "C keyword" in result["error"]
+
+
+def test_create_type_reports_parser_rejection(monkeypatch):
+    """Recovery-eval gap #1: a declaration the IDB parser rejects surfaces
+    the parser error count."""
+    import ida_typeinf
+
+    _commit_fails(monkeypatch)
+    monkeypatch.setattr(ida_typeinf, "idc_parse_types", lambda *a, **k: 4, raising=False)
+    forge_api.create_structure("S")
+    forge_api.add_member("S", 0, "u32", name="x")
+
+    result = forge_api.create_type("S", overwrite=True)
+
+    assert result["ok"] is False
+    assert "rejected" in result["error"]
+    assert "4" in result["error"]

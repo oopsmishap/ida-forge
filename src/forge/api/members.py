@@ -434,6 +434,19 @@ class Member(AbstractMember):
                 rebuilt = parse_user_tinfo(f"{type_name} {suffix}".rstrip())
                 if rebuilt is not None:
                     return rebuilt
+        # Recovery-eval gap #5 (2026-08-13): scanner-copied tinfos also go
+        # stale when a named type is re-filed (inline-child members kept
+        # binding the 48-byte child after it shrank to 44). Re-parse the
+        # CURRENT declaration text — the fresh til resolve re-binds the
+        # size/ordinal. Anything that no longer parses keeps the stored
+        # handle.
+        if raw:
+            try:
+                fresh = parse_user_tinfo(raw)
+                if fresh is not None:
+                    return fresh
+            except Exception as exc:  # noqa: BLE001 — degraded tils degrade to the stored handle
+                log_debug(f"pack re-parse of {raw!r} failed: {exc}")
         return None
 
     def get_udt_member(self, array_size: int = 0, offset: int = 0):

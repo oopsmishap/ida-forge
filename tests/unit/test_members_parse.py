@@ -243,6 +243,30 @@ def test_resolve_pack_tinfo_prefers_decl_src(monkeypatch):
     assert resolved.dstr() == "KV *"
 
 
+def test_resolve_pack_tinfo_reparses_named_reference(monkeypatch):
+    """Recovery-eval gap #5: a scanner-copied tinfo that names an IDB type
+    goes stale when the type is re-filed (inline-child members kept binding
+    a 48-byte child after it shrank) — packing re-parses the CURRENT
+    declaration text and re-binds the fresh size."""
+    from types import SimpleNamespace
+
+    parsed = []
+
+    def _fake_parse(decl):
+        parsed.append(decl)
+        return SimpleNamespace(dstr=lambda: decl, get_size=lambda: 44)
+
+    monkeypatch.setattr(members, "parse_user_tinfo", _fake_parse, raising=False)
+
+    stale = members.Member.__new__(members.Member)
+    stale.offset = 0x10
+    stale.tinfo = SimpleNamespace(dstr=lambda: "inline_child")
+    resolved = stale._resolve_pack_tinfo()
+
+    assert parsed == ["inline_child"]
+    assert resolved.dstr() == "inline_child"
+
+
 def test_virtual_table_init_wires_origin_and_scanned_variable(monkeypatch):
     monkeypatch.setattr(
         members.VirtualTable, "populate_virtual_functions", lambda self: None
