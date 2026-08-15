@@ -2,6 +2,43 @@
 
 All notable changes are tracked here. Format: date — change set (branch/commit).
 
+## 2026-08-15 — R3.2 recovery-eval gap-fix wave (F1–F7)
+
+Recovery-eval round 2 gaps closed: four real fixes, one exercised-at-
+probe feature, two documented IDA-inherent behaviors. 651 tests green
+(baseline 632), ruff clean, live probe 7/7.
+
+- **F1 pack**: store structures pack by default — every commit is
+  `#pragma pack(push, 1)` (wrapped at the `Structure.set_cdecl` choke
+  point; parse_decl gates strip the pragma, `idc_parse_types` accepts
+  it). `create_structure(pack=N)` / new `set_pack(name, N≥1|None)` verb
+  control the alignment; `pack` persists through the catalog
+  serialize/deserialize round trip (legacy catalogs default packed) and
+  `duplicate_structure` carries it.
+- **F2 rename verb**: `rename_member(name, offset, new_name)` renames a
+  COMMITTED IDB struct member (gap_* entries included) in place via
+  `tinfo_t.rename_udm` — til-persistent, packed layout preserved (9.4
+  live finding: there is no `update_named_type` on this build and
+  `create_udt` re-aligns pack-derived offsets; older builds fall back
+  to udt-rebuild + `update_named_type`, then the delete+re-file tail).
+  Bit-unit udt offsets from `get_udt_details` are accepted. The store
+  is untouched — rename after the last re-commit.
+- **F3 function-pointer typedefs**: `create_typedef` write ladder now
+  tries the declarator-name form (`typedef int (__cdecl *DispatchFn)
+  (...);`) when `typedef <decl> <name>;` is rejected, before the
+  hexrays fallback.
+- **F4 scanner teleport**: `scan_from_allocation` on a helper-mediated
+  row (callee set — the folded-size_hint shape included) decompiles the
+  callee, resolves its returned-variable allocation through the E.22
+  alias-chain machinery, deep-scans the callee, and merges both
+  evidence sets by byte offset (higher score wins, ties to the callee).
+- **F5/F6 documented**: Hex-Rays `lea`-only global member rendering and
+  apply-span erosion notes added to the eval doc's "Forge state" list;
+  the probe's double-apply reproduced no erosion — no code change.
+- **F7 aliases completed**: the intN/uintN map now lands on IDA-native
+  tokens in one pass (`u32`→`unsigned __int32`, `_DWORD`→
+  `unsigned __int32`, ...); add_member accepts the shorthand.
+
 ## 2026-08-15 — R3.1 update-not-delete wave (eval round 3)
 
 Agent-facing delete paths removed; committed types are updated in place.

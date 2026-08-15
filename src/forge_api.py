@@ -74,6 +74,7 @@ __all__ = [
     "remove_structure",
     "rename_ea",
     "rename_local",
+    "rename_member",
     "rename_structure",
     "scan_from_allocation",
     "scan_global",
@@ -82,6 +83,7 @@ __all__ = [
     "set_func_proto",
     "set_lvar_types",
     "set_member",
+    "set_pack",
     "shallow_scan",
     "signature",
     "split_flags",
@@ -318,6 +320,7 @@ def _to_structure_dict(structure) -> dict:
         "name": structure.name,
         "main_offset": structure.main_offset,
         "created_type_name": structure.created_type_name,
+        "pack": structure.pack,
         "members": [_to_member_dict(member) for member in structure.members],
         "collisions": list(structure.collisions),
         "child_relationships": [
@@ -1395,10 +1398,13 @@ def get_member(
 @api(
     group="structures",
     returns="dict",
-    example='s = forge_api.create_structure("Recovered")',
+    example='s = forge_api.create_structure("Recovered", pack=None)',
 )
 def create_structure(
-    name: str, members: list[dict] | None = None, origin: int = 0
+    name: str,
+    members: list[dict] | None = None,
+    origin: int = 0,
+    pack: int | None = 1,
 ) -> dict:
     """Create a structure in the headless store and select it.
 
@@ -1408,14 +1414,20 @@ def create_structure(
     :class:`ForgeApiError` when the name already exists in the store. Nothing is
     written to the IDB until :func:`create_type`/:func:`finalize`.
 
+    ``pack`` sets the byte-alignment of the committed layout (default 1 =
+    fully packed; ``None`` = natural alignment). Applied when the structure
+    is committed; change it later with :func:`set_pack`.
+
     Returns:
         the new structure's dict (see :func:`get_structure`).
     """
     from forge.api.structure import Structure
 
+    _validate_pack(pack)
     if name in _structures:
         raise ForgeApiError(f"structure {name!r} already exists")
     structure = Structure(name)
+    structure.pack = pack
     _structures[name] = structure
     _state.current = name
     # E3 (eval review 2026-08-13): a member whose type references the
@@ -1848,6 +1860,7 @@ def duplicate_structure(name: str) -> str:
     new_name = _unique_structure_name(source.name)
     cloned = Structure(new_name)
     cloned.main_offset = source.main_offset
+    cloned.pack = source.pack
     cloned.members = [
         _copy.copy(member) for member in source.members
     ]
@@ -1861,6 +1874,30 @@ def duplicate_structure(name: str) -> str:
     cloned.refresh_collisions()
     _state.current = new_name
     return new_name
+
+
+@api(
+    group="structures",
+    returns="dict",
+    example='r = forge_api.set_pack("Outer", None)',
+)
+def set_pack(name: str | None = None, pack: int | None = 1) -> dict:
+    """Set the byte-alignment of a store structure's committed layout.
+
+    ``pack`` is the ``#pragma pack(push, N)`` alignment used when the
+    structure is committed: default ``1`` (fully packed — the store's
+    default, matching recovery-eval layouts); ``None`` restores natural
+    alignment. Int >= 1 or None only (raises :class:`ForgeApiError`).
+    Takes effect on the next ``create_type``/``finalize`` commit.
+
+    Returns:
+        ``{"ok": True, "pack": pack}``.
+    """
+    structure = _resolve_structure(name, required=True)
+    _validate_pack(pack)
+    structure.pack = pack
+    _mark_dirty()
+    return {"ok": True, "pack": pack}
 
 
 @api(
@@ -3178,6 +3215,18 @@ def _validate_member_name(name: str) -> None:
         raise ForgeApiError(f"{name} is a C keyword — rename the member")
 
 
+def _validate_pack(pack: int | None) -> None:
+    """Reject pack values the pragma verb cannot express (R3.2 F1).
+
+    ``#pragma pack(push, N)`` requires ``N`` a positive integer; None is
+    the natural-alignment opt-out.
+    """
+    if pack is not None and (not isinstance(pack, int) or pack < 1):
+        raise ForgeApiError(
+            f"pack must be an int >= 1 or None, got {pack!r}"
+        )
+
+
 def _commit_failure_reason(cdecl: str, name: str) -> str:
     """Explain why committing ``cdecl`` as ``name`` failed.
 
@@ -3349,6 +3398,26 @@ def create_type(name: str | None = None, *, overwrite: bool = False) -> dict:
     }
 
 
+def _typedef_declarator_name(declaration: str, name: str) -> str | None:
+    """Insert ``name`` after the pointer star of a function-pointer
+    declarator (R3.2 F3).
+
+    IDA's parser rejects the abstract-declarator-then-name form
+    (``typedef int (__cdecl *)(void *, unsigned int) NAME;``); naming the
+    pointer declarator directly (``int (__cdecl *NAME)(void *, unsigned
+    int)``) parses. Returns None when the declaration has no
+    function-pointer declarator to rewrite.
+    """
+    if not re.search(r"\(\s*(?:__\w+\s+)?\*", declaration):
+        return None
+    return re.sub(
+        r"(\(\s*(?:__\w+\s+)?\*)(\s*)\)",
+        lambda m: f"{m.group(1)}{name}{m.group(2)})",
+        declaration,
+        count=1,
+    )
+
+
 @api(
     group="types",
     returns="dict",
@@ -3363,9 +3432,12 @@ def create_typedef(name: str, declaration: str) -> dict:
     The typedef commits as ``typedef <declaration> <name>;`` through
     ``forge_types.create_type`` (the pure IDB-write path used by every
     commit — no pseudocode-view dependency); when that write fails, the
+    declarator-name form (``typedef int (__cdecl *NAME)(...);``) is tried
+    — IDA's parser rejects abstract declarators — and then the
     ``ida_hexrays.create_typedef`` mechanism (the templated-types path)
-    materializes the named type as a fallback. Typedefs live in the type
-    table like any other named type (:func:`type_of` reads them back).
+    materializes the named type as a last-resort fallback. Typedefs live
+    in the type table like any other named type (:func:`type_of` reads
+    them back).
 
     Returns:
         ``{"ok": bool, "type": str}``, or an error dict when the
@@ -3374,6 +3446,7 @@ def create_typedef(name: str, declaration: str) -> dict:
     _require_ida()
     from forge.api.members import parse_user_tinfo
 
+    _validate_member_name(name)
     if parse_user_tinfo(declaration) is None:
         return {
             "ok": False,
@@ -3387,6 +3460,12 @@ def create_typedef(name: str, declaration: str) -> dict:
     if forge_types.create_type(name, f"typedef {declaration} {name};"):
         return {"ok": True, "type": name}
 
+    declarator_name = _typedef_declarator_name(declaration, name)
+    if declarator_name is not None and forge_types.create_type(
+        name, f"typedef {declarator_name};"
+    ):
+        return {"ok": True, "type": name}
+
     create_typedef_fn = getattr(ida_hexrays, "create_typedef", None)
     if callable(create_typedef_fn):
         try:
@@ -3396,6 +3475,176 @@ def create_typedef(name: str, declaration: str) -> dict:
         if is_type(name):
             return {"ok": True, "type": name}
     return {"ok": False, "type": name, "error": "typedef write failed"}
+
+
+@api(
+    group="types",
+    returns="dict",
+    example='r = forge_api.rename_member("Outer", 0x10, "bag_fixed")',
+)
+def rename_member(name: str, offset: int, new_name: str) -> dict:
+    """Rename a member of a COMMITTED IDB named struct type at byte
+    ``offset`` (recovery-eval round 2 F2: the ``gap_*`` auto-fill entries
+    the store never had, which reappear on every re-commit).
+
+    The store is NOT changed — this renames the live IDB type only. A
+    later ``create_type(overwrite=True)`` re-commits the store's member
+    set, losing the rename: rename AFTER the last re-commit.
+
+    Returns:
+        ``{"ok": True, "type", "offset", "from", "to"}``, or an error
+        dict when the type is missing, the offset has no member, or the
+        IDB write fails.
+    """
+    _require_ida()
+    _validate_member_name(new_name)
+
+    import ida_typeinf
+
+    tinfo = ida_typeinf.tinfo_t()
+    if not tinfo.get_named_type(ida_typeinf.get_idati(), name):
+        return {"ok": False, "error": f"no type {name}"}
+
+    udt = ida_typeinf.udt_type_data_t()
+    if not tinfo.get_udt_details(udt):
+        return {"ok": False, "error": f"{name} is not a struct/union type"}
+
+    # Live 9.4 finding: get_udt_details reports offsets in BITS (the
+    # byte-vs-bit convention differs across builds) — accept the byte
+    # offset when the raw value is bit-clean (same rule as type_of).
+    index = None
+    for idx, member in enumerate(udt):
+        raw = getattr(member, "offset", None)
+        if raw == offset or (
+            raw is not None and raw % 8 == 0 and raw // 8 == offset
+        ):
+            index = idx
+            break
+    if index is None:
+        return {"ok": False, "error": f"no member at offset {hex(offset)}"}
+
+    prev = udt[index].name
+    if prev == new_name:
+        return {
+            "ok": True,
+            "type": name,
+            "offset": offset,
+            "from": prev,
+            "to": new_name,
+        }
+
+    # Live 9.4 finding (R3.2 probe): tinfo_t.rename_udm mutates the named
+    # type IN PLACE — the rename is til-persistent and the packed layout
+    # survives (no commit verb, no udt rebuild; the 9.4 build has no
+    # update_named_type, and create_udt on pack-derived offsets errors).
+    rename_udm = getattr(tinfo, "rename_udm", None)
+    if callable(rename_udm):
+        code = None
+        rename_err = None
+        try:
+            code = rename_udm(index, new_name)
+        except Exception as exc:  # noqa: BLE001 — version/format tolerance
+            rename_err = str(exc)
+        if code == getattr(ida_typeinf, "TERR_OK", 0):
+            return {
+                "ok": True,
+                "type": name,
+                "offset": offset,
+                "from": prev,
+                "to": new_name,
+            }
+        return {
+            "ok": False,
+            "type": name,
+            "error": f"rename failed ({code if code is not None else rename_err})",
+        }
+
+    # Older builds / stubs: get_udt_details COPIES the member data out;
+    # bake the mutation back into the tinfo (preserving the pack
+    # attribute) and commit via update_named_type, else delete+re-file.
+    prev_pack = getattr(udt, "pack", None)
+    udt[index].name = new_name
+    is_union = getattr(tinfo, "is_union", None)
+    if callable(is_union) and is_union():
+        udt_flags = getattr(ida_typeinf, "BTF_UNION", None) or 0
+    else:
+        udt_flags = getattr(ida_typeinf, "BTF_STRUCT", None) or 0
+    try:
+        rebuilt = tinfo.create_udt(udt, udt_flags)
+    except Exception:  # noqa: BLE001 — unrebuildable udt degrades loudly
+        rebuilt = False
+    if not rebuilt:
+        return {
+            "ok": False,
+            "type": name,
+            "error": f"failed to rebuild {name} with the renamed member",
+        }
+    try:
+        if prev_pack not in (None, 0, -1):
+            set_pack = getattr(tinfo, "set_udt_pack", None)
+            if callable(set_pack):
+                set_pack(prev_pack)
+    except Exception as exc:  # noqa: BLE001 — pack rescue is best-effort
+        from forge.util.logging import log_debug
+
+        log_debug(f"pack rescue after rename failed: {exc}")
+
+    update_fn = getattr(ida_typeinf, "update_named_type", None)
+    if callable(update_fn):
+        try:
+            if update_fn(ida_typeinf.get_idati(), name, tinfo):
+                return {
+                    "ok": True,
+                    "type": name,
+                    "offset": offset,
+                    "from": prev,
+                    "to": new_name,
+                }
+        except Exception as exc:  # noqa: BLE001 — fall back to delete+re-file
+            from forge.util.logging import log_debug
+
+            log_debug(f"rename_member in-place update unavailable: {exc}")
+
+    # Fallback (stubs / older IDA): serialize the edited udt and re-file it,
+    # mirroring the apply_new_field tail (live-proven on 9.4).
+    import idaapi as _idaapi
+
+    cdecl = _idaapi.print_tinfo(
+        None,
+        4,
+        5,
+        _idaapi.PRTYPE_MULTI | _idaapi.PRTYPE_TYPE | _idaapi.PRTYPE_SEMI,
+        tinfo,
+        name,
+        None,
+    )
+    if not cdecl:
+        return {
+            "ok": False,
+            "type": name,
+            "error": f"failed to serialize {name} after rename",
+        }
+    previous_ordinal = _idaapi.get_type_ordinal(_idaapi.cvar.idati, name)
+    if previous_ordinal:
+        _idaapi.del_numbered_type(_idaapi.cvar.idati, previous_ordinal)
+        ordinal = _idaapi.idc_set_local_type(
+            previous_ordinal, cdecl, _idaapi.PT_TYP
+        )
+    else:
+        ordinal = _idaapi.idc_set_local_type(-1, cdecl, _idaapi.PT_TYP)
+    if not ordinal:
+        return {
+            "ok": False,
+            "type": name,
+            "error": f"failed to re-file {name} after rename",
+        }
+    return {
+        "ok": True,
+        "type": name,
+        "offset": offset,
+        "from": prev,
+        "to": new_name,
+    }
 
 
 @api(
@@ -4285,6 +4534,91 @@ def create_field(
     return result
 
 
+def _helper_allocation_row(callee_ea: int) -> dict | None:
+    """Teleport target for helper-mediated allocations (R3.2 F4).
+
+    When an allocation is invisible at the call site (the variable is
+    assigned the result of a non-allocator helper, E.22), the REAL
+    allocator may live inside the helper's body. Decompile the callee
+    and resolve each ``return <var>`` through the same machinery the
+    caller-side guesser uses (direct assignment match, then the ≤2-hop
+    ``v = w`` alias chain, then a pointer-typed-return fallback row).
+    Returns the first resolved HEAP row, else None. Live finding
+    (9.4, 2026-08-15): re-rooting a whole ``GuessAllocationVisitor`` at
+    the returned lvar yields nothing — its upward walk stops at the
+    ``v = cast(w)`` chain — the alias-chain pass is the proven shape.
+    """
+    from forge.api.hexrays import ctype as _ct
+    from forge.api.hexrays import decompile as _decompile
+    from forge.api.hexrays import iter_returned_exprs
+    from forge.features.guess_allocation.guess_allocation import GuessAllocationVisitor
+
+    cfunc = _decompile(callee_ea)
+    if cfunc is None:
+        return None
+    asg_op = getattr(_ct, "asg", None)
+    finder = GuessAllocationVisitor.__new__(GuessAllocationVisitor)
+
+    def _resolved(returned):
+        alloc_obj = finder._find_allocator_assignment(cfunc, returned, asg_op)
+        if alloc_obj is not None:
+            return alloc_obj
+        hop_source = returned
+        for _hop in range(2):
+            hop_target = finder._aliased_hop_target(cfunc, hop_source, asg_op)
+            if hop_target is None:
+                break
+            alloc_obj = finder._find_allocator_assignment(
+                cfunc, hop_target, asg_op
+            )
+            if alloc_obj is not None:
+                return alloc_obj
+            hop_source = hop_target
+        return None
+
+    for returned in iter_returned_exprs(cfunc):
+        if returned is None:
+            continue
+        var_node = getattr(returned, "v", None)
+        var_name = getattr(var_node, "name", None)
+        alloc_obj = _resolved(returned)
+        if alloc_obj is None and not finder._expr_type_is_pointer(returned):
+            continue
+        return {
+            "ea": getattr(alloc_obj, "ea", None) if alloc_obj is not None else callee_ea,
+            "var": var_name,
+            "line": f"return value of {hex(callee_ea)}",
+            "kind": "HEAP",
+            "size_hint": getattr(alloc_obj, "size", None) if alloc_obj is not None else None,
+            "callee": None,
+        }
+    return None
+
+
+def _merge_member_rows(base: list[dict], extra: list[dict]) -> list[dict]:
+    """Offset-union of two member-row sets (R3.2 F4).
+
+    Same-offset duplicates keep the higher ``score``; ties keep
+    ``extra``'s row (the callee's real init writes).
+    """
+    merged: dict[int, dict] = {}
+    for row in base:
+        merged.setdefault(row.get("offset"), row)
+    for row in extra:
+        offset = row.get("offset")
+        existing = merged.get(offset)
+        if existing is None:
+            merged[offset] = row
+            continue
+        rank_new = row.get("score")
+        rank_old = existing.get("score")
+        if (rank_new if rank_new is not None else 0) >= (
+            rank_old if rank_old is not None else 0
+        ):
+            merged[offset] = row
+    return list(merged.values())
+
+
 @api(
     group="scan",
     returns="dict",
@@ -4313,6 +4647,12 @@ def scan_from_allocation(
     Returns ``{"ok": False, "error": ...}`` when the variable has no heap
     allocation. Success returns ``{"ok": True, "allocation": <row>,
     "structure": <name>, "members": [...]}``.
+
+    R3.2 (F4): when the chosen allocation row is helper-mediated
+    (``callee`` set — the allocator lives inside the helper body), the
+    helper's body is ALSO scanned — the real allocator inside the callee
+    (found via its first returned lvar) yields evidence the call site
+    cannot show; both evidence sets are merged by byte offset.
 
     Returns:
         dict.
@@ -4355,6 +4695,26 @@ def scan_from_allocation(
         with contextlib.suppress(Exception):
             set_lvar_types(ea, {allocation["var"]: restore_type})
     members = scan_result.get("members", [])
+
+    # R3.2 (F4): helper-mediated rows — teleport into the helper body:
+    # scan the callee's returned-allocation root and compose both
+    # evidence sets (offset union, higher score wins, ties to the callee).
+    # Live 9.4 finding: helper rows can carry a folded size_hint (the
+    # guesser resolves the calloc THROUGH the callee) — the gate is the
+    # callee itself, not size_hint.
+    if allocation.get("callee"):
+        callee_row = _helper_allocation_row(allocation["callee"])
+        if callee_row is not None:
+            callee_scan = deep_scan(
+                allocation["callee"],
+                var_name=callee_row["var"],
+                structure=struct_name,
+                recurse_calls=True,
+                root_type=root_type,
+            )
+            members = _merge_member_rows(
+                members, callee_scan.get("members", [])
+            )
 
     if vtable_addr is not None:
         to_vtable(struct_name, 0, vtable_addr)

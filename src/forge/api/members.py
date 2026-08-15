@@ -61,6 +61,17 @@ TYPE_DECL_ALIASES = {
     "uint16": "u16",
     "uint32": "u32",
     "uint64": "u64",
+    # R3.2: the intN/uintN family must land on IDA-native tokens (the
+    # R2.5 map only reached the aliases themselves).
+    "u8": "unsigned __int8",
+    "u16": "unsigned __int16",
+    "u32": "unsigned __int32",
+    "u64": "unsigned __int64",
+    "i8": "__int8",
+    "i16": "__int16",
+    "i32": "__int32",
+    "i64": "__int64",
+    "u128": "unsigned __int128",
 }
 
 

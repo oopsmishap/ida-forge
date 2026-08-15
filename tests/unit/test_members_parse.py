@@ -5,8 +5,8 @@ from forge.util.cxx_to_c_name import demangled_name_to_c_str
 
 
 def test_normalize_type_declaration_rewrites_known_aliases():
-    assert members.normalize_type_declaration("_DWORD *") == "u32 *"
-    assert members.normalize_type_declaration("unsigned __int64") == "u64"
+    assert members.normalize_type_declaration("_DWORD *") == "unsigned __int32 *"
+    assert members.normalize_type_declaration("unsigned __int64") == "unsigned __int64"
     assert members.normalize_type_declaration("  BOOL  ") == "bool"
 
 
@@ -28,7 +28,11 @@ def test_parse_user_tinfo_uses_parse_decl_attempts_before_fallbacks(monkeypatch)
     result = members.parse_user_tinfo(" _DWORD * ")
 
     assert result is sentinel
-    assert attempts == ["u32 *", "u32 *;", "u32 * __forge_member;"]
+    assert attempts == [
+        "unsigned __int32 *",
+        "unsigned __int32 *;",
+        "unsigned __int32 * __forge_member;",
+    ]
 
 
 def test_parse_user_tinfo_falls_back_to_idc_parser(monkeypatch):

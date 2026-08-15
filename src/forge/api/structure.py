@@ -27,6 +27,12 @@ from forge.api.members import (
 from forge.util.logging import log_debug, log_error, log_warning
 
 
+def _strip_pragma_decl(cdecl: str) -> str:
+    """Drop a leading ``#pragma pack(...)`` line (parse_decl accepts no
+    preprocessor lines; idc_parse_types does)."""
+    return re.sub(r"^#pragma pack\([^\n]*\)\s*", "", cdecl, count=1)
+
+
 @contextmanager
 def _type_write_undo(action: str):
     """Run a destructive type write inside an IDA undo snapshot.
@@ -88,6 +94,9 @@ class Structure:
         self.collisions: list[bool] = []
         self.is_auto_named: bool = False
         self.created_type_name: str | None = None
+        # R3.2 (recovery eval round 2, F1): store structures pack byte
+        # layouts by default (pack=1); None opts out (natural alignment).
+        self.pack: int | None = 1
         self.provenance: StructureProvenance = StructureProvenance()
         self.parent_relationships: list[StructureRelationship] = []
         self.child_relationships: list[StructureRelationship] = []
@@ -802,12 +811,20 @@ class Structure:
     ):
         """Create/overwrite the IDA type from ``cdecl`` and apply it.
 
-        ``overwrite`` controls the behavior when ``structure_name`` already
+``overwrite`` controls the behavior when ``structure_name`` already
         exists as an IDA type: ``None`` asks the user (GUI flow, shown from
         :meth:`pack_structure`), ``True`` overwrites without asking, and
         ``False`` aborts. The headless ``forge_api`` facade always passes an
         explicit bool so it never raises a Qt dialog.
         """
+        # R3.2 (recovery eval round 2, F1): the store packs structure
+        # layouts by default. Every commit path lands here, so one wrap
+        # covers the facade create_type/finalize*/create_child_types and
+        # the GUI (already-wrapped text skips the wrap; the GUI keeps its
+        # fixed pack(1) dialog behavior). idc_parse_types accepts the
+        # pragma line; parse_decl-based gates strip it below.
+        if self.pack and not cdecl.lstrip().startswith("#pragma pack"):
+            cdecl = f"#pragma pack(push, {self.pack})\n{cdecl}"
         structure_name = self._extract_type_name(cdecl)
         if not structure_name:
             log_warning("Failed to determine type name from the declaration.", True)
@@ -860,7 +877,7 @@ class Structure:
         # new one. Validate the edited declaration first so a malformed edit
         # cannot destroy the existing type (the DB would end up with no
         # type at all — which silently breaks child scans on the parent).
-        if not self._declaration_parses(cdecl):
+        if not self._declaration_parses(_strip_pragma_decl(cdecl)):
             log_error(
                 "The edited declaration could not be parsed; "
                 f"the existing type {structure_name} was kept.",
@@ -880,7 +897,7 @@ class Structure:
                 if ida_typeinf.parse_decl(
                     parsed,
                     ida_typeinf.get_idati(),
-                    cdecl,
+                    _strip_pragma_decl(cdecl),
                     ida_typeinf.PT_TYP | ida_typeinf.PT_SIL,
                 ) and update_fn(ida_typeinf.get_idati(), structure_name, parsed):
                     self.created_type_name = structure_name

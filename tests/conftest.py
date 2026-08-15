@@ -437,6 +437,7 @@ _stub_module(
     create_udt_padding_member=lambda *args, **kwargs: None,
     collect_ctree_items_near_ea=_collect_ctree_items_near_ea,
     to_function_offset_str=lambda ea: f"sub_{ea:x}+0x0",
+    iter_returned_exprs=lambda *args, **kwargs: iter(()),
 )
 _stub_module("forge.api.types", types=types.SimpleNamespace(width=8), import_type=lambda *args, **kwargs: 0)
 _stub_module("forge.api.scanner", NewDeepScanVisitor=type("NewDeepScanVisitor", (), {}))

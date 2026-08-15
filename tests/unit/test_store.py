@@ -127,6 +127,28 @@ def test_catalog_persistence_round_trip():
     assert loaded.provenance.kind == "manual"
 
 
+def test_catalog_persistence_pack_round_trip():
+    """R3.2 (F1): the pack attribute survives a catalog serialize/reload;
+    catalogs persisted before R3.2 (no "pack" key) default to packed."""
+    from forge.api.store import StructureCatalog
+
+    forge_api.create_structure("PackedS", pack=2)
+    forge_api.set_pack("PackedS", None)
+    forge_api.create_structure("DefaultedS")
+
+    fresh = StructureCatalog()
+
+    assert fresh["PackedS"].pack is None
+    assert fresh["DefaultedS"].pack == 1
+
+    # legacy payload without a "pack" key restores as packed
+    legacy = StructureCatalog()
+    legacy_structure = legacy._deserialize(
+        {"name": "Legacy", "main_offset": 0, "members": []}
+    )
+    assert legacy_structure.pack == 1
+
+
 def test_catalog_persistence_vtable_member_round_trip(monkeypatch):
     """I.28: vtable members survive the round trip as VirtualTables."""
     import ida_name

@@ -94,21 +94,25 @@ def test_to_hex_is_pure():
 
 
 def test_intN_aliases_normalize_in_type_declarations():
-    """R2.5: the intN/uintN shorthand normalizes to the __intN spellings so
-    member types typed ``int32``/``uint64`` parse instead of silently
-    vanishing from the committed cdecl."""
+    """R2.5/R3.2: the intN/uintN shorthand normalizes all the way to the
+    IDA-native spellings (``int32`` → ``__int32`` etc.) so member types
+    typed ``int32``/``uint64`` parse instead of silently vanishing from
+    the committed cdecl."""
     from forge.api.members import normalize_type_declaration
 
-    assert normalize_type_declaration("int8") == "i8"
-    assert normalize_type_declaration("int16") == "i16"
-    assert normalize_type_declaration("int32") == "i32"
-    assert normalize_type_declaration("int64") == "i64"
-    assert normalize_type_declaration("uint8") == "u8"
-    assert normalize_type_declaration("uint16") == "u16"
-    assert normalize_type_declaration("uint32") == "u32"
-    assert normalize_type_declaration("uint64") == "u64"
-    assert normalize_type_declaration("uint32 *") == "u32 *"
-    assert normalize_type_declaration("uint64[8]") == "u64[8]"
+    assert normalize_type_declaration("int8") == "__int8"
+    assert normalize_type_declaration("int16") == "__int16"
+    assert normalize_type_declaration("int32") == "__int32"
+    assert normalize_type_declaration("int64") == "__int64"
+    assert normalize_type_declaration("uint8") == "unsigned __int8"
+    assert normalize_type_declaration("uint16") == "unsigned __int16"
+    assert normalize_type_declaration("uint32") == "unsigned __int32"
+    assert normalize_type_declaration("uint64") == "unsigned __int64"
+    assert normalize_type_declaration("uint32 *") == "unsigned __int32 *"
+    assert normalize_type_declaration("uint64[8]") == "unsigned __int64[8]"
+    # R3.2: the alias chain endpoint — _DWORD chains through u32 to the
+    # native token in the same pass.
+    assert normalize_type_declaration("_DWORD") == "unsigned __int32"
     # unknown tokens are untouched — the parse path still fails loudly
     assert normalize_type_declaration("int33") == "int33"
 
@@ -120,6 +124,151 @@ def test_intN_aliases_add_member_accepts_shorthand(monkeypatch):
     member = forge_api.add_member("S", 0x10, "int32", name="width")
     assert member["offset"] == 0x10
     assert member["name"] == "width"
+
+
+def test_create_structure_pack_default_and_override():
+    """R3.2 (F1): store structures default to packed (pack=1); a
+    create_structure(pack=N) override is honored and exposed."""
+    default = forge_api.create_structure("PackDefault")
+    assert default["pack"] == 1
+
+    padded = forge_api.create_structure("PackNatural", pack=None)
+    assert padded["pack"] is None
+
+    packed2 = forge_api.create_structure("PackTwo", pack=2)
+    assert packed2["pack"] == 2
+    assert forge_api.get_structure("PackTwo")["pack"] == 2
+
+
+def test_set_pack_round_trip_and_validation():
+    """R3.2 (F1): set_pack mutates the store attribute and persists it;
+    non-int/negative values raise ForgeApiError."""
+    forge_api.create_structure("PackMutable", pack=2)
+    result = forge_api.set_pack("PackMutable", None)
+    assert result == {"ok": True, "pack": None}
+    assert forge_api.get_structure("PackMutable")["pack"] is None
+
+    result = forge_api.set_pack("PackMutable", 8)
+    assert result == {"ok": True, "pack": 8}
+    assert forge_api.get_structure("PackMutable")["pack"] == 8
+
+    with pytest.raises(forge_api.ForgeApiError):
+        forge_api.set_pack("PackMutable", 0)
+    with pytest.raises(forge_api.ForgeApiError):
+        forge_api.set_pack("PackMutable", -1)
+    with pytest.raises(forge_api.ForgeApiError):
+        forge_api.set_pack("PackMutable", "1")
+    # rejected values leave the attribute untouched
+    assert forge_api.get_structure("PackMutable")["pack"] == 8
+
+
+def test_duplicate_structure_carries_pack():
+    """R3.2 (F1): a duplicated store structure keeps the source pack."""
+    forge_api.create_structure("PackSource", pack=None)
+    new_name = forge_api.duplicate_structure("PackSource")
+    assert forge_api.get_structure(new_name)["pack"] is None
+    forge_api.set_pack("PackSource", 4)
+    new_name2 = forge_api.duplicate_structure("PackSource")
+    assert forge_api.get_structure(new_name2)["pack"] == 4
+
+
+def test_set_cdecl_wraps_pragma_pack(monkeypatch):
+    """R3.2 (F1): every commit path lands in Structure.set_cdecl, which
+    prepends ``#pragma pack(push, N)`` when the structure carries a pack
+    and the text is not already wrapped (already-wrapped text passes
+    through untouched; pack=None is raw)."""
+    from forge.api import structure as structure_mod
+
+    captured = []
+    monkeypatch.setattr(
+        structure_mod.forge_types,
+        "create_type",
+        lambda name, decl: captured.append((name, decl)) or True,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        structure_mod.Structure,
+        "_apply_scanned_variable_types",
+        lambda self, name, origin: None,
+        raising=False,
+    )
+
+    body = "struct Packed { char c; unsigned __int64 w; };"
+
+    s = structure_mod.Structure("Packed")
+    s.pack = 1
+    s.set_cdecl(body)
+    assert captured and captured[0][1] == "#pragma pack(push, 1)\n" + body
+
+    # already-wrapped text is never double-wrapped
+    already = "#pragma pack(push, 1)\n" + body
+    s.set_cdecl(already)
+    assert captured[1][1] == already
+
+    # pack=None opts out — raw text reaches create_type
+    s.pack = None
+    s.set_cdecl(body)
+    assert captured[2][1] == body
+
+
+def test_set_cdecl_pragma_survives_overwrite_gate(monkeypatch):
+    """R3.2 (F1): the overwrite gate and the update_named_type branch
+    parse the STRIPPED body (parse_decl rejects preprocessor lines),
+    while create_type still receives the full wrapped text."""
+    from importlib import import_module
+    from types import SimpleNamespace
+
+    from forge.api import structure as structure_mod
+
+    parsed_texts = []
+    captured = []
+    monkeypatch.setattr(
+        structure_mod.ida_typeinf,
+        "parse_decl",
+        lambda out_tif, idati, decl, flags: parsed_texts.append(decl) or "Packed",
+        raising=False,
+    )
+    monkeypatch.setattr(
+        structure_mod.ida_typeinf,
+        "update_named_type",
+        lambda idati, name, tinfo: True,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        structure_mod.forge_types,
+        "create_type",
+        lambda name, decl: captured.append((name, decl)) or False,
+        raising=False,
+    )
+
+    class _QMessageBox:
+        Yes = 1
+        No = 0
+
+    qt_module = import_module("forge.util.qt")
+    monkeypatch.setattr(
+        qt_module, "QtWidgets", SimpleNamespace(QMessageBox=_QMessageBox)
+    )
+
+    body = "struct Packed { int u; unsigned int w; };"
+    packed = structure_mod.Structure("Packed")
+    packed.pack = 1
+    packed.set_cdecl(body, overwrite=True)
+
+    # first attempt (create_type) got the wrapped text, then the overwrite
+    # gate AND the update branch parsed the stripped body
+    assert captured[0][1] == "#pragma pack(push, 1)\n" + body
+    assert parsed_texts == [
+        "struct Packed { int u; unsigned int w; };",
+        "struct Packed { int u; unsigned int w; };",
+    ]
+
+
+def test_create_structure_validate_pack_raises():
+    with pytest.raises(forge_api.ForgeApiError):
+        forge_api.create_structure("BadPack", pack=0)
+    with pytest.raises(forge_api.ForgeApiError):
+        forge_api.create_structure("BadPack2", pack="1")
 
 
 def test_create_type_re_resolves_placeholder_member_sizes(monkeypatch):
@@ -1461,6 +1610,138 @@ def test_scan_from_allocation_uses_callee_row_without_heap_kind(monkeypatch):
     assert result["allocation"]["callee"] == 0x1400020F0
 
 
+def test_scan_from_allocation_teleports_into_helper_body(monkeypatch):
+    """R3.2 (F4): helper-mediated rows ALSO deep-scan the callee's
+    returned-allocation root; both evidence sets merge by offset —
+    higher score wins, ties keep the callee's row."""
+    rows = [
+        {
+            "ea": 0x402000,
+            "var": "v0",
+            "line": "v0 = sub_1400020F0()",
+            "kind": "HEAP",
+            "size_hint": None,
+            "callee": 0x1400020F0,
+        }
+    ]
+    monkeypatch.setattr(forge_api, "guess_allocation", lambda *a, **k: rows)
+    monkeypatch.setattr(
+        forge_api,
+        "_helper_allocation_row",
+        lambda callee_ea: {
+            "ea": 0x402100,
+            "var": "node",
+            "line": "node = calloc(1, 0x20)",
+            "kind": "HEAP",
+            "size_hint": 0x20,
+            "callee": None,
+        },
+    )
+    calls = []
+    caller_members = [
+        {"offset": 0, "name": "x", "score": 5},
+        {"offset": 8, "name": "caller_only", "score": 3},
+    ]
+    callee_members = [
+        {"offset": 0, "name": "x_init", "score": 5},  # tie -> callee row wins
+        {"offset": 8, "name": "caller_only", "score": 2},  # caller higher -> stays
+        {"offset": 4, "name": "callee_only", "score": 1},
+    ]
+
+    def fake_deep_scan(ea, *, var_name=None, structure="", **k):
+        calls.append((ea, var_name))
+        if ea == 0x1400014F0:
+            return {"structure": structure, "members": caller_members}
+        return {"structure": structure, "members": callee_members}
+
+    monkeypatch.setattr(forge_api, "deep_scan", fake_deep_scan)
+    monkeypatch.setattr(forge_api, "to_vtable", lambda *a, **k: {}, raising=False)
+
+    result = forge_api.scan_from_allocation(
+        0x1400014F0, var_name="v0", name="R3Chain"
+    )
+
+    assert result["ok"] is True
+    # caller scan first, then the teleported callee scan with the
+    # helper's returned var
+    assert calls == [(0x1400014F0, "v0"), (0x1400020F0, "node")]
+    rows_by_offset = {m["offset"]: m for m in result["members"]}
+    assert rows_by_offset[0]["name"] == "x_init"  # tie -> callee wins
+    assert rows_by_offset[8]["name"] == "caller_only"  # higher score wins
+    assert rows_by_offset[8]["score"] == 3
+    assert rows_by_offset[4]["name"] == "callee_only"  # union
+
+
+def test_scan_from_allocation_teleports_with_folded_size_hint(monkeypatch):
+    """R3.2 (F4): a helper row whose calloc size got folded (size_hint
+    set — live 9.4 shape) STILL teleports: the gate is the callee, not
+    size_hint."""
+    rows = [
+        {
+            "ea": 0x402000,
+            "var": "v0",
+            "line": "v0 = sub_1400020F0(3, 2);",
+            "kind": "HEAP",
+            "size_hint": 40,
+            "callee": 0x1400020F0,
+        }
+    ]
+    monkeypatch.setattr(forge_api, "guess_allocation", lambda *a, **k: rows)
+    monkeypatch.setattr(
+        forge_api,
+        "_helper_allocation_row",
+        lambda callee_ea: {
+            "ea": 0x402100,
+            "var": "node",
+            "line": "node = calloc(1, 0x28)",
+            "kind": "HEAP",
+            "size_hint": 40,
+            "callee": None,
+        },
+    )
+    calls = []
+    monkeypatch.setattr(
+        forge_api,
+        "deep_scan",
+        lambda ea, **k: calls.append(ea) or {"structure": k["structure"], "members": []},
+    )
+    monkeypatch.setattr(forge_api, "to_vtable", lambda *a, **k: {}, raising=False)
+
+    result = forge_api.scan_from_allocation(0x140001F10, var_name="v0", name="R3Chain")
+
+    assert result["ok"] is True
+    assert calls == [0x140001F10, 0x1400020F0]
+
+
+def test_scan_from_allocation_teleport_noop_without_helper_row(monkeypatch):
+    """R3.2 (F4): when the helper body proves no allocation, the caller
+    scan alone drives the result (current behavior unchanged)."""
+    rows = [
+        {
+            "ea": 0x402000,
+            "var": "v0",
+            "line": "v0 = sub_1400020F0()",
+            "kind": "HEAP",
+            "size_hint": None,
+            "callee": 0x1400020F0,
+        }
+    ]
+    monkeypatch.setattr(forge_api, "guess_allocation", lambda *a, **k: rows)
+    monkeypatch.setattr(forge_api, "_helper_allocation_row", lambda callee_ea: None)
+    calls = []
+    monkeypatch.setattr(
+        forge_api,
+        "deep_scan",
+        lambda ea, **k: calls.append(ea) or {"structure": k["structure"], "members": []},
+    )
+    monkeypatch.setattr(forge_api, "to_vtable", lambda *a, **k: {}, raising=False)
+
+    result = forge_api.scan_from_allocation(0x1400014F0, var_name="v0", name="R3Chain")
+
+    assert result["ok"] is True
+    assert calls == [0x1400014F0]
+
+
 def test_scan_from_allocation_reports_missing_heap(monkeypatch):
     """I.23: no heap allocation for the variable -> an error dict, and no
     structure is created."""
@@ -2617,6 +2898,316 @@ def test_create_typedef_falls_back_to_hexrays_create_typedef(monkeypatch):
 
     assert result == {"ok": True, "type": "DispatchFn"}
     assert calls == ["DispatchFn"]
+
+
+def test_typedef_declarator_name_transform_pairs():
+    """R3.2 (F3): the transform inserts the typedef name right after the
+    pointer star; non-function-pointer declarations are untouched (None)."""
+    assert (
+        forge_api._typedef_declarator_name(
+            "int (__cdecl *)(void *, unsigned int)", "DispatchFn"
+        )
+        == "int (__cdecl *DispatchFn)(void *, unsigned int)"
+    )
+    assert (
+        forge_api._typedef_declarator_name(
+            "int (*)(unsigned int)", "Callback"
+        )
+        == "int (*Callback)(unsigned int)"
+    )
+    assert forge_api._typedef_declarator_name("unsigned int", "Word") is None
+    assert forge_api._typedef_declarator_name("void *", "Opaque") is None
+
+
+def test_create_typedef_ladder_tries_declarator_name_before_hexrays(monkeypatch):
+    """R3.2 (F3): the write ladder is (1) ``typedef <decl> <name>;``, (2)
+    the declarator-name form when the first is rejected, (3) the
+    hexrays fallback — each lower rung only when the one above fails."""
+    import ida_hexrays
+
+    import forge.api.types as forge_types_mod
+
+    attempts = []
+    monkeypatch.setattr(
+        forge_types_mod,
+        "create_type",
+        lambda name, decl: (
+            attempts.append((name, decl))
+            or (len(attempts) == 3)
+        ),
+        raising=False,
+    )
+    hexrays_calls = []
+    monkeypatch.setattr(
+        ida_hexrays,
+        "create_typedef",
+        lambda name: (hexrays_calls.append(name) or True),
+        raising=False,
+    )
+    monkeypatch.setattr(forge_api, "is_type", lambda name: True, raising=False)
+
+    result = forge_api.create_typedef(
+        "DispatchFn", "int (__cdecl *)(void *, unsigned int)"
+    )
+
+    assert result == {"ok": True, "type": "DispatchFn"}
+    assert attempts == [
+        (
+            "DispatchFn",
+            "typedef int (__cdecl *)(void *, unsigned int) DispatchFn;",
+        ),
+        (
+            "DispatchFn",
+            "typedef int (__cdecl *DispatchFn)(void *, unsigned int);",
+        ),
+    ]
+    assert hexrays_calls == ["DispatchFn"]
+
+
+def test_create_typedef_scalar_skips_declarator_rung(monkeypatch):
+    """R3.2 (F3): scalar/enum typedefs have no pointer declarator — the
+    ladder still reaches the hexrays fallback, not a bogus rung."""
+    import ida_hexrays
+
+    import forge.api.types as forge_types_mod
+
+    attempts = []
+    monkeypatch.setattr(
+        forge_types_mod,
+        "create_type",
+        lambda name, decl: (attempts.append((name, decl)) or False),
+        raising=False,
+    )
+    hexrays_calls = []
+    monkeypatch.setattr(
+        ida_hexrays,
+        "create_typedef",
+        lambda name: (hexrays_calls.append(name) or True),
+        raising=False,
+    )
+    monkeypatch.setattr(forge_api, "is_type", lambda name: True, raising=False)
+
+    result = forge_api.create_typedef("Word", "unsigned int")
+
+    assert result == {"ok": True, "type": "Word"}
+    assert attempts == [("Word", "typedef unsigned int Word;")]
+    assert hexrays_calls == ["Word"]
+
+
+def test_create_typedef_rejects_keyword_name(monkeypatch):
+    """R3.2 (F3): a reserved-word typedef name fails loudly before any
+    write (same rule as members)."""
+    import forge.api.types as forge_types_mod
+
+    calls = []
+    monkeypatch.setattr(
+        forge_types_mod,
+        "create_type",
+        lambda name, decl: calls.append(name) or False,
+        raising=False,
+    )
+
+    with pytest.raises(forge_api.ForgeApiError):
+        forge_api.create_typedef("int", "unsigned int")
+
+    assert calls == []
+
+
+def test_rename_member_uses_rename_udm_til_persistent(monkeypatch):
+    """R3.2 (F2): the live path mutates the named-type tinfo in place —
+    rename_udm itself is the til write (no commit verb touched); gaps are
+    renamable (the F2 case) and bit offsets are accepted."""
+    from types import SimpleNamespace
+
+    import ida_typeinf
+
+    class _FakeTinfo:
+        def __init__(self, members=None):
+            self._members = members or [
+                SimpleNamespace(offset=0, name="first"),
+                SimpleNamespace(offset=8, name="wide"),  # bit offsets (9.4)
+                SimpleNamespace(offset=72, name="tail"),
+            ]
+            self.renamed = []
+
+        def get_named_type(self, _idati, name):
+            return name == "Outer"
+
+        def get_udt_details(self, udt):
+            udt[:] = self._members
+            return True
+
+        def rename_udm(self, index, new_name, etf_flags=0):
+            self.renamed.append((index, new_name))
+            self._members[index].name = new_name
+            return 0  # TERR_OK
+
+    updates = []
+    seen = []
+    monkeypatch.setattr(ida_typeinf, "tinfo_t", _FakeTinfo, raising=False)
+    monkeypatch.setattr(ida_typeinf, "udt_type_data_t", list, raising=False)
+    monkeypatch.setattr(
+        ida_typeinf,
+        "update_named_type",
+        lambda idati, name, tinfo: updates.append(name) or True,
+        raising=False,
+    )
+    real_rename = _FakeTinfo.rename_udm
+
+    def _spy(self, index, new_name, etf_flags=0):
+        seen.append((index, new_name))
+        return real_rename(self, index, new_name, etf_flags)
+
+    monkeypatch.setattr(_FakeTinfo, "rename_udm", _spy)
+
+    result = forge_api.rename_member("Outer", 1, "renamed_wide")
+
+    assert result == {
+        "ok": True,
+        "type": "Outer",
+        "offset": 1,
+        "from": "wide",
+        "to": "renamed_wide",
+    }
+    # rename_udm carried the rename at the right index — no commit verb
+    assert seen == [(1, "renamed_wide")]
+    assert updates == []
+
+
+def test_rename_member_gap_entry_offsets_supported(monkeypatch):
+    """R3.2 (F2): padding/gap entries are NOT skipped — renaming them is
+    the F2 use case (bit offsets accepted)."""
+    from types import SimpleNamespace
+
+    import ida_typeinf
+
+    class _FakeTinfo:
+        def __init__(self):
+            self._members = [
+                SimpleNamespace(offset=0, name="gap_0"),
+                SimpleNamespace(offset=0x220, name="gap_1"),  # 0x44 * 8
+            ]
+            self.renamed = []
+
+        def get_named_type(self, _idati, name):
+            return True
+
+        def get_udt_details(self, udt):
+            udt[:] = self._members
+            return True
+
+        def rename_udm(self, index, new_name, etf_flags=0):
+            self.renamed.append((index, new_name))
+            self._members[index].name = new_name
+            return 0
+
+    monkeypatch.setattr(ida_typeinf, "tinfo_t", _FakeTinfo, raising=False)
+    monkeypatch.setattr(ida_typeinf, "udt_type_data_t", list, raising=False)
+
+    result = forge_api.rename_member("Outer", 0x44, "pad_end")
+
+    assert result == {
+        "ok": True,
+        "type": "Outer",
+        "offset": 0x44,
+        "from": "gap_1",
+        "to": "pad_end",
+    }
+    assert _FakeTinfo().renamed == []
+
+
+def test_rename_member_legacy_rebuild_path(monkeypatch):
+    """R3.2 (F2): without rename_udm (older builds), the udt copy is
+    rebuilt via create_udt and committed through update_named_type."""
+    from types import SimpleNamespace
+
+    import ida_typeinf
+
+    class _FakeTinfo:
+        def __init__(self):
+            self._members = [
+                SimpleNamespace(offset=0, name="first"),
+                SimpleNamespace(offset=8, name="wide"),
+            ]
+            self.rebuild_flags = None
+
+        def get_named_type(self, _idati, name):
+            return name == "Outer"
+
+        def get_udt_details(self, udt):
+            udt[:] = self._members
+            return True
+
+        def create_udt(self, udt, flags):
+            self._members = list(udt)
+            self.rebuild_flags = flags
+            return True
+
+    updates = []
+    monkeypatch.setattr(ida_typeinf, "tinfo_t", _FakeTinfo, raising=False)
+    monkeypatch.setattr(ida_typeinf, "udt_type_data_t", list, raising=False)
+    monkeypatch.setattr(
+        ida_typeinf,
+        "update_named_type",
+        lambda idati, name, tinfo: updates.append((name, tinfo)) or True,
+        raising=False,
+    )
+
+    result = forge_api.rename_member("Outer", 1, "renamed_wide")
+
+    assert result == {
+        "ok": True,
+        "type": "Outer",
+        "offset": 1,
+        "from": "wide",
+        "to": "renamed_wide",
+    }
+    # the rebuilt udt (committed via update_named_type) carries the name
+    assert len(updates) == 1
+    assert updates[0][0] == "Outer"
+    assert updates[0][1]._members[1].name == "renamed_wide"
+    assert updates[0][1]._members[0].name == "first"
+    assert updates[0][1].rebuild_flags == 0
+
+
+def test_rename_member_error_dicts(monkeypatch):
+    """R3.2 (F2): missing type and missing-offset are distinct error
+    dicts; keyword new names raise ForgeApiError before any lookup."""
+    from types import SimpleNamespace
+
+    import ida_typeinf
+
+    class _FakeTinfo:
+        def __init__(self):
+            self._members = [
+                SimpleNamespace(offset=0, name="first"),
+                SimpleNamespace(offset=64, name="second"),
+            ]
+
+        def get_named_type(self, _idati, name):
+            return name == "Outer"
+
+        def get_udt_details(self, udt):
+            udt[:] = self._members
+            return True
+
+        def create_udt(self, udt, flags):
+            self._members = list(udt)
+            return True
+
+    monkeypatch.setattr(ida_typeinf, "tinfo_t", _FakeTinfo, raising=False)
+    monkeypatch.setattr(ida_typeinf, "udt_type_data_t", list, raising=False)
+
+    assert forge_api.rename_member("Missing", 0, "x") == {
+        "ok": False,
+        "error": "no type Missing",
+    }
+    assert forge_api.rename_member("Outer", 0x10, "x") == {
+        "ok": False,
+        "error": "no member at offset 0x10",
+    }
+    with pytest.raises(forge_api.ForgeApiError):
+        forge_api.rename_member("Outer", 0, "int")
 
 
 def test_add_member_accepts_inline_union_type(monkeypatch):

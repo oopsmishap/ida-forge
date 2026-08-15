@@ -58,7 +58,9 @@ commit → apply → mirror.
   duplicate_structure, rename_structure, add_member,
   set_member (`member_name=` disambiguates collision-offset pairs;
   editing fields), remove_members, get_member (offset + `member_name=`),
-  nudge_members, auto_resolve.
+  nudge_members, auto_resolve; layouts pack by default — set_pack(name,
+  N≥1) / create_structure(pack=N) changes the commit alignment,
+  `set_pack(name, None)` restores natural alignment.
 - **scan**: decompile(ea, force), signature, deep_scan / shallow_scan
   (ea + var_name/var_index/item_ea + structure + root_type + recurse_calls/
   max_depth), scan_global(ea, span), guess_allocation(ea, var_name),
@@ -72,7 +74,10 @@ commit → apply → mirror.
   `created_names`), create_child_types, apply_type(ea, decl,
   redefine_range=True) — the WHOLE span becomes one struct item (no
   manual create_struct).
-- **types**: create_typedef — and NO delete verbs: `remove_type` does
+- **types**: create_typedef (function pointers commit via the
+  declarator-name form), rename_member(name, offset, new_name) — renames
+  a COMMITTED member (gap_* entries included); the store is untouched, so
+  rename after the last re-commit. NO delete verbs: `remove_type` does
   not exist. Fix a layout with `remove_members`/`add_member`/`set_member`
   and re-commit with `create_type(..., overwrite=True)`.
 - **naming**: rename_local, set_lvar_types (C types on args/locals;
@@ -96,9 +101,11 @@ commit → apply → mirror.
    type exists (lazy placeholder).
 3. Recover — SCAN FIRST, always: `deep_scan(ea, var_name=...,
    root_type="Type *")` or `scan_from_allocation` / `scan_global` before
-   any manual construction; keep the call's output as evidence. KNOWN
-   GAP: scans do NOT follow wrapper helpers (`v = node_new(...)` with
-   the calloc inside) — deep_scan the callee instead.
+   any manual construction; keep the call's output as evidence.
+   `scan_from_allocation` now teleports into wrapper helpers
+   (`v = node_new(...)` with the calloc inside): the helper's body is
+   scanned via the allocator feeding its first returned lvar; only
+   helpers whose allocator cannot be proven need manual disassembly.
 4. De-noise: scanners emit hypotheses + byte-granular junk — trim with
    `remove_members` / `set_member(enabled=False)`, keep evidence-based
    names.

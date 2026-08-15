@@ -108,8 +108,22 @@ Working as intended — do not work around these:
 - `apply_type`'s `del_items` cleanup takes an END offset, not a size —
   overlapping spans can erode the .data tail; keep applications to
   non-overlapping ranges. (R2.4.)
-- `int32`/`uintN` shorthand does not parse in member types — use
-  `__intN`/`unsigned __intN`. (R2.5.)
+- `int32`/`uintN`/`_DWORD` shorthand parses in member types — the
+  R2.5 alias map now runs all the way to IDA-native tokens
+  (`uint32` ≡ `unsigned __int32`, `_DWORD` ≡ `unsigned __int32`,
+  `int64` ≡ `__int64`, ...). (R2.5 + R3.2 F7: aliases complete.)
+- Store structures pack byte layouts by default (R3.2 F1): every commit
+  is `#pragma pack(push, 1)`; `create_structure(..., pack=N)` or
+  `set_pack(name, N)` (N ≥ 1) changes it, `set_pack(name, None)`
+  restores natural alignment.
+- Committed-member names — including the `gap_*` auto-fill entries the
+  store never held — rename via `rename_member(name, offset, new_name)`
+  (R3.2 F2). The store is NOT changed: rename AFTER the last
+  `create_type(overwrite=True)` re-commit, or the rename is lost.
+- Hex-Rays only renders global member access when the reach is
+  `lea reg, stru_xxx.field`; literal-address `qword_...` operands stay
+  untyped (compiler artifact — workaround: apply the type at the
+  instance EA used by the majority of accesses). (F5, IDA-inherent.)
 - **Update, never delete (R3.1):** `remove_type` no longer exists;
   `undo_type` refuses when there is no prior declaration to restore;
   `remove_structure` raises for any structure committed to the IDB.
@@ -126,10 +140,14 @@ Working as intended — do not work around these:
 Your primary grind: committing your recoveries in the IDB so globals
 render and pseudocode shows real member access.
 
-One known gap (tracked as E.22): `guess_allocation`/`scan_from_allocation`
-do **not** follow wrapper helper allocations (`v1 = chain_node_new(...)` —
-the `calloc` sits inside the callee). Compensate with `deep_scan` +
-disassembly of the helper, and report it as a found gap.
+One known gap (tracked as E.22, closed by R3.2 F4): wrapper-helper
+allocations (`v1 = chain_node_new(...)` — the `calloc` sits inside the
+callee) are now followed: `scan_from_allocation` teleports into the
+helper's body, finds the allocator feeding its first returned lvar, and
+scans there too (both evidence sets merge by offset). The manual
+`deep_scan` + disassembly compensation applies only to helpers whose
+allocator cannot be proven statically (no returned-lvar allocation) —
+report those as found gaps.
 
 ## Rules
 

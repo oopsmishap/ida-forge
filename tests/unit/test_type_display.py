@@ -59,7 +59,8 @@ def test_parse_user_tinfo_unions_use_member_suffix_branch_first(monkeypatch):
 
 
 def test_parse_user_tinfo_normalize_keeps_intN_aliases():
-    """R2.5: the normalize step rewrites intN/uintN before the parse
-    attempts; unknown tokens survive untouched (parse then fails loudly)."""
-    assert normalize_type_declaration("uint32 [4]") == "u32 [4]"
-    assert normalize_type_declaration("int16 *") == "i16 *"
+    """R2.5/R3.2: the normalize step rewrites intN/uintN to native tokens
+    before the parse attempts; unknown tokens survive untouched (parse
+    then fails loudly)."""
+    assert normalize_type_declaration("uint32 [4]") == "unsigned __int32 [4]"
+    assert normalize_type_declaration("int16 *") == "__int16 *"

@@ -103,6 +103,7 @@ class StructureCatalog:
             "main_offset": structure.main_offset,
             "created_type_name": structure.created_type_name,
             "is_auto_named": structure.is_auto_named,
+            "pack": structure.pack,
             "provenance": provenance,
             "members": members,
             "child_relationships": [
@@ -125,6 +126,8 @@ class StructureCatalog:
         structure.main_offset = raw.get("main_offset", 0)
         structure.created_type_name = raw.get("created_type_name")
         structure.is_auto_named = raw.get("is_auto_named", False)
+        # R3.2: existing persisted catalogs default to packed (no migration).
+        structure.pack = raw.get("pack", 1)
         prov = raw.get("provenance") or {}
         known = set(StructureProvenance.__dataclass_fields__)
         structure.provenance = StructureProvenance(
