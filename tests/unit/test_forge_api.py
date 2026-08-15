@@ -2726,6 +2726,68 @@ def test_name_members_from_printf_uses_format_labels(monkeypatch, _real_hexrays)
     # the 0x20 member never existed — no phantom naming
 
 
+def test_name_members_from_printf_recognizes_local_wrappers(monkeypatch, _real_hexrays):
+    """E14: a local function named like a log wrapper (fixture log_msg)
+    carries the printf argument shape too."""
+    import ida_bytes
+    import ida_funcs
+
+    import forge.api.hexrays as hx
+
+    forge_api.create_structure("Player")
+    forge_api.add_member("Player", 0x00, "u64")
+
+    monkeypatch.setattr(forge_api, "imports", lambda *a, **k: [], raising=False)
+    monkeypatch.setattr(
+        ida_funcs, "get_func_name", lambda ea: "log_msg", raising=False
+    )
+    monkeypatch.setattr(
+        ida_bytes,
+        "get_strlit_contents",
+        lambda *a, **k: b"id=%p count=%u",
+        raising=False,
+    )
+    cfunc = SimpleNamespace(
+        entry_ea=0x401000,
+        get_lvars=lambda: [
+            SimpleNamespace(name="p", type=lambda: FakeTinfo("u64 *"))
+        ],
+        argidx=(),
+        treeitems=[
+            SimpleNamespace(
+                to_specific_type=lambda: SimpleNamespace(
+                    op=hx.ctype.call,
+                    x=SimpleNamespace(obj_ea=0x140001F0),
+                    a=[
+                        SimpleNamespace(op=hx.ctype.obj, obj_ea=0x40101100),
+                        SimpleNamespace(
+                            op=hx.ctype.memptr,
+                            x=SimpleNamespace(
+                                op=hx.ctype.var, v=SimpleNamespace(name="p")
+                            ),
+                            m=0x00,
+                        ),
+                        SimpleNamespace(
+                            op=hx.ctype.memptr,
+                            x=SimpleNamespace(
+                                op=hx.ctype.var, v=SimpleNamespace(name="p")
+                            ),
+                            m=0xFF,
+                        ),
+                    ],
+                )
+            )
+        ],
+    )
+    monkeypatch.setattr(_real_hexrays, "decompile", lambda ea: cfunc, raising=False)
+
+    result = forge_api.name_members_from_printf("Player", 0x401000)
+
+    assert result["ok"] is True
+    assert result["renamed"] == ["id"]
+    assert forge_api.get_member("Player", 0x00)["name"] == "id"
+
+
 def test_name_members_from_printf_no_printf_call(monkeypatch, _real_hexrays):
     """E14: no printf-family call in the function → a loud error."""
     cfunc = SimpleNamespace(entry_ea=0x401000, treeitems=[], get_lvars=list, argidx=())
@@ -2923,7 +2985,14 @@ def test_scan_returned_rows_with_callers(monkeypatch, _real_hexrays):
     visitor_module = _sys.modules["forge.api.visitor"]
     if not hasattr(visitor_module, "RecursiveUpwardsObjectVisitor"):
         visitor_module.RecursiveUpwardsObjectVisitor = type(
-            "RecursiveUpwardsObjectVisitor", (), {}
+            "RecursiveUpwardsObjectVisitor",
+            (),
+            {
+                "__init__": lambda self, *a, **k: None,
+                "parent_expr": lambda self: None,
+                "get_line": lambda self: "",
+                "_cfunc": None,
+            },
         )
 
     import forge.api.hexrays as hx
@@ -3148,6 +3217,122 @@ def test_if_inverter_and_transform_contract(monkeypatch):
     visitor.visit_insn(SimpleNamespace(ea=0x4010))
     assert visitor.window == [SimpleNamespace(ea=0x4010)]
     assert seen == [0x4010]
+
+
+def test_iter_returned_exprs_reads_creturn_expr(monkeypatch, _real_hexrays):
+    """Live 9.4 finding (2026-08-15): return statements carry the value
+    under creturn.expr, via a PROPERTY to_specific_type."""
+    from forge.api import hexrays as hexrays_mod
+
+    # property-style wrapper: to_specific_type is NOT callable
+    return_value = SimpleNamespace(op=65, v=SimpleNamespace(idx=5))
+    item = SimpleNamespace(
+        to_specific_type=SimpleNamespace(
+            op=80, creturn=SimpleNamespace(expr=return_value)
+        )
+    )
+    cfunc = SimpleNamespace(
+        entry_ea=0x401000,
+        treeitems=[item],
+        body=SimpleNamespace(apply_to=lambda *a, **k: None),
+    )
+
+    found = list(hexrays_mod.iter_returned_exprs(cfunc, ret_op=80))
+
+    assert found == [return_value]
+
+
+def test_guess_allocation_callee_statement_wrapper_property(monkeypatch, _real_hexrays):
+    """Live 9.4 finding: treeitem statements arrive through a
+    property-style to_specific_type that must not be called — the alias
+    chain still resolves `return v` where v = w; w = calloc(...)."""
+    import sys as _sys
+
+    import ida_funcs
+
+    visitor_module = _sys.modules["forge.api.visitor"]
+    if not hasattr(visitor_module, "RecursiveUpwardsObjectVisitor"):
+        visitor_module.RecursiveUpwardsObjectVisitor = type(
+            "RecursiveUpwardsObjectVisitor",
+            (),
+            {
+                "__init__": lambda self, *a, **k: None,
+                "parent_expr": lambda self: None,
+                "get_line": lambda self: "",
+                "_cfunc": None,
+            },
+        )
+
+    from forge.api.scan_object import ObjectType
+    from forge.features.guess_allocation import guess_allocation as guess_mod
+
+    cfunc = SimpleNamespace(
+        entry_ea=0x401000,
+        body=SimpleNamespace(find_parent_of=lambda expr: None),
+    )
+    obj = SimpleNamespace(id=ObjectType.local_variable, ea=0x5000, name="node")
+
+    visitor = guess_mod.GuessAllocationVisitor(cfunc, obj)
+    monkeypatch.setattr(
+        guess_mod,
+        "ctype",
+        SimpleNamespace(asg=1, ref=2, ret=3, call=5, var=4),
+    )
+    monkeypatch.setattr(
+        visitor,
+        "parent_expr",
+        lambda: SimpleNamespace(op=1, y=SimpleNamespace(op=5, x=SimpleNamespace(obj_ea=0x402000))),
+    )
+    monkeypatch.setattr(visitor, "get_line", lambda: "node = chain_node_new(...)")
+    v = SimpleNamespace(idx=7)
+    w = SimpleNamespace(idx=9)
+    monkeypatch.setattr(
+        guess_mod.MemoryAllocationObject,
+        "create",
+        lambda _cfunc, _expr: (
+            SimpleNamespace(ea=0x401200, size=40)
+            if getattr(getattr(_expr, "x", None), "obj_ea", None) == 0x6000
+            else None
+        ),
+    )
+    monkeypatch.setattr(
+        ida_funcs, "get_func", lambda ea: SimpleNamespace(start_ea=0x402000), raising=False
+    )
+    monkeypatch.setattr(
+        _real_hexrays,
+        "decompile",
+        lambda ea: SimpleNamespace(
+            treeitems=[
+                # property-style shape: the specific object directly (patched ops:
+                # ret=3, asg=1, var=4, call=5)
+                SimpleNamespace(
+                    to_specific_type=SimpleNamespace(
+                        op=3, creturn=SimpleNamespace(expr=SimpleNamespace(op=4, v=v))
+                    )
+                ),
+                SimpleNamespace(
+                    to_specific_type=SimpleNamespace(
+                        op=1,
+                        x=SimpleNamespace(op=4, v=v),
+                        y=SimpleNamespace(op=4, v=w),
+                    )
+                ),
+                SimpleNamespace(
+                    to_specific_type=SimpleNamespace(
+                        op=1,
+                        x=SimpleNamespace(op=4, v=w),
+                        y=SimpleNamespace(op=5, x=SimpleNamespace(obj_ea=0x6000)),
+                    )
+                ),
+            ]
+        ),
+    )
+
+    visitor._manipulate(SimpleNamespace(), obj)
+
+    assert visitor._data == [
+        [0x401200, "node", "node = chain_node_new(...)", "HEAP", 40, 0x402000]
+    ]
 
 
 def test_rename_ea_renames_function_or_global(monkeypatch):

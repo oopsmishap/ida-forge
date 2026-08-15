@@ -3631,6 +3631,21 @@ def _format_token_labels(format_bytes) -> list[str | None]:
     return tokens
 
 
+def _unwrap_treeitem(item):
+    """The specific ctree object behind a treeitems entry.
+
+    ``to_specific_type`` is a METHOD on some builds' wrappers and a
+    PROPERTY (already-returned object) on the live 9.4 build; test
+    doubles use callables. Plain items pass through.
+    """
+    to_specific = getattr(item, "to_specific_type", None)
+    if callable(to_specific):
+        return to_specific()
+    if to_specific is not None:
+        return to_specific
+    return getattr(item, "it", None) or item
+
+
 def _iter_ctree_calls(cfunc):
     """Yield every call cexpr in ``cfunc`` (treeitems or visitor walk).
 
@@ -3652,10 +3667,7 @@ def _iter_ctree_calls(cfunc):
     treeitems = getattr(cfunc, "treeitems", None)
     if treeitems:
         for item in treeitems:
-            specific = getattr(item, "it", None) or item
-            to_specific = getattr(specific, "to_specific_type", None)
-            if callable(to_specific):
-                specific = to_specific()
+            specific = _unwrap_treeitem(item)
             if _is_call(specific):
                 yield specific
         return
@@ -3688,22 +3700,32 @@ def _iter_ctree_calls(cfunc):
 
 
 def _printf_call_expressions(cfunc) -> list:
-    """The call cexprs of printf-family imports in ``cfunc`` (E14).
+    """The call cexprs of printf-family targets in ``cfunc`` (E14).
 
-    A call counts when its target EA resolves to an imported name ending
-    in ``printf``/``sprintf``/``snprintf``/``vsnprintf``.
+    A call counts when its target is an imported name ending in
+    ``printf``/``sprintf``/``snprintf``/``vsnprintf``, or a function
+    whose name contains ``printf`` / starts with ``log`` (local wrappers
+    like the fixture's ``log_msg`` — the call-site argument shape is the
+    same: format literal + varargs).
     """
+    import ida_funcs
+
     import_name_by_ea = {row["ea"]: row["name"] or "" for row in imports()}
     printf_suffixes = ("printf", "sprintf", "snprintf", "vsnprintf")
-    return [
-        call
-        for call in _iter_ctree_calls(cfunc)
-        if (
-            import_name_by_ea.get(
-                getattr(getattr(call, "x", None), "obj_ea", None), ""
-            ).endswith(printf_suffixes)
-        )
-    ]
+    calls: list = []
+    for call in _iter_ctree_calls(cfunc):
+        callee_ea = getattr(getattr(call, "x", None), "obj_ea", None)
+        name = import_name_by_ea.get(callee_ea) or ""
+        if not name and callee_ea not in (None, -1):
+            try:
+                name = ida_funcs.get_func_name(callee_ea) or ""
+            except Exception:  # noqa: BLE001 — name resolution is best-effort
+                name = ""
+        if name.endswith(printf_suffixes) or (
+            name and ("printf" in name or name.startswith("log"))
+        ):
+            calls.append(call)
+    return calls
 
 
 def _assigned_lvar_for_call(cfunc, target_ea) -> str | None:
@@ -3744,16 +3766,15 @@ def _assigned_lvar_for_call(cfunc, target_ea) -> str | None:
     example='r = forge_api.name_members_from_printf("Player", 0x1400014F0)',
 )
 def name_members_from_printf(structure: str, ea: int) -> dict:
-    """Name members from the function's printf format string (E14).
+    """Name members from the function's printf format strings (E14).
 
-    Locates the first ``printf``/``sprintf``/``snprintf``/``vsnprintf``
-    call in the function containing ``ea``, reads its format-string
-    literal, and walks the call's varargs in slot order. Each vararg that
     is a ``memptr`` (``obj->member``) and lands on a store member whose
     name is still the synthesized pattern (``u32_10`` / ``field_8``) is
     named after the label the literal gives that slot (``score=%d
-    flags=%x`` → members ``score``, ``flags``). User-named members are
-    NEVER overwritten; unresolvable slots are skipped.
+    flags=%x`` → members ``score``, ``flags``). Calls are merged: the
+    first call's resolvable slots win, later calls only fill slots the
+    earlier calls left unnamed. User-named members are NEVER
+    overwritten; unresolvable slots are skipped.
 
     Returns:
         ``{"ok": True, "renamed": [names]}`` or an error dict.
@@ -3771,57 +3792,81 @@ def name_members_from_printf(structure: str, ea: int) -> dict:
             "ok": False,
             "error": "no printf-family call found in the function",
         }
-    call = calls[0]
-    args = list(getattr(call, "a", []) or [])
-    if not args:
-        return {"ok": False, "error": "printf call has no arguments"}
-
-    format_arg = args[0]
-    format_ea = (
-        getattr(format_arg, "obj_ea", None)
-        if getattr(format_arg, "op", None) == _ctype.obj
-        else None
-    )
-    if format_ea in (None, -1):
-        return {"ok": False, "error": "format string is not a literal"}
 
     import ida_bytes
 
-    try:
-        format_bytes = ida_bytes.get_strlit_contents(format_ea, -1, 0)
-    except TypeError:  # pragma: no cover — 2-arg form on some builds
-        format_bytes = ida_bytes.get_strlit_contents(format_ea, -1)
-    if format_bytes is None:
-        return {"ok": False, "error": "format string is not a literal"}
-
-    tokens = _format_token_labels(format_bytes)
     renamed = []
-    for slot, token in enumerate(tokens):
-        if token is None:
+    for call in calls:
+        args = list(getattr(call, "a", []) or [])
+        if not args:
             continue
-        argument_index = 1 + slot
-        if argument_index >= len(args):
+        format_arg = args[0]
+        # live 9.4: the format literal arrives as cast(const char *) of
+        # the obj node — peel the wrapper chain (and refs).
+        format_expr = format_arg
+        for _ in range(4):
+            op = getattr(format_expr, "op", None)
+            if op in (_ctype.cast, _ctype.ref):
+                inner = getattr(format_expr, "x", None)
+                if inner is None:
+                    break
+                format_expr = inner
+                continue
             break
-        argument = args[argument_index]
-        # only x->member varargs carry naming evidence
-        if getattr(argument, "op", None) != _ctype.memptr:
-            continue
-        member_offset = getattr(argument, "m", None)
-        if not isinstance(member_offset, int) or member_offset < 0:
-            continue
-        base_var = getattr(getattr(argument, "x", None), "v", None)
-        base_name = getattr(base_var, "name", None)
-        if not base_name:
+        format_ea = (
+            getattr(format_expr, "obj_ea", None)
+            if getattr(format_expr, "op", None) in (_ctype.obj, _ctype.str)
+            else None
+        )
+        if format_ea is None:
+            # some builds expose the literal address under .obj
+            format_ea = getattr(format_expr, "obj", None)
+        if format_ea in (None, -1):
             continue
         try:
-            _resolve_scan_root(cfunc, var_name=base_name)
-        except ForgeApiError:
+            format_bytes = ida_bytes.get_strlit_contents(format_ea, -1, 0)
+        except TypeError:  # pragma: no cover — 2-arg form on some builds
+            format_bytes = ida_bytes.get_strlit_contents(format_ea, -1)
+        if format_bytes is None:
             continue
-        member = target.get_member_by_offset(member_offset)
-        if member is None or not _is_synthesized_member_name(member.name):
-            continue
-        member.name = token
-        renamed.append(token)
+
+        tokens = _format_token_labels(format_bytes)
+        for slot, token in enumerate(tokens):
+            if token is None:
+                continue
+            argument_index = 1 + slot
+            if argument_index >= len(args):
+                break
+            argument = args[argument_index]
+            # only x->member varargs carry naming evidence
+            if getattr(argument, "op", None) != _ctype.memptr:
+                continue
+            member_offset = getattr(argument, "m", None)
+            if not isinstance(member_offset, int) or member_offset < 0:
+                continue
+            base_expr = getattr(argument, "x", None)
+            base_var = getattr(base_expr, "v", None)
+            base_name = getattr(base_var, "name", None)
+            if not base_name:
+                base_name = getattr(base_expr, "name", None)
+            if not base_name and base_var is not None:
+                # live 9.4: var_ref_t exposes the idx, not the name
+                var_index = getattr(base_var, "idx", None)
+                if isinstance(var_index, int):
+                    lvars = list(cfunc.get_lvars())
+                    if 0 <= var_index < len(lvars):
+                        base_name = lvars[var_index].name
+            if not base_name:
+                continue
+            try:
+                _resolve_scan_root(cfunc, var_name=base_name)
+            except ForgeApiError:
+                continue
+            member = target.get_member_by_offset(member_offset)
+            if member is None or not _is_synthesized_member_name(member.name):
+                continue
+            member.name = token
+            renamed.append(token)
     _mark_dirty()
     return {"ok": True, "renamed": renamed}
 

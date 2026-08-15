@@ -89,14 +89,38 @@ def get_line(ctree: ida_hexrays.ctree_parentee_t, cfunc) -> str:
     return ""
 
 
+def _return_value(return_insn):
+    """The expression a ``return`` statement returns.
+
+    The binding exposes the value either directly (``.x`` — unit doubles
+    and older builds) or through the statement's return struct
+    (``.creturn``/``.details`` — live 9.4 finding 2026-08-15: the
+    statement carries ``creturn_t`` with the value under ``.x``).
+    """
+    value = getattr(return_insn, "x", None)
+    if value is not None:
+        return value
+    return_struct = (
+        getattr(return_insn, "creturn", None)
+        or getattr(return_insn, "details", None)
+        or getattr(return_insn, "ret", None)
+    )
+    if return_struct is not None:
+        value = getattr(return_struct, "expr", None)
+        if value is not None:
+            return value
+        return getattr(return_struct, "x", None)
+    return None
+
+
 def iter_returned_exprs(cfunc, ret_op=None):
     """Yield the expression of every ``return <expr>`` statement.
 
     Shared by the allocation guesser and :func:`scan_returned` (E.22/F.3).
     ``ret_op`` defaults to the module's ctree return code; pass an explicit
-    code to match test doubles. Walks treeitems when present, falling back
-    to a ctree-visitor walk (treeitems is empty on the live 9.4 build, O1
-    finding 2026-08-13).
+    code to match test doubles. Walks treeitems when present (skipping
+    items without statement bodies — 9.4 live finding 2026-08-15),
+    falling back to a ctree-visitor walk.
     """
     if ret_op is None:
         ret_op = (
@@ -104,18 +128,30 @@ def iter_returned_exprs(cfunc, ret_op=None):
             or getattr(ctype, "cit_ret", None)
             or getattr(ctype, "cit_return", None)
         )
+    found: list = []
     treeitems = getattr(cfunc, "treeitems", None)
     if treeitems:
         for item in treeitems:
-            # to_specific_type is a method; ``or item`` would keep the
-            # bound method and never match (same trap as inverse_if E6).
-            specific = getattr(item, "it", None) or item
-            to_specific = getattr(specific, "to_specific_type", None)
+            # to_specific_type is a method on some builds and a property
+            # on the live 9.4 build — either way the specific object is
+            # what carries the statement/expression.
+            to_specific = getattr(item, "to_specific_type", None)
             if callable(to_specific):
                 specific = to_specific()
+            elif to_specific is not None:
+                specific = to_specific
+            else:
+                specific = getattr(item, "it", None) or item
             if ret_op is not None and getattr(specific, "op", None) == ret_op:
-                yield getattr(specific, "x", None)
-        return
+                value = _return_value(specific)
+                if value is not None:
+                    found.append(value)
+        if found:
+            yield from found
+            return
+        # treeitems exist but expose no statement bodies on this build
+        # (9.4 live finding 2026-08-15: ret items carry x=None) — walk
+        # the ctree instead.
 
     walker_cls = getattr(ida_hexrays, "ctree_visitor_t", None)
     if walker_cls is None or ret_op is None:
@@ -133,7 +169,9 @@ def iter_returned_exprs(cfunc, ret_op=None):
             # the binding hook for statements is visit_insn, not
             # visit_statement (O1 live finding, 2026-08-13)
             if getattr(insn, "op", None) == ret_op:
-                self.returned.append(getattr(insn, "x", None))
+                value = _return_value(insn)
+                if value is not None:
+                    self.returned.append(value)
             return 0
 
     walker = _ReturnWalker()

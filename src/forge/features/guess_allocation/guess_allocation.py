@@ -257,16 +257,29 @@ class GuessAllocationVisitor(RecursiveUpwardsObjectVisitor):
         no tree items) — falls back to a ctree visitor walk over the body.
         """
         asg_op = getattr(ctype, "asg", None)
+        asg_sites: list = []
         treeitems = getattr(cfunc, "treeitems", None)
         if treeitems:
             for item in treeitems:
-                specific = getattr(item, "it", None) or item
-                to_specific = getattr(specific, "to_specific_type", None)
+                # to_specific_type is a method on some builds and a
+                # property on the live 9.4 build.
+                to_specific = getattr(item, "to_specific_type", None)
                 if callable(to_specific):
                     specific = to_specific()
+                elif to_specific is not None:
+                    specific = to_specific
+                else:
+                    specific = getattr(item, "it", None) or item
                 if asg_op is not None and getattr(specific, "op", None) == asg_op:
-                    yield getattr(specific, "x", None), getattr(specific, "y", None)
-            return
+                    target = getattr(specific, "x", None)
+                    rhs = getattr(specific, "y", None)
+                    if target is not None and rhs is not None:
+                        asg_sites.append((target, rhs))
+            if asg_sites:
+                yield from asg_sites
+                return
+            # treeitems exist but expose no statement bodies on this
+            # build (9.4 live finding 2026-08-15) — walk the ctree.
 
         walker_cls = getattr(ida_hexrays, "ctree_visitor_t", None)
         if walker_cls is None or asg_op is None:
