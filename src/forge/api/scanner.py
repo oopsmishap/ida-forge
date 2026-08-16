@@ -546,6 +546,61 @@ class ScanVisitor(ObjectVisitor):
 
         tinfo = self._prefer_object_tinfo(obj, tinfo)
 
+        # R3.14: the same write can be extracted twice — once through the
+        # assignment walk (which now prefers the RHS ``child_t *``) and once
+        # through the standalone ``*((_QWORD *)v0 + N)`` deref walk (which
+        # sees only the storage width ``u64``).  Once a member at the offset
+        # is a pointer to a real struct, the scalar width row is redundant
+        # AND the worse type — skip it so the store keeps the typed member.
+        existing = None
+        if tinfo is not None:
+            get_member = getattr(self._structure, "get_member_by_offset", None)
+            if callable(get_member):
+                existing = get_member(offset)
+            existing_tinfo = getattr(existing, "tinfo", None) if existing is not None else None
+            is_integral = getattr(tinfo, "is_integral", None)
+            if (
+                callable(is_integral)
+                and is_integral()
+                and existing_tinfo is not None
+                and existing_tinfo.is_ptr()
+            ):
+                pointed = existing_tinfo.get_pointed_object()
+                if pointed is not None:
+                    is_udt = getattr(pointed, "is_udt", None)
+                    if callable(is_udt) and is_udt():
+                        log_debug(
+                            f"skipping scalar-width duplicate at "
+                            f"{hex(offset)} (member {existing.name} "
+                            "is a struct pointer)"
+                        )
+                        return None
+            # R3.14: the REVERSE read-cast artifact — `*(_DWORD **)v0` reads
+            # the slot as a pointer value when the written member is an
+            # integral (`u32_0`).  The store's integral member is the true
+            # type; the pointer-shaped read redeclaration only appears
+            # because the root lvar is `_DWORD *` and hexrays re-casts every
+            # access.  Suppress pointer-to-scalar rows that hit an existing
+            # integral member of the same width.
+            is_ptr = getattr(tinfo, "is_ptr", None)
+            if callable(is_ptr) and is_ptr() and existing_tinfo is not None:
+                ex_integral = getattr(existing_tinfo, "is_integral", None)
+                if callable(ex_integral) and ex_integral():
+                    pointed = None
+                    get_pointed = getattr(tinfo, "get_pointed_object", None)
+                    if callable(get_pointed):
+                        pointed = get_pointed()
+                    if pointed is None or not (
+                        getattr(pointed, "is_udt", lambda: False)
+                        and pointed.is_udt()
+                    ):
+                        log_debug(
+                            f"skipping pointer-shaped read cast at "
+                            f"{hex(offset)} (member {existing.name} is "
+                            "integral)"
+                        )
+                        return None
+
         if tinfo is not None:
             tinfo = ida_typeinf.tinfo_t(tinfo)
             tinfo.clr_const()
@@ -586,8 +641,13 @@ class ScanVisitor(ObjectVisitor):
             if first_parent.op == ctype.idx:
                 offset = first_parent.y.numval() * cexpr.type.get_ptrarr_objsize()
             else:
-                # Hex-Rays add nodes already encode byte offsets.
-                offset = first_parent.y.numval()
+                # R3.14: `(_QWORD *)v0 + 2` — the add node's y counts
+                # ELEMENTS of the pointee type, not bytes (`char *` keeps
+                # scale 1; `_QWORD *` scales by 8).  Using the raw numval
+                # planted `u64_1/u64_2/u64_3` rows at 0x1/0x2/0x3 that
+                # overlapped the correct 0x8/0x10/0x18 members.
+                pointee_scale = self._add_pointee_scale(first_parent)
+                offset = first_parent.y.numval() * pointee_scale
             cexpr = self.parent_expr()
             if first_parent.op == ctype.add:
                 context.pop_front()
@@ -596,7 +656,10 @@ class ScanVisitor(ObjectVisitor):
             # `(TYPE)expr + offset`
             if second_parent.y.op != ctype.num:
                 return None
-            offset = second_parent.theother(first_parent).numval()
+            offset = (
+                second_parent.theother(first_parent).numval()
+                * self._add_pointee_scale(second_parent)
+            )
             cexpr = second_parent
             context.pop_front(2)
         else:
@@ -618,7 +681,10 @@ class ScanVisitor(ObjectVisitor):
             if other.op != ctype.num:
                 return None
 
-            offset = other.numval()
+            # R3.14: scale add-numval by the pointee size exactly like the
+            # ptr path (see _extract_member_from_ptr) — otherwise
+            # `(_QWORD *)v0 + 2` records byte-offset 2 instead of 16.
+            offset = other.numval() * self._add_pointee_scale(first_parent)
             cexpr = self.parent_expr()
             context.pop_front()
         else:
@@ -716,7 +782,10 @@ class ScanVisitor(ObjectVisitor):
                         assignee_offset,
                         cexpr,
                         obj,
-                        assignment_parent.x.type,
+                        self._prefer_rhs_pointer_type(
+                            assignment_parent.x.type,
+                            getattr(assignment_parent, "y", None),
+                        ),
                         obj_ea,
                     )
 
@@ -768,10 +837,27 @@ class ScanVisitor(ObjectVisitor):
                     # `*((TYPE*)expr + x) = ...`
                     obj_ea = self._extract_obj_ea(second_expr.y)
                     log_debug("pointer assignment to object")
-                    return self._get_member(offset, cexpr, obj, second_expr.y.type, obj_ea)
+                    return self._get_member(
+                        offset,
+                        cexpr,
+                        obj,
+                        self._prefer_rhs_pointer_type(
+                            second_expr.y.type,
+                            second_expr.y,
+                        ),
+                        obj_ea,
+                    )
                 # `*(TYPE*)expr = ...`
                 log_debug("cast assignment to object")
-                return self._get_member(offset, cexpr, obj, second_expr.x.type)
+                return self._get_member(
+                    offset,
+                    cexpr,
+                    obj,
+                    self._prefer_rhs_pointer_type(
+                        second_expr.x.type,
+                        getattr(second_expr, "y", None),
+                    ),
+                )
             if context.op_at(1) == ctype.call and second_expr is not None and first_expr is not None:
                 log_debug(f"pointer passed as argument to function at {hex(second_expr.ea)}")
                 if second_expr.x == first_expr:
@@ -877,6 +963,61 @@ class ScanVisitor(ObjectVisitor):
         if lhs_index is None:
             return True  # can't disprove; global/member-LHS sites still count
         return lhs_index == getattr(obj, "index", -1)
+
+    @staticmethod
+    def _add_pointee_scale(add_node) -> int:
+        """The element size hexrays' ``add``-numval counts in.
+
+        ``(_QWORD *)v0 + 2`` -> 8 (byte offset 16); ``(char *)v0 + 28`` -> 1
+        (byte offset 28).  Mirrors scan_object._extract_offset_expression's
+        add handling (R3.14).
+        """
+        add_type = getattr(add_node, "type", None)
+        get_objsize = getattr(add_type, "get_ptrarr_objsize", None)
+        if callable(get_objsize):
+            try:
+                return get_objsize() or 1
+            except Exception:  # noqa: BLE001 — broken tinfo wrapper
+                log_debug("get_ptrarr_objsize failed on add node; keeping scale 1")
+        return 1
+
+    @staticmethod
+    def _prefer_rhs_pointer_type(lhs_tinfo, rhs_cexpr):
+        """R3.14: when assigning a struct pointer into a member slot, the
+        MEMBER type should be the RHS pointer type (``child_t *``), NOT the
+        LHS storage cast (``_QWORD``).  ``v0->u64_10 = v1`` in a typed
+        fixture decompiles to ``*((_QWORD *)v0 + 2) = v1;`` — the write is
+        the pointer VALUE, so the member must carry the pointer's struct
+        type or the parent/child relationship is lost.
+
+        Returns the RHS pointer tinfo when it points at a named UDT/struct;
+        falls back to ``lhs_tinfo`` otherwise (integral stores, bare ``void *``,
+        strings, casts to scalars).
+        """
+        if rhs_cexpr is None:
+            return lhs_tinfo
+        rhs = rhs_cexpr
+        while rhs is not None and getattr(rhs, "op", None) in (
+            getattr(ctype, "cast", None),
+            getattr(ctype, "ref", None),
+        ):
+            rhs = getattr(rhs, "x", None)
+        rhs_tinfo = getattr(rhs, "type", None)
+        if rhs_tinfo is None or not rhs_tinfo.is_ptr():
+            return lhs_tinfo
+        try:
+            pointed = rhs_tinfo.get_pointed_object()
+        except Exception:  # noqa: BLE001 — broken tinfo wrappers
+            return lhs_tinfo
+        if pointed is None:
+            return lhs_tinfo
+        is_udt = getattr(pointed, "is_udt", None)
+        is_struct = getattr(pointed, "is_struct", None)
+        if callable(is_struct) and is_struct():
+            return rhs_tinfo
+        if callable(is_udt) and is_udt():
+            return rhs_tinfo
+        return lhs_tinfo
 
     @staticmethod
     def _extract_obj_ea(cexpr: ida_hexrays.cexpr_t) -> int | None:
