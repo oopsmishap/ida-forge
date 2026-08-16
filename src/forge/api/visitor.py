@@ -97,7 +97,43 @@ class DownwardsObjectVisitor(ObjectVisitor):
         if scan_object is None:
             return None
 
+        # R3.13: refuse to wrap a member-reference around a DIFFERENT
+        # lvar than the scan root when its allocator size disagrees with
+        # the root's.  Prevents ``v0->field = v2`` (where v0 is a
+        # 0x38-byte calloc target and v2 is the 0x2C-byte scan root)
+        # from depositing v0's members into the root's structure.
+        if (
+            isinstance(scan_object, VariableObject)
+            and isinstance(self._init_obj, VariableObject)
+            and scan_object is not self._init_obj
+        ):
+            if getattr(scan_object, "alloc_size", None) is None:
+                scan_object.alloc_size = self._resolve_init_alloc_size(
+                    getattr(scan_object, "index", -1)
+                )
+            if getattr(scan_object, "alloc_size", None) is not None and (
+                getattr(self._init_obj, "alloc_size", None) is None
+                or scan_object.alloc_size != self._init_obj.alloc_size
+            ):
+                log_debug(
+                    f"refusing member-wrap for {scan_object.name} (alloc "
+                    f"{scan_object.alloc_size:#x}); scan-root "
+                    f"{self._init_obj.name} (alloc {self._init_obj.alloc_size})"
+                )
+                return None
+
         return _make_offset_scan_object(scan_object, offset)
+
+    def _resolve_init_alloc_size(self, lvar_index: int) -> int | None:
+        """Wrap the shared ``resolve_lvar_init_alloc_size`` helper (R3.13).
+        Kept as a method so test mocks can monkeypatch it.
+        """
+        from forge.api.scan_object import resolve_lvar_init_alloc_size
+
+        return resolve_lvar_init_alloc_size(self._cfunc, lvar_index)
+
+
+
 
     def _append_scan_object(
         self, new_obj: ScanObject | None, source_obj: ScanObject
@@ -107,12 +143,56 @@ class DownwardsObjectVisitor(ObjectVisitor):
 
         if hasattr(new_obj, "inherit_scan_root_from"):
             new_obj.inherit_scan_root_from(source_obj)
+        # R3.13: refuse to add a VariableObject whose known alloc size
+        # conflicts with an already-tracked VariableObject (typically
+        # ``self._init_obj``).  Prevents the ``v0->field = v2`` LHS walk
+        # from pulling v0 in as a new scan root when the scan was
+        # started on v2.  Same rule as the upwards-visitor's closure.
+        if isinstance(new_obj, VariableObject):
+            new_alloc = getattr(new_obj, "alloc_size", None)
+            if new_alloc is None:
+                # Resolve lazily so the mid-walk path doesn't pay a ctree
+                # walk for objects that never conflict.
+                try:
+                    new_alloc = self._resolve_init_alloc_size(
+                        getattr(new_obj, "index", -1)
+                    )
+                    if new_alloc is not None:
+                        new_obj.alloc_size = new_alloc
+                except Exception:  # noqa: BLE001 — best-effort
+                    new_alloc = None
+            if isinstance(new_alloc, int) and new_alloc > 0:
+                # The scan root may have been REMOVED from self._objects
+                # by its own calloc write ("Remove object v2 from
+                # scanning" — _is_object_overwritten treats the allocator
+                # assignment as an overwrite).  Compare against the
+                # immutable _init_obj in addition to the live list.
+                candidates = list(self._objects)
+                init_obj = getattr(self, "_init_obj", None)
+                if init_obj is not None and init_obj not in candidates:
+                    candidates.append(init_obj)
+                for existing in candidates:
+                    if not isinstance(existing, VariableObject):
+                        continue
+                    ex_alloc = getattr(existing, "alloc_size", None)
+                    if (
+                        isinstance(ex_alloc, int)
+                        and ex_alloc > 0
+                        and ex_alloc != new_alloc
+                    ):
+                        log_debug(
+                            f"refusing scan-root merge of {new_obj.name} "
+                            f"(alloc {new_alloc:#x}) with "
+                            f"{existing.name} (alloc {ex_alloc:#x})"
+                        )
+                        return
         self._objects.append(new_obj)
         if (
             getattr(new_obj, "func_ea", ida_idaapi.BADADDR)
             == getattr(self._cfunc, "entry_ea", ida_idaapi.BADADDR)
         ):
             self._rescan_current_function = True
+
 
 
     def _matches_object(self, obj: ScanObject, cexpr: ida_hexrays.cexpr_t) -> bool:

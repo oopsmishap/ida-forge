@@ -243,6 +243,51 @@ def _get_struct_tinfo(tinfo):
     return tinfo
 
 
+def resolve_lvar_init_alloc_size(cfunc, target_index: int):
+    """Walk the cfunc looking for ``lvar[target_index] = <allocator>(...)``
+    and return the allocator's folded size, or ``None`` if no tracked
+    allocator initializes this lvar (R3.13).
+    """
+    if target_index < 0:
+        return None
+    if not hasattr(ida_hexrays, "ctree_parentee_t"):
+        return None
+    from forge.api.hexrays import ctype as _ctype
+    var_op = getattr(_ctype, "var", None)
+    asg_op = getattr(_ctype, "asg", None)
+    if var_op is None or asg_op is None:
+        return None
+
+    class _Finder(ida_hexrays.ctree_parentee_t):
+        def __init__(self):
+            ida_hexrays.ctree_parentee_t.__init__(self)
+            self.alloc = None
+
+        def visit_expr(self, cexpr):
+            if getattr(cexpr, "op", None) != asg_op:
+                return 0
+            x = getattr(cexpr, "x", None)
+            if (
+                getattr(x, "op", None) == var_op
+                and hasattr(x, "v")
+                and getattr(x.v, "idx", -1) == target_index
+            ):
+                rhs = getattr(cexpr, "y", None)
+                alloc = MemoryAllocationObject.create(cfunc, rhs)
+                if alloc is not None:
+                    self.alloc = alloc.size
+            return 0
+
+    finder = _Finder()
+    try:
+        body = getattr(cfunc, "body", None)
+        if body is not None:
+            finder.apply_to(body, None)
+    except Exception:  # noqa: BLE001 — best-effort
+        return None
+    return finder.alloc
+
+
 def _make_offset_scan_object(base_obj, offset: int):
     base_tinfo = _get_struct_tinfo(getattr(base_obj, "tinfo", None))
     if base_tinfo is None or offset == 0:

@@ -699,6 +699,17 @@ class ScanVisitor(ObjectVisitor):
                             "no member extracted"
                         )
                         return None
+                    if not self._assignee_is_same_lvar(assignment_parent.x, obj):
+                        # R3.13: `*(_QWORD *)&v0->u32_18 = v2` — the LHS
+                        # base (v0) is a DIFFERENT lvar than the matched
+                        # obj (v2).  The write targets v0's memory; the
+                        # RHS lvar match must not deposit a member into
+                        # v2's structure.
+                        log_debug(
+                            f"refusing member extraction for {obj.name}: "
+                            "assignee base is a different lvar"
+                        )
+                        return None
                     obj_ea = self._extract_obj_ea(getattr(assignment_parent, "y", None))
                     log_debug("assignment to object")
                     return self._get_member(
@@ -822,6 +833,50 @@ class ScanVisitor(ObjectVisitor):
             return types["u8"].type
 
         return None  # Turns into VoidMember
+
+    @staticmethod
+    def _assignee_base_lvar_index(x) -> int | None:
+        """Find the base ``var`` node under casts/refs/memptrs/memrefs in an
+        assignment LHS and return its lvar index, or None if the LHS has no
+        local-variable base.
+
+        Used by R3.13's cross-lvar guard: for ``*(_QWORD *)&v0->u32_18 = v2``
+        the LHS base is v0's lvar, which must not write members into a scan
+        rooted on v2.
+        """
+        walk = x
+        while walk is not None and hasattr(walk, "op"):
+            op = walk.op
+            if op in (
+                getattr(ctype, "ref", None),
+                getattr(ctype, "cast", None),
+                getattr(ctype, "memptr", None),
+                getattr(ctype, "memref", None),
+                getattr(ctype, "dot", None),
+                getattr(ctype, "idx", None),
+                getattr(ctype, "add", None),
+                getattr(ctype, "ptr", None),
+            ):
+                walk = getattr(walk, "x", None)
+                continue
+            if op == getattr(ctype, "var", None) and hasattr(walk, "v"):
+                return getattr(walk.v, "idx", None)
+            return None
+        return None
+
+    def _assignee_is_same_lvar(self, x, obj) -> bool:
+        """True when the assignment LHS's base lvar is the same lvar as the
+        matched scan obj (R3.13).  Non-variable objs (structure pointers,
+        globals, ...) have no lvar identity and are always allowed.
+        """
+        from forge.api.scan_object import VariableObject
+
+        if not isinstance(obj, VariableObject):
+            return True
+        lhs_index = self._assignee_base_lvar_index(x)
+        if lhs_index is None:
+            return True  # can't disprove; global/member-LHS sites still count
+        return lhs_index == getattr(obj, "index", -1)
 
     @staticmethod
     def _extract_obj_ea(cexpr: ida_hexrays.cexpr_t) -> int | None:

@@ -2408,11 +2408,20 @@ def refresh_types(*, include_names: bool = False) -> dict:
 # scanning
 # --------------------------------------------------------------------------- #
 def _make_var_root(cfunc, lvars, index):
-    from forge.api.scan_object import VariableObject
+    from forge.api.scan_object import VariableObject, resolve_lvar_init_alloc_size
 
     obj = VariableObject(lvars[index], index)
     obj.func_ea = cfunc.entry_ea
+    # R3.13: tag the root lvar with its initial allocator size so the
+    # downwards-visitor's ``_create_scan_object_from_expr`` can refuse
+    # to wrap a member-reference around a different-size lvar (e.g.
+    # ``v0->field = v2`` where v0 is a 0x38-byte calloc target and v2
+    # is the 0x2C-byte scan root).
+    obj.alloc_size = resolve_lvar_init_alloc_size(cfunc, index)
     return obj
+
+
+
 
 
 _INTEGRAL_SCALARS = {
