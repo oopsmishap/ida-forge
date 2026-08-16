@@ -320,12 +320,30 @@ class AbstractMember:
         # Add the number of scanned variables to the score
         score += len(self.scanned_variables)
 
-        # Ajdust the score based on the type
+        # Adjust the score based on the type.  R3.15: named struct/union
+        # pointer types (`child_t *`) and named struct values must outscore
+        # the integral aliases (`_DWORD`/`_QWORD`/`u64`/...) — collision
+        # resolution keeps the higher score, and the alias-width row for a
+        # slot that actually holds a recovered struct pointer is the WEAKER
+        # evidence (it only reflects the storage width of the write).
         if self.is_simple_type():
             score -= 1
         elif self.tinfo.is_funcptr():
             score += 1000 + len(self.tinfo.dstr())
-        elif "struct " in self.tinfo.dstr():
+        elif self.tinfo.is_ptr():
+            # A pointer whose pointee is a real named struct/union/class
+            # (`child_t *`, `struct Foo *`) is the strongest scalar shape.
+            pointed = self.tinfo.get_pointed_object()
+            if pointed is not None and pointed.is_udt():
+                score += 3
+            else:
+                # `void *` / integral pointee — still just a BYTE or scalar
+                # pointer; no named-type recovery happened.
+                score += 1
+        elif self.tinfo.is_udt():
+            # Embedded (non-pointer) named struct/union member.
+            score += 2
+        elif "struct " in self.tinfo.dstr() or "class " in self.tinfo.dstr():
             score -= 10
         else:
             score += 1
