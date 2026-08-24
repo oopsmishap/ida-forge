@@ -287,8 +287,8 @@ class AbstractMember:
 
     def has_collision(self, other):
         if self.offset <= other.offset:
-            return self.offset + self.size > other.offset
-        return (other.offset + other.size) >= self.offset
+            return self.offset + self.effective_size() > other.offset
+        return (other.offset + other.effective_size()) >= self.offset
 
     def is_simple_type(self):
         return re.match(r"((i|u|f)(8|16|32|64|128))", self.tinfo.dstr())
@@ -368,6 +368,14 @@ class AbstractMember:
             return 1
         size = self.tinfo.get_size()
         return size if size != ida_typeinf.BADSIZE else 1
+    def effective_size(self) -> int:
+        """Default pack-time size: the stored size.
+
+        ``Member`` overrides this to re-resolve from a fresh pack tinfo
+        (R2.1); ``VirtualTable`` and any other ``AbstractMember`` subclass
+        use the stored size, which is already correct for them.
+        """
+        return self.size
 
     @property
     def type_alias(self):

@@ -32,6 +32,18 @@ def _strip_pragma_decl(cdecl: str) -> str:
     preprocessor lines; idc_parse_types does)."""
     return re.sub(r"^#pragma pack\([^\n]*\)\s*", "", cdecl, count=1)
 
+def _member_pack_size(member) -> int:
+    """Pack-time byte size, tolerant of duck-typed members (test fakes).
+
+    Real members expose ``effective_size()`` (pack-resolved — R2.1); test
+    doubles and older shapes only carry a stored ``size``. Collision math
+    must use the pack size so a placeholder-poisoned member is not treated
+    as non-colliding.
+    """
+    effective = getattr(member, "effective_size", None)
+    if callable(effective):
+        return effective()
+    return getattr(member, "size", 1)
 
 def _apply_lvar_pointer_type(func_ea: int, var: str, structure_name: str) -> bool:
     """Retype the local named ``var`` in ``func_ea`` to ``Name *`` (R3.8).
@@ -532,12 +544,12 @@ class Structure:
                 continue
 
             current_member = self.members[current_index]
-            if current_member.offset + current_member.size > next_member.offset:
+            if current_member.offset + _member_pack_size(current_member) > next_member.offset:
                 self.collisions[current_index] = True
                 self.collisions[next_index] = True
 
-                current_end = current_member.offset + current_member.size
-                next_end = next_member.offset + next_member.size
+                current_end = current_member.offset + _member_pack_size(current_member)
+                next_end = next_member.offset + _member_pack_size(next_member)
                 if current_end < next_end:
                     current_index = next_index
             else:
@@ -823,6 +835,10 @@ class Structure:
             struct_name = ida_kernwin.ask_str("", ida_kernwin.HIST_TYPE, "Struct name:")
             if not struct_name:
                 return None
+            # ``build_cdecl`` derives its name from ``get_name() or
+            # self.name`` — persist the prompted name so an unnamed
+            # ``Structure("")`` can actually be packed (R4 name flow).
+            self.name = struct_name
 
         start_index = self.get_main_offset_index() if start is None else start
         origin = (
@@ -901,9 +917,16 @@ class Structure:
         failed: list = []
         seen_targets: set[tuple] = set()
         for scan_object in self.get_unique_scanned_variables(origin):
+            identity_key = getattr(scan_object, "identity_key", None)
             target_key = (
-                getattr(scan_object, "func_ea", None),
-                getattr(scan_object, "name", None),
+                identity_key()
+                if callable(identity_key)
+                else (
+                    getattr(scan_object, "func_ea", None),
+                    getattr(scan_object, "ea", None),
+                    getattr(scan_object, "id", None),
+                    getattr(scan_object, "name", None),
+                )
             )
             if target_key in seen_targets:
                 continue
@@ -968,10 +991,18 @@ class Structure:
                 type_str = dstr()
             except Exception:  # noqa: BLE001 — degraded tinfo
                 type_str = None
+        # Globals: the persisted site address must be the OBJECT address
+        # (``_obj_ea``), not the referencing expression's instruction
+        # address (``ea``) — the reload fallback re-applies at this
+        # address and ``_is_code(expression_ea)`` is True, so a global
+        # persisted by ``ea`` is misclassified as code and never retyped.
+        site_ea = getattr(scan_object, "_obj_ea", None)
+        if site_ea is None:
+            site_ea = getattr(scan_object, "ea", idaapi.BADADDR)
         return {
             "func_ea": getattr(scan_object, "func_ea", idaapi.BADADDR),
             "var": getattr(scan_object, "name", None),
-            "ea": getattr(scan_object, "ea", idaapi.BADADDR),
+            "ea": site_ea,
             "type": type_str,
         }
 

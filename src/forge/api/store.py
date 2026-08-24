@@ -32,9 +32,16 @@ def _live_scan_site_rows(structure) -> list:
     seen: set = set()
     for member in structure.members:
         for scan_object in getattr(member, "scanned_variables", None) or ():
+            identity_key = getattr(scan_object, "identity_key", None)
             key = (
-                getattr(scan_object, "func_ea", None),
-                getattr(scan_object, "name", None),
+                identity_key()
+                if callable(identity_key)
+                else (
+                    getattr(scan_object, "func_ea", None),
+                    getattr(scan_object, "ea", None),
+                    getattr(scan_object, "id", None),
+                    getattr(scan_object, "name", None),
+                )
             )
             if key in seen or key == (None, None):
                 continue
@@ -133,7 +140,10 @@ class StructureCatalog:
                 "offset": member.offset,
                 "name": getattr(member, "name", ""),
                 "type": type_str,
-                "size": getattr(member, "size", None),
+                # The authored declaration string (E4): re-parsed fresh at
+                # pack time so stale tinfo ordinals can never serialize as
+                # ``#NN *``. Persisted so members keep it across reloads.
+                "decl_src": getattr(member, "decl_src", None),
                 "comment": getattr(member, "comment", ""),
                 "enabled": getattr(member, "enabled", True),
                 "is_array": getattr(member, "is_array", False),
@@ -209,6 +219,7 @@ class StructureCatalog:
                         member_raw.get("origin", 0),
                     )
                     member.name = member_raw.get("name") or member.name
+                    member.decl_src = member_raw.get("decl_src")
             except Exception as exc:  # noqa: BLE001 — skip broken members
                 log_warning(f"skipping corrupt catalog member: {exc}")
                 continue

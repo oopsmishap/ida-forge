@@ -417,8 +417,14 @@ def import_type(name):
     til_import = getattr(idati, "import_type", None)
     if callable(til_import):
         tinfo = ida_typeinf.tinfo_t()
-        if tinfo.get_named_type(idati, name) and til_import(tinfo) is not None:
-            return 1
+        if not tinfo.get_named_type(idati, name):
+            return -1
+        type_id = til_import(tinfo)
+        # ``til.import_type`` returns the ordinal, or BADORD (never None) on
+        # failure — check the sentinel, not truthiness, and return the real
+        # ordinal instead of a hardcoded value.
+        if type_id is not None and type_id != ida_idaapi.BADORD:
+            return type_id
 
     import idc
 

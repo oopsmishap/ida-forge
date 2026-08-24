@@ -105,7 +105,9 @@ class TemplatedTypes:
             if not tinfo.get_named_type(idati, name):
                 return _BADORD
             result = til_import(tinfo)
-            return name if result is not None else _BADORD
+            if result is not None and result != _BADORD:
+                return result
+            return _BADORD
 
         import idc
 
