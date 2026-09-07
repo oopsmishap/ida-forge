@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import logging
 
-import ida_kernwin
+try:
+    import ida_kernwin
+except ImportError:  # pragma: no cover - headless import only
+    ida_kernwin = None
 
 from forge.plugin import PLUGIN_NAME
 
@@ -51,7 +54,8 @@ class _IDAMsgHandler(logging.Handler):
             message = self.format(record)
         except Exception:  # noqa: BLE001
             message = record.getMessage()
-
+        if ida_kernwin is None:
+            return
         if record.levelno >= logging.WARNING:
             ida_kernwin.msg(f"{IDAWARNING}{message}\n")
         else:

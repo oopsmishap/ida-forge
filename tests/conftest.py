@@ -459,8 +459,41 @@ _stub_module(
     iter_returned_exprs=lambda *args, **kwargs: iter(()),
 )
 _stub_module("forge.api.types", types=types.SimpleNamespace(width=8), import_type=lambda *args, **kwargs: 0)
-_stub_module("forge.api.scanner", NewDeepScanVisitor=type("NewDeepScanVisitor", (), {}))
-_stub_module("forge.api.visitor", FunctionTouchVisitor=type("FunctionTouchVisitor", (), {}))
+_stub_module(
+    "forge.api.scanner",
+    NewDeepScanVisitor=type("NewDeepScanVisitor", (), {}),
+    NewShallowScanVisitor=type("NewShallowScanVisitor", (), {}),
+)
+
+
+class _StubRecursiveUpwardsObjectVisitor:
+    """Functional double matching the real base's surface.
+
+    ``GuessAllocationVisitor`` (and any test constructing it) inherits this
+    when the real ``forge.api.visitor`` module is stubbed, so the double
+    must store the constructor state and expose ``parent_expr``/``get_line``
+    exactly like the real base. Lives here — not in individual test files —
+    so every collection order sees the same shape.
+    """
+
+    def __init__(self, cfunc, obj, data=None, skip_until_object=False, visited=None):
+        self._cfunc = cfunc
+        self.parents = []
+        self._skip = skip_until_object
+        self._init_obj = obj
+
+    def parent_expr(self):
+        return None
+
+    def get_line(self):
+        return ""
+
+
+_stub_module(
+    "forge.api.visitor",
+    FunctionTouchVisitor=type("FunctionTouchVisitor", (), {}),
+    RecursiveUpwardsObjectVisitor=_StubRecursiveUpwardsObjectVisitor,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -479,3 +512,20 @@ def _purge_user_config_dir():
         shutil.rmtree(_user_ida_dir)
     _user_ida_dir.mkdir(parents=True, exist_ok=True)
     yield
+@pytest.fixture
+def fake_ida_domain(monkeypatch):
+    """Install a minimal Domain module for adapter routing tests."""
+
+    class FakeDatabase:
+        current = None
+        calls = []
+
+        @classmethod
+        def open(cls, *args, **kwargs):
+            cls.calls.append((args, kwargs))
+            return cls.current
+
+    module = types.ModuleType("ida_domain")
+    module.Database = FakeDatabase
+    monkeypatch.setitem(sys.modules, "ida_domain", module)
+    return FakeDatabase

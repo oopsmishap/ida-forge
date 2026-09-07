@@ -10,8 +10,8 @@ implemented and live-verified (see CHANGELOG 2026-08-15).
 **`CHANGELOG.md` owns the completed history**; this file tracks only
 open work.
 
-Baselines: `python -m pytest -q` → 632 passing; `python -m ruff check
-src tests` → clean; branch `forge-api` clean working tree.
+Baselines: `python -m pytest -q` → 1285 passing; `python -m ruff check
+src tests` → clean.
 
 ## Closed in the 2026-08-15 closure wave (commits 726dd8b..cb55b3f)
 
@@ -74,7 +74,7 @@ below remain observations, not tasks.
 ## Verification commands
 
 ```bash
-python -m pytest -q            # 577 passing
+python -m pytest -q            # 1285 passing
 python -m ruff check src tests # clean
 git log --oneline main..HEAD   # pending commit list
 ```
@@ -86,8 +86,8 @@ git log --oneline main..HEAD   # pending commit list
 - The test temp config dir is auto-purged per test
   (`_purge_user_config_dir` in `tests/conftest.py`) — do not write test
   fixtures that persist under `%TEMP%\ida-forge-tests`.
-- Real-IDA verification (T1.2, T3.3) requires IDA ≥ 9.0 with Hex-Rays;
-  the structure-builder features need the decompiler.
+- Real-IDA verification requires IDA ≥ 9.0 with Hex-Rays; the
+  structure-builder features need the decompiler.
 - When touching `types.py`, re-read the leimurr comment — the canonical
   warning for the tinfo-handle class of bug.
 - **Headless (ida-codemode / idalib) session notes, 2026-08-12/13/15**:

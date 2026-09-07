@@ -177,3 +177,18 @@ def test_config_backfills_new_default_keys_from_legacy_file(tmp_path, monkeypatc
     # The fill-in is persisted, so the next read sees the merged file.
     reloaded = _LegacyConfig()
     assert reloaded["added_top_level"] == "fresh"
+
+def test_config_uses_domain_metadata_user_directory(monkeypatch, tmp_path):
+    from forge.api import config as config_module
+
+    domain_dir = tmp_path / "domain-user"
+    monkeypatch.setattr(
+        config_module,
+        "current_database",
+        lambda required=False: type(
+            "Database", (), {"metadata": type("Metadata", (), {"user_idadir": str(domain_dir)})()}
+        )(),
+    )
+    monkeypatch.setattr("ida_diskio.get_user_idadir", lambda: str(tmp_path / "sdk-user"))
+    config = ExampleConfig()
+    assert config._config_path == domain_dir / "cfg" / "forge.toml"

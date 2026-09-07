@@ -24,6 +24,7 @@ from forge.api.structure import Structure
 from forge.util.logging import log_debug, log_info, log_warning
 
 from .dialogs import ScannedVariableChooser
+from .hierarchy import HierarchyCommitResult, StructureHierarchySession
 
 
 def _form_module():
@@ -41,6 +42,20 @@ class ChildScanPlan:
     root_function_ea: int | None
     has_multiple_roots: bool
     scan_variables: tuple[ScanObject, ...] = ()
+    # Byte offset of the scanned child inside its parent structure. Pointer
+    # children scan their pointee directly (0); embedded children scan the
+    # parent buffer, so their observations are parent-relative and the
+    # hierarchy session re-bases them by subtracting this value.
+    source_base: int = 0
+
+
+@dataclass(frozen=True)
+class HierarchyScanRequest:
+    """One root scan feeding the hierarchy reconstruction session."""
+
+    cfunc: ida_hexrays.cfunc_t
+    obj: ScanObject
+    source_base: int = 0
 
 @dataclass(frozen=True)
 class ChildScanInferenceSeed:
@@ -108,6 +123,109 @@ class ChildScanMixin:
     @staticmethod
     def _warn_unimplemented(action_name: str) -> None:
         log_warning(f"{action_name} is not implemented yet.", True)
+
+    def _run_deep_hierarchy_scan(
+        self,
+        structure: Structure,
+        requests,
+        *,
+        max_depth: int | None,
+    ) -> HierarchyCommitResult | None:
+        """Rebuild the structure (and its call-shaped children) in one session.
+
+        Every request runs through a frame-aware deep scan whose member
+        observations feed a :class:`StructureHierarchySession`; the session
+        classifies recursive call frames, places observations at their
+        source-relative offsets, and commits the merged structures.
+        """
+        selected_structure_name = (
+            self.current_structure.name
+            if self.current_structure is not None
+            else structure.name
+        )
+        working_structures = dict(self.structures)
+        working_structures[structure.name] = structure
+        session = StructureHierarchySession(
+            structure,
+            working_structures,
+            make_unique_name=self._make_unique_structure_name,
+        )
+        visitor_cls = getattr(_form_module(), "NewDeepScanVisitor", NewDeepScanVisitor)
+        pointer_children: dict[int, Structure] = {}
+        for request in requests:
+            if request.cfunc is None or request.obj is None:
+                continue
+            visitor = visitor_cls(
+                request.cfunc,
+                request.source_base,
+                request.obj,
+                structure,
+                recurse_calls=True,
+                max_depth=max_depth,
+                member_sink=session.member_sink,
+            )
+            visitor.process()
+            session.finish_scan(visitor, source_base=request.source_base)
+            for field_offset, child in getattr(
+                visitor, "pointer_child_structures", {}
+            ).items():
+                merged = pointer_children.get(field_offset)
+                if merged is None:
+                    pointer_children[field_offset] = child
+                else:
+                    for child_member in child.members:
+                        merged.add_member(child_member)
+
+        if not session.has_observations:
+            return None
+
+        result = session.commit()
+        self._register_structure_models(result.structures)
+        self._link_pointer_children(structure, pointer_children)
+        self.current_structure = self.structures.get(
+            selected_structure_name, structure
+        )
+        if self.ui is not None:
+            self.reload_structure_list()
+        else:
+            self.update_structure_fields()
+            self.update_action_states()
+        return result
+
+    def _link_pointer_children(
+        self,
+        parent_structure: Structure,
+        pointer_children: dict[int, Structure],
+    ) -> None:
+        """Create and link auto-reconstructed pointer-linked child structures.
+
+        Each entry is the pointee of a pointer field (e.g. a vtable / function
+        pointer table) discovered while deep scanning. The child is given a
+        globally-unique name, registered, and linked to its parent field with
+        a pointer relationship so the field can be retyped to ``child *``.
+        """
+        for field_offset in sorted(pointer_children):
+            child = pointer_children[field_offset]
+            child.auto_resolve()
+            if not any(getattr(m, "enabled", True) for m in child.members):
+                continue
+            parent_member = parent_structure.get_member_by_offset(field_offset)
+            if parent_member is None:
+                continue
+            # Do not clobber a field that already links to an embedded/pointer child.
+            if getattr(parent_member, "linked_child_structure_name", None):
+                continue
+            child.name = self._make_unique_structure_name(
+                f"struct_field_{field_offset:x}"
+            )
+            child.is_auto_named = True
+            child.set_provenance(
+                kind="child_scan", source_member_offset=field_offset
+            )
+            self.structures[child.name] = child
+            self._link_child_structure(
+                parent_structure, child, parent_member, "pointer"
+            )
 
     @staticmethod
     def _prepare_scan_cfunc(func_ea: int):
@@ -836,6 +954,11 @@ class ChildScanMixin:
             ),
             has_multiple_roots=len(function_eas) > 1 or len(expression_eas) > 1,
             scan_variables=seeded_scan_variables,
+            source_base=(
+                0
+                if relation_kind == "pointer"
+                else self._child_scan_origin(member)
+            ),
         )
 
 
@@ -857,8 +980,7 @@ class ChildScanMixin:
         child_structure: Structure,
         plan: ChildScanPlan,
     ) -> bool:
-        scanned_any = False
-        visitor_cls = getattr(_form_module(), "NewDeepScanVisitor", NewDeepScanVisitor)
+        requests: list[HierarchyScanRequest] = []
         evidence_by_function = self._collect_evidence_by_function(plan)
 
         for func_ea in plan.function_eas:
@@ -867,12 +989,52 @@ class ChildScanMixin:
                 continue
 
             scan_variables = evidence_by_function.get(func_ea) or [plan.scan_object]
-            if self._scan_evidence_in_function(
-                child_structure, cfunc, scan_variables, plan, visitor_cls
-            ):
-                scanned_any = True
+            for scan_variable in scan_variables:
+                seeded_scan_object = self._seed_scan_object_from_evidence(
+                    plan.scan_object, scan_variable
+                )
+                if seeded_scan_object is None:
+                    log_warning(
+                        f"Skipping child scan evidence without a usable location in {hex(func_ea)}",
+                        True,
+                    )
+                    continue
 
-        return scanned_any
+                inferred_roots = self._infer_child_scan_roots(cfunc, seeded_scan_object)
+                if inferred_roots:
+                    log_info(
+                        "Child scan inferred "
+                        f"{len(inferred_roots)} assignment root(s) for "
+                        f"{getattr(seeded_scan_object, 'name', '<unnamed>')} in {hex(func_ea)}"
+                    )
+                    roots = inferred_roots
+                else:
+                    log_warning(
+                        "Child scan fell back to seeded member evidence for "
+                        f"{getattr(seeded_scan_object, 'name', '<unnamed>')} in {hex(func_ea)}"
+                    )
+                    roots = (seeded_scan_object,)
+
+                for root in roots:
+                    root_cfunc = self._prepare_scan_cfunc(
+                        getattr(root, "func_ea", idaapi.BADADDR)
+                    ) or cfunc
+                    requests.append(
+                        HierarchyScanRequest(
+                            cfunc=root_cfunc,
+                            obj=root,
+                            source_base=plan.source_base,
+                        )
+                    )
+
+        return (
+            self._run_deep_hierarchy_scan(
+                child_structure,
+                requests,
+                max_depth=None,
+            )
+            is not None
+        )
 
     @staticmethod
     def _collect_evidence_by_function(plan: ChildScanPlan) -> dict[int, list[ScanObject]]:
@@ -886,58 +1048,6 @@ class ChildScanMixin:
             evidence_by_function.setdefault(func_ea, []).append(normalized)
         return evidence_by_function
 
-    def _scan_evidence_in_function(
-        self,
-        child_structure: Structure,
-        cfunc: ida_hexrays.cfunc_t,
-        scan_variables,
-        plan: ChildScanPlan,
-        visitor_cls,
-    ) -> bool:
-        """Run the deep scan for one evidence function; True if any visitor ran."""
-        scanned_any = False
-        for scan_variable in scan_variables:
-            seeded_scan_object = self._seed_scan_object_from_evidence(
-                plan.scan_object, scan_variable
-            )
-            if seeded_scan_object is None:
-                log_warning(
-                    f"Skipping child scan evidence without a usable location in {hex(cfunc.entry_ea)}",
-                    True,
-                )
-                continue
-
-            inferred_roots = self._infer_child_scan_roots(cfunc, seeded_scan_object)
-            if inferred_roots:
-                log_info(
-                    "Child scan inferred "
-                    f"{len(inferred_roots)} assignment root(s) for "
-                    f"{getattr(seeded_scan_object, 'name', '<unnamed>')} in {hex(cfunc.entry_ea)}"
-                )
-                roots = inferred_roots
-            else:
-                log_warning(
-                    "Child scan fell back to seeded member evidence for "
-                    f"{getattr(seeded_scan_object, 'name', '<unnamed>')} in {hex(cfunc.entry_ea)}"
-                )
-                roots = (seeded_scan_object,)
-
-            for root in roots:
-                root_cfunc = self._prepare_scan_cfunc(
-                    getattr(root, "func_ea", idaapi.BADADDR)
-                ) or cfunc
-                visitor = visitor_cls(
-                    root_cfunc,
-                    child_structure.main_offset,
-                    root,
-                    child_structure,
-                    recurse_calls=True,
-                    skip_until_object=False,
-                )
-                visitor.process()
-                scanned_any = True
-
-        return scanned_any
 
 
 
@@ -1022,9 +1132,11 @@ class ChildScanMixin:
         if child_structure is None:
             return
 
-        child_origin = self._child_scan_origin(selected_member)
-        if child_structure.main_offset != child_origin:
-            child_structure.set_main_offset(child_origin)
+        # The hierarchy session places child observations by subtracting the
+        # plan's source_base, so the child structure itself is stored
+        # child-local (main_offset 0) for both pointer and embedded relations.
+        if child_structure.main_offset != 0:
+            child_structure.set_main_offset(0)
 
         existing_member_count = len(child_structure.members)
         scanned_any = self._execute_child_scan_plan(child_structure, plan)

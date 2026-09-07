@@ -8,6 +8,7 @@ from forge.api.hexrays import ctype, find_expr_address, to_function_offset_str
 from forge.api.scan_object import MemoryAllocationObject, ObjectType, ScanObject
 from forge.api.ui_actions import HexRaysPopupAction, register_action
 from forge.api.visitor import RecursiveUpwardsObjectVisitor
+from forge.util.logging import log_debug
 
 
 def _make_allocation_chooser(items):
@@ -38,7 +39,14 @@ def _make_allocation_chooser(items):
 
 class GuessAllocationVisitor(RecursiveUpwardsObjectVisitor):
     def __init__(self, cfunc, obj: ScanObject, *, interactive: bool = True):
-        super().__init__(cfunc, obj, skip_until_object=True)
+        try:
+            super().__init__(cfunc, obj, skip_until_object=True)
+        except TypeError:
+            super().__init__(cfunc, obj)
+        self._cfunc = getattr(self, "_cfunc", cfunc)
+        self._init_obj = getattr(self, "_init_obj", obj)
+        self.parents = getattr(self, "parents", [])
+        self._skip = getattr(self, "_skip", True)
         self._data = []
         self._interactive = interactive
 
@@ -56,7 +64,7 @@ class GuessAllocationVisitor(RecursiveUpwardsObjectVisitor):
             return False
 
         return obj_ea == find_expr_address(cexpr, getattr(self, "parents", []))
-    
+
     def _discover_allocation_via_callee(self, call_expr, obj):
         """Cross-function allocation discovery (I.25, E.22/I.25 alias chain).
 
@@ -151,7 +159,8 @@ class GuessAllocationVisitor(RecursiveUpwardsObjectVisitor):
                         None,
                         callee_ea,
                     ]
-        except Exception:  # noqa: BLE001 — cross-function recon is best-effort
+        except Exception as exc:  # noqa: BLE001 — cross-function recon is best-effort
+            log_debug(f"Cross-function allocation discovery failed: {exc!r}")
             return None
         return None
 
@@ -181,8 +190,19 @@ class GuessAllocationVisitor(RecursiveUpwardsObjectVisitor):
         same lvar as ``source`` — returns the `w` node (single var after
         cast-peel), or None. Same identity matching as
         :meth:`_find_allocator_assignment` (lvar index, EA fallback)."""
-        source_idx = getattr(getattr(source, "v", None), "idx", None)
-        source_ea = getattr(source, "ea", None)
+        source_var = self._as_single_var(source)
+        if source_var is None and getattr(getattr(source, "v", None), "idx", None) is not None:
+            # The source is already the var node itself (var nodes always
+            # carry ``v``; some builds and test doubles omit ``op``).
+            source_var = source
+        source_idx = getattr(getattr(source_var, "v", None), "idx", None)
+        source_ea = getattr(source_var, "ea", None)
+        if source_idx is None and source_ea in (None, 0):
+            # A cast-peeled node with no identity (`v` is None and the EA is
+            # unset) cannot be tied to one lvar; matching unconstrained made
+            # the FIRST `x = <single var>` move win regardless of variable
+            # (review repro, 2026-09-07).
+            return None
         for target, rhs in self._iter_assignment_sites(cfunc):
             if target is None:
                 continue
@@ -234,6 +254,12 @@ class GuessAllocationVisitor(RecursiveUpwardsObjectVisitor):
             returned = returned.x
             returned_idx = getattr(getattr(returned, "v", None), "idx", None)
             returned_ea = getattr(returned, "ea", None) or returned_ea
+        if returned_idx is None and returned_ea in (None, 0):
+            # Same guard as :meth:`_aliased_hop_target`: a peeled node with
+            # no lvar index and no EA cannot be tied to one lvar — matching
+            # unconstrained picks the first assignment regardless of
+            # variable (review repro, 2026-09-07).
+            return None
         for target, rhs in self._iter_assignment_sites(cfunc):
             if target is None:
                 continue

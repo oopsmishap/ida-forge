@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 import ida_funcs
 import ida_hexrays
 import ida_idaapi
@@ -29,6 +31,25 @@ from forge.api.scan_object import (
 )
 from forge.api.types import types
 from forge.util.logging import log_debug, log_info, log_trace, log_warning
+
+
+@dataclass(frozen=True)
+class RecursiveCallFrame:
+    """One caller-argument scan position in the recursive call tree.
+
+    ``base_offset`` is the byte offset within the ROOT scanned structure at
+    which this callee's view of the object starts: it accumulates the argument
+    offsets along the caller chain so member observations recorded during the
+    callee scan can be placed absolutely by the hierarchy session.
+    """
+
+    frame_id: int
+    parent_frame_id: int | None
+    function_ea: int
+    argument_index: int
+    call_site_ea: int
+    base_offset: int
+    depth: int
 
 
 class ObjectVisitor(ida_hexrays.ctree_parentee_t):
@@ -132,9 +153,6 @@ class DownwardsObjectVisitor(ObjectVisitor):
 
         return resolve_lvar_init_alloc_size(self._cfunc, lvar_index)
 
-
-
-
     def _append_scan_object(
         self, new_obj: ScanObject | None, source_obj: ScanObject
     ) -> None:
@@ -192,8 +210,6 @@ class DownwardsObjectVisitor(ObjectVisitor):
             == getattr(self._cfunc, "entry_ea", ida_idaapi.BADADDR)
         ):
             self._rescan_current_function = True
-
-
 
     def _matches_object(self, obj: ScanObject, cexpr: ida_hexrays.cexpr_t) -> bool:
         target_matches = getattr(obj, "is_target", None)
@@ -395,39 +411,71 @@ class UpwardsObjectVisitor(ObjectVisitor):
 
     def _prepare(self):
         # R3.12: refuse to merge two VariableObjects through the
-        # transitive closure when their alloc sizes disagree (one
-        # known different from the other known, or a known different
-        # from unknown — unknown is permissive, two knowns equal is
-        # fine, two knowns unequal is rejected).
-        result: set = set()
-        todo: set = set(self._objects)
-        while todo:
-            obj = todo.pop()
-            obj_alloc = self._alloc_size(obj)
-            if obj_alloc and any(
-                self._alloc_size(other) and self._alloc_size(other) != obj_alloc
-                for other in result
+        # transitive closure when their alloc sizes disagree.  Known
+        # sizes seen during the closure run are tracked in
+        # ``seen_sizes``; a known size conflicting with an
+        # already-seen known size is rejected, and a SECOND DISTINCT
+        # known size is rejected too — it must never be folded into
+        # the accepted set, or later known-size objects are skipped
+        # asymmetrically and their subtrees orphaned.  Unknown sizes
+        # stay permissive.
+        accepted_objects: set = set()
+        seen_sizes: set[tuple] = set()
+        pending: set = set(self._objects)
+        while pending:
+            current_object = pending.pop()
+            object_alloc_size = self._alloc_size(current_object)
+            if object_alloc_size and any(
+                sz != object_alloc_size for sz in seen_sizes
             ):
-                # size mismatch with an already-collected root — skip
+                # size mismatch with an already-seen allocation — skip
                 # this object; do not propagate its assignments.
                 continue
-            result.add(obj)
-            if getattr(obj, "id", None) == ObjectType.call_argument or obj not in self._tree:
+            accepted_objects.add(current_object)
+            if object_alloc_size:
+                seen_sizes.add(object_alloc_size)
+            if (
+                getattr(current_object, "id", None) == ObjectType.call_argument
+                or current_object not in self._tree
+            ):
+                continue
+            children = self._tree[current_object]
+            known_child_sizes = {
+                size
+                for child in children
+                if (size := self._alloc_size(child))
+            }
+            if not object_alloc_size and len(known_child_sizes) > 1:
+                # R3.12: an UNKNOWN-size parent (e.g. a phi-merged lvar
+                # ``void *p; if (c) p = a(0x2C); else p = b(0x38)``)
+                # whose children carry two distinct known sizes would
+                # batch-accept and fold two different allocations.
+                # Reject the parent's propagation entirely: the parent
+                # stays accepted, but its children are not pulled in.
+                # Parents with a known size (or children with a single
+                # consistent known size) keep the validated behavior.
+                log_debug(
+                    "refusing upwards closure through unknown-size "
+                    "parent with conflicting child alloc sizes "
+                    f"{sorted(sz[0] for sz in known_child_sizes)}"
+                )
                 continue
             # R3.12: when propagating, drop any child whose known alloc
-            # size conflicts with a known root already in result.
-            new_obj_allocs = {self._alloc_size(c) for c in self._tree[obj]}
-            conflicting_sizes = {
-                sz for sz in new_obj_allocs if sz and any(
-                    self._alloc_size(other) and self._alloc_size(other) != sz
-                    for other in result
+            # size conflicts with a known size seen in this closure.
+            eligible_children = {
+                child
+                for child in children
+                if not self._alloc_size(child)
+                or not any(
+                    sz != self._alloc_size(child) for sz in seen_sizes
                 )
             }
-            o = {c for c in self._tree[obj] if self._alloc_size(c) not in conflicting_sizes}
-            todo |= o - result
-            result |= o
-        self._objects = list(result)
+            pending |= eligible_children - accepted_objects
+            accepted_objects |= eligible_children
+        self._objects = list(accepted_objects)
         self._tree.clear()
+
+
 class RecursiveObjectVisitor(ObjectVisitor):
     def __init__(
         self,
@@ -435,16 +483,16 @@ class RecursiveObjectVisitor(ObjectVisitor):
         obj: ScanObject,
         data=None,
         skip_until_object=False,
-        visited=None,
+        visited: set | None = None,
     ):
         ObjectVisitor.__init__(self, cfunc, obj, data, skip_until_object)
-        self._visited = visited if visited else set()
-        self._new_for_visit = set()
-        self.crippled = False
-        self._arg_index = -1
-        self._debug_scan_tree = {}
-        self._debug_scan_tree_root = ida_funcs.get_func_name(self._cfunc.entry_ea)
-        self._debug_message = []
+        self._visited: set = visited if visited is not None else set()
+        self._new_for_visit: set[tuple[int, int]] = set()
+        self.crippled: bool = False
+        self._arg_index: int | None = -1
+        self._debug_scan_tree: dict[tuple[str, int], set[tuple[str, int]]] = {}
+        self._debug_scan_tree_root: str = ida_funcs.get_func_name(self._cfunc.entry_ea)
+        self._debug_message: list[str] = []
 
     def visit_expr(self, cexpr: ida_hexrays.cexpr_t):
         return super().visit_expr(cexpr)
@@ -485,36 +533,84 @@ class RecursiveObjectVisitor(ObjectVisitor):
         )
 
     def process(self):
+        """Run the visitor lifecycle and render its scan tree.
+
+        ``_finish`` always runs after recursive processing starts. If either
+        body or finish callback raises, normal Python exception precedence
+        applies; scan-tree rendering is skipped on failure.
+        """
         self._start()
-        self._recursive_process()
-        self._finish()
+        try:
+            self._recursive_process()
+        finally:
+            self._finish()
         self.dump_scan_tree()
 
     def dump_scan_tree(self):
+        """Reset, render, and log the current scan tree.
+
+        Rendering and logging errors intentionally propagate to the caller;
+        diagnostics must not silently hide a failed render.
+        """
+        self._debug_message.clear()
         self._prepare_scan_tree()
         newline = "\n"
         log_info(f"{newline.join(self._debug_message)}\n---------------")
 
-    def _prepare_scan_tree(self, key=None, level=1):
+    def _prepare_scan_tree(
+        self,
+        key=None,
+        level=1,
+        _path: set[tuple[str, int]] | None = None,
+    ):
+        """Render scan-tree paths without Python recursion limits.
+
+        ``_path`` is path-local, not global, so shared descendants remain
+        visible for each distinct parent path while recursive cycles terminate.
+        An explicit stack keeps deep call graphs renderable without changing
+        ordering, indentation, or caller-supplied path ownership.
+        """
+        if _path is None:
+            _path = set()
         if key is None:
             key = (self._debug_scan_tree_root, -1)
             self._debug_message.append(
                 f"\n--- Scan Tree ---\n{self._debug_scan_tree_root}"
             )
-        if key in self._debug_scan_tree:
-            for func_name, arg_idx in self._debug_scan_tree[key]:
-                prefix = " | " * (level - 1) + " |_ "
-                self._debug_message.append(f"{prefix}{func_name}(idx: {arg_idx})")
-                self._prepare_scan_tree((func_name, arg_idx), level + 1)
-
+        stack = [(key, level, False, True)]
+        try:
+            while stack:
+                current_key, current_level, exiting, is_root = stack.pop()
+                if exiting:
+                    _path.remove(current_key)
+                    continue
+                if not is_root:
+                    func_name, arg_idx = current_key
+                    prefix = " | " * (current_level - 2) + " |_ "
+                    self._debug_message.append(
+                        f"{prefix}{func_name}(idx: {arg_idx})"
+                    )
+                if current_key in _path:
+                    continue
+                _path.add(current_key)
+                stack.append((current_key, current_level, True, is_root))
+                children = sorted(self._debug_scan_tree.get(current_key, ()))
+                # LIFO stack: push ascending siblings reversed so each
+                # sibling's own line and subtree render in ascending order.
+                for child in reversed(children):
+                    stack.append((child, current_level + 1, False, False))
+        finally:
+            while stack:
+                current_key, _current_level, exiting, _is_root = stack.pop()
+                if exiting and current_key in _path:
+                    _path.remove(current_key)
     def _recursive_process(self):
+        """Run one recursive pass and always finish its iteration callback."""
         self._start_iteration()
-        super().process()
-        self._finish_iteration()
-
-    def _manipulate(self, cexpr, obj):
-        self._check_call(cexpr)
-        super()._manipulate(cexpr, obj)
+        try:
+            super().process()
+        finally:
+            self._finish_iteration()
 
     def _check_call(self, cexpr: ida_hexrays.cexpr_t):
         raise NotImplementedError
@@ -575,6 +671,111 @@ class RecursiveDownwardsObjectVisitor(RecursiveObjectVisitor, DownwardsObjectVis
         self._recurse_calls = recurse_calls
         self._max_depth = max_depth
         self._visit_base_offsets: dict[tuple[int, int], int] = {}
+        root_frame = RecursiveCallFrame(
+            frame_id=0,
+            parent_frame_id=None,
+            function_ea=cfunc.entry_ea,
+            argument_index=-1,
+            call_site_ea=ida_idaapi.BADADDR,
+            base_offset=0,
+            depth=0,
+        )
+        self._call_frames: dict[int, RecursiveCallFrame] = {0: root_frame}
+        self._frame_children: dict[int, list[int]] = {0: []}
+        self._frame_aliases: dict[int, int] = {}
+        self._visited_frames: dict[tuple[int, int], int] = {}
+        self._evidence_cache: dict[tuple[int, int, int], int] = {}
+        self._current_frame = root_frame
+        self._next_frame_id = 1
+        # Deep scans queue whole RecursiveCallFrame visits (shallow/upwards
+        # visitors keep the base tuple set) so every nested scan knows which
+        # caller position it is observing and can report it to a member sink.
+        self._new_for_visit: list[RecursiveCallFrame] = []
+
+    @property
+    def current_frame(self) -> RecursiveCallFrame:
+        return self._current_frame
+
+    @property
+    def call_frames(self) -> tuple[RecursiveCallFrame, ...]:
+        return tuple(self._call_frames[frame_id] for frame_id in sorted(self._call_frames))
+
+    @property
+    def frame_aliases(self) -> dict[int, int]:
+        return dict(self._frame_aliases)
+
+    def canonical_frame_id(self, frame_id: int) -> int:
+        while frame_id in self._frame_aliases:
+            frame_id = self._frame_aliases[frame_id]
+        return frame_id
+
+    def _has_active_ancestor(self, function_ea: int, argument_index: int) -> bool:
+        frame: RecursiveCallFrame | None = self._current_frame
+        while frame is not None:
+            if (
+                frame.function_ea == function_ea
+                and frame.argument_index == argument_index
+            ):
+                return True
+            if frame.parent_frame_id is None:
+                break
+            frame = self._call_frames[frame.parent_frame_id]
+        return False
+
+    def _add_visit(
+        self,
+        func_ea: int,
+        arg_idx: int,
+        call_site_ea: int = ida_idaapi.BADADDR,
+        relative_offset: int = 0,
+    ) -> bool:
+        parent_frame = self._current_frame
+        depth = parent_frame.depth + 1
+        if self._max_depth is not None and depth > self._max_depth:
+            return False
+        if self._has_active_ancestor(func_ea, arg_idx):
+            return False
+
+        frame = RecursiveCallFrame(
+            frame_id=self._next_frame_id,
+            parent_frame_id=parent_frame.frame_id,
+            function_ea=func_ea,
+            argument_index=arg_idx,
+            call_site_ea=call_site_ea,
+            base_offset=parent_frame.base_offset + relative_offset,
+            depth=depth,
+        )
+        self._next_frame_id += 1
+        self._call_frames[frame.frame_id] = frame
+        self._frame_children.setdefault(frame.parent_frame_id, []).append(frame.frame_id)
+        self._frame_children[frame.frame_id] = []
+
+        cache_key = (func_ea, arg_idx, frame.base_offset)
+        canonical_frame_id = self._evidence_cache.get(cache_key)
+        if (func_ea, arg_idx) in self._visited or canonical_frame_id is not None:
+            # Already covered by an earlier scan position: keep the frame in
+            # the tree for evidence bookkeeping but alias it to the canonical
+            # (actually scanned) frame instead of rescanning.  A revisit at a
+            # DIFFERENT base_offset has no evidence-cache entry (the cache is
+            # keyed by offset); alias it to the earlier (func_ea, arg_idx)
+            # frame anyway — offsets differ, but the earlier frame is the one
+            # that actually scanned this callee, so canonical_frame_id keeps
+            # finding a covering scan.
+            if canonical_frame_id is not None:
+                self._frame_aliases[frame.frame_id] = canonical_frame_id
+            else:
+                earlier_frame_id = self._visited_frames.get((func_ea, arg_idx))
+                if earlier_frame_id is not None:
+                    self._frame_aliases[frame.frame_id] = earlier_frame_id
+            return False
+        self._visited.add((func_ea, arg_idx))
+        self._visited_frames[(func_ea, arg_idx)] = frame.frame_id
+        self._evidence_cache[cache_key] = frame.frame_id
+        log_debug(
+            f"Add visit {to_hex(func_ea)} {arg_idx} at {to_hex(frame.base_offset)}\n\n"
+        )
+        self._new_for_visit.append(frame)
+        return True
 
 
     def _referenced_object(self, cexpr):
@@ -665,7 +866,51 @@ class RecursiveDownwardsObjectVisitor(RecursiveObjectVisitor, DownwardsObjectVis
             return
         if member is not None:
             log_debug(f"[I.20] memory-writer member at 0x{offset:x} via {canonical}")
-            self._structure.add_member(member)
+            emitter = getattr(self, "_emit_member", None)
+            if callable(emitter):
+                # NewDeepScanVisitor with a member sink routes every member
+                # (including synthesized ones) through the frame-aware path.
+                emitter(member)
+            else:
+                self._structure.add_member(member)
+
+    def _is_unplaceable_call_argument(self, cexpr) -> bool:
+        """True when the call argument's expression cannot be pinned to a
+        fixed offset of the scanned object (indexed / pointer-member loads).
+        """
+        indexed_op = getattr(ctype, "idx", None)
+        pointer_member_op = getattr(ctype, "memptr", None)
+        work = [cexpr]
+        while work:
+            expr = work.pop()
+            if expr is None:
+                continue
+            op = getattr(expr, "op", None)
+            if op in (indexed_op, pointer_member_op):
+                return True
+            work.append(getattr(expr, "x", None))
+            work.append(getattr(expr, "y", None))
+        return False
+
+    def _argument_is_tracked_root(self, cexpr) -> bool:
+        """True when the call argument's value is itself a tracked scan object.
+
+        Deep-scanning a pointer that lives in a member/indexed expression (for
+        example ``this->u32_28`` typed as a scalar but used as a pointer) must
+        follow that value into the callee to reconstruct what it points at.
+        Such an argument otherwise looks ``unplaceable`` because it contains a
+        ``memptr``/``idx`` node. Only the argument value itself qualifies here;
+        a sub-field address like ``&a1->field`` does not, so embedded-hierarchy
+        placement rules are unaffected.
+        """
+        expr = cexpr
+        cast_op = getattr(ctype, "cast", None)
+        while expr is not None and getattr(expr, "op", None) == cast_op:
+            expr = getattr(expr, "x", None)
+        if expr is None:
+            return False
+        return any(self._matches_object(obj, expr) for obj in self._objects)
+
 
     def _check_call(self, cexpr: ida_hexrays.cexpr_t):
         parent: ida_hexrays.cexpr_t | None = self.parent_expr()
@@ -685,6 +930,9 @@ class RecursiveDownwardsObjectVisitor(RecursiveObjectVisitor, DownwardsObjectVis
 
         if not self._expression_references_object(cexpr):
             return
+        is_tracked_root = self._argument_is_tracked_root(cexpr)
+        if not is_tracked_root and self._is_unplaceable_call_argument(cexpr):
+            return
         _, arg_offset = _extract_offset_expression(cexpr)
         if arg_offset is None:
             arg_offset = 0
@@ -699,7 +947,12 @@ class RecursiveDownwardsObjectVisitor(RecursiveObjectVisitor, DownwardsObjectVis
         # member for it before the ordinary argument-tracking path.
         if idx == 0:
             self._maybe_add_memory_writer_member(call_cexpr, arg_cexpr)
-        if self._add_visit(func_ea, idx):
+        # A tracked-root pointer passed by value opens a fresh pointee at
+        # base 0; the parser's offset there is the member's slot inside its
+        # own parent, which is irrelevant to what the pointer points at.
+        relative_offset = 0 if is_tracked_root else arg_offset
+        call_site_ea = getattr(call_cexpr, "ea", ida_idaapi.BADADDR)
+        if self._add_visit(func_ea, idx, call_site_ea, relative_offset):
             self._visit_base_offsets[(func_ea, idx)] = arg_offset
             self._add_scan_tree_info(func_ea, idx)
 
@@ -726,16 +979,20 @@ class RecursiveDownwardsObjectVisitor(RecursiveObjectVisitor, DownwardsObjectVis
 
     _VISIT_DEFERRED = object()
 
-    def _execute_visit(self, func_ea: int, arg_idx: int, acc_offset: int):
-        """Scan one caller-argument visit; spool discovered children.
+    def _execute_visit(self, frame: RecursiveCallFrame):
+        """Scan one caller-argument frame and spool the frames it discovered.
+
+        Nested visitor state is restored and the shared visit queue is cleared
+        in all outcomes before returning or propagating an exception.
 
         Returns:
-          - a list of ``(ea, arg_idx, acc_offset)`` child visits to queue,
+          - a list of child RecursiveCallFrame visits to queue,
           - ``_VISIT_DEFERRED`` when the callee cannot accept the argument yet
             (argidx unknown mid-analysis) and the visit must be retried,
-          - ``None`` when the visit is dropped (decompilation failure).
+          - ``None`` when the visit is dropped (decompilation failure or
+            varargs callee).
         """
-        cfunc = decompile(func_ea)
+        cfunc = decompile(frame.function_ea)
         if cfunc is None:
             return None
         cfunc = self._refresh_decompilation_tree(cfunc)
@@ -751,10 +1008,11 @@ class RecursiveDownwardsObjectVisitor(RecursiveObjectVisitor, DownwardsObjectVis
         is_vararg_cc = getattr(func_type, "is_vararg_cc", None)
         if callable(is_vararg_cc) and is_vararg_cc():
             log_debug(
-                f"Skipping varargs callee {to_hex(func_ea)} - format-style body"
+                f"Skipping varargs callee {to_hex(frame.function_ea)} - format-style body"
             )
             return None
 
+        arg_idx = frame.argument_index
         argidx = getattr(cfunc, "argidx", ())
         if arg_idx is None or arg_idx < 0 or arg_idx >= len(argidx):
             return self._VISIT_DEFERRED
@@ -762,86 +1020,71 @@ class RecursiveDownwardsObjectVisitor(RecursiveObjectVisitor, DownwardsObjectVis
         arg, lvar_idx = get_argument(cfunc, arg_idx)
         obj = VariableObject(arg, lvar_idx)
 
-        saved_cfunc = self._cfunc
-        saved_arg_index = getattr(self, "_arg_index", None)
-        saved_objects = list(getattr(self, "_objects", []))
-        saved_skip = getattr(self, "_skip", False)
-        saved_init_obj = getattr(self, "_init_obj", None)
+        saved_cfunc: ida_hexrays.cfunc_t = self._cfunc
+        saved_arg_index: int | None = getattr(self, "_arg_index", None)
+        saved_objects: list[ScanObject] = list(getattr(self, "_objects", []))
+        saved_skip: bool = getattr(self, "_skip", False)
+        saved_init_obj: ScanObject | None = getattr(self, "_init_obj", None)
+        saved_base_offset: int = self._callee_base_offset
+        saved_frame: RecursiveCallFrame = self._current_frame
 
-        saved_base_offset = self._callee_base_offset
-        self._callee_base_offset = acc_offset
-        self.prepare_new_scan(cfunc, lvar_idx, obj)
-        self._scan_single_function()
-        self._callee_base_offset = saved_base_offset
-
-        children: list[tuple[int, int, int]] = []
-        for child_ea, child_idx in self._new_for_visit:
-            child_offset = acc_offset + self._visit_base_offsets.get(
-                (child_ea, child_idx), 0
-            )
-            children.append((child_ea, child_idx, child_offset))
-        self._new_for_visit.clear()
-
-        self._cfunc = saved_cfunc
-        self._arg_index = saved_arg_index
-        self._objects = saved_objects
-        self._skip = saved_skip
-        self._init_obj = saved_init_obj
-
-        return children
+        try:
+            self._callee_base_offset = frame.base_offset
+            self._current_frame = frame
+            self.prepare_new_scan(cfunc, lvar_idx, obj)
+            self._scan_single_function()
+            children: list[RecursiveCallFrame] = list(self._new_for_visit)
+            self._new_for_visit.clear()
+            return children
+        finally:
+            self._new_for_visit.clear()
+            self._callee_base_offset = saved_base_offset
+            self._cfunc = saved_cfunc
+            self._arg_index = saved_arg_index
+            self._objects = saved_objects
+            self._skip = saved_skip
+            self._init_obj = saved_init_obj
+            self._current_frame = saved_frame
 
     def _recursive_process(self):
-        self._scan_single_function()
+        """Run the root scan, then process caller-argument frames.
 
-        pending_visits: list[tuple[int, int, int]] = [
-            (fe, ai, self._visit_base_offsets.get((fe, ai), 0))
-            for (fe, ai) in self._new_for_visit
-        ]
-        self._new_for_visit.clear()
-        deferred_visits: list[tuple[int, int, int]] = []
+        Deferred frames (callee argidx not resolved yet) are retried after
+        the queue drains; the loop stops as soon as a full pass makes no
+        progress so mid-analysis callees cannot spin the scan forever.
+        """
+        try:
+            self._scan_single_function()
 
-        while pending_visits:
-            func_ea, arg_idx, acc_offset = pending_visits.pop()
+            pending_visits: list[RecursiveCallFrame] = sorted(
+                self._new_for_visit,
+                key=lambda frame: (
+                    frame.function_ea,
+                    frame.argument_index,
+                    frame.base_offset,
+                ),
+            )
+            self._new_for_visit.clear()
+            deferred_visits: list[RecursiveCallFrame] = []
 
-            outcome = self._execute_visit(func_ea, arg_idx, acc_offset)
-            if outcome is self._VISIT_DEFERRED:
-                deferred_visits.append((func_ea, arg_idx, acc_offset))
-                continue
-            if outcome:
-                pending_visits.extend(outcome)
-
-            if not pending_visits and deferred_visits:
-                pending_visits = deferred_visits
-                deferred_visits = []
-
-        while deferred_visits:
-            next_round: list[tuple[int, int, int]] = []
-            progressed = False
-            for func_ea, arg_idx, acc_offset in deferred_visits:
-                outcome = self._execute_visit(func_ea, arg_idx, acc_offset)
-                if outcome is self._VISIT_DEFERRED:
-                    next_round.append((func_ea, arg_idx, acc_offset))
-                    continue
-                if outcome is None:
-                    # Decompilation failed: the visit is dropped and counts
-                    # as no progress (matches the original loop semantics).
-                    continue
-                if outcome:
-                    pending_visits.extend(outcome)
-                progressed = True
-
-            if pending_visits:
+            while pending_visits or deferred_visits:
+                progressed = False
                 while pending_visits:
-                    func_ea, arg_idx, acc_offset = pending_visits.pop()
-                    if arg_idx is None:
+                    frame = pending_visits.pop()
+
+                    outcome = self._execute_visit(frame)
+                    if outcome is self._VISIT_DEFERRED:
+                        deferred_visits.append(frame)
                         continue
-                    next_round.append((func_ea, arg_idx, acc_offset))
+                    if outcome:
+                        pending_visits.extend(outcome)
+                        progressed = True
 
-            if not progressed or not next_round:
-                break
-            deferred_visits = next_round
-
-
+                if not deferred_visits or not progressed:
+                    break
+                pending_visits, deferred_visits = deferred_visits, []
+        finally:
+            self._new_for_visit.clear()
 
 class RecursiveUpwardsObjectVisitor(RecursiveObjectVisitor, UpwardsObjectVisitor):
     def __init__(

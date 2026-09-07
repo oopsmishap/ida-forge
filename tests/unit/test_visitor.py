@@ -18,11 +18,39 @@ import ida_idaapi
 ida_idaapi.BADADDR = -1
 
 
+def _root_frame(visitor_module, function_ea=0x401000):
+    return visitor_module.RecursiveCallFrame(
+        frame_id=0,
+        parent_frame_id=None,
+        function_ea=function_ea,
+        argument_index=-1,
+        call_site_ea=ida_idaapi.BADADDR,
+        base_offset=0,
+        depth=0,
+    )
+
+
+def _child_frame(visitor_module, frame_id, function_ea, argument_index, base_offset):
+    return visitor_module.RecursiveCallFrame(
+        frame_id=frame_id,
+        parent_frame_id=0,
+        function_ea=function_ea,
+        argument_index=argument_index,
+        call_site_ea=ida_idaapi.BADADDR,
+        base_offset=base_offset,
+        depth=1,
+    )
+
+
 def _load_visitor_module():
     visitor_path = Path(__file__).resolve().parents[2] / "src" / "forge" / "api" / "visitor.py"
     spec = util.spec_from_file_location("forge.api.visitor_real", visitor_path)
     assert spec is not None and spec.loader is not None
     module = util.module_from_spec(spec)
+    # Python 3.14 dataclass processing resolves KW_ONLY sentinels through
+    # sys.modules[cls.__module__]; register the freshly-created module before
+    # executing it (same pattern as test_scanner.py's loader).
+    sys.modules["forge.api.visitor_real"] = module
     spec.loader.exec_module(module)
     return module
 
@@ -63,7 +91,7 @@ def test_execute_visit_drops_varargs_callees(monkeypatch):
     )
     visitor._cfunc = SimpleNamespace(entry_ea=0x401000)
     visitor._max_depth = None
-    visitor._current_depth = 0
+    visitor._current_frame = _root_frame(visitor_module)
     varargs_callee = SimpleNamespace(
         entry_ea=0x402000,
         argidx=[0],
@@ -83,32 +111,69 @@ def test_execute_visit_drops_varargs_callees(monkeypatch):
         lambda *args, **kwargs: argument_queries.append(args) or (None, None),
         raising=False,
     )
-    result = visitor._execute_visit(0x402000, 0, 0)
+    result = visitor._execute_visit(
+        _child_frame(visitor_module, 1, 0x402000, 0, 0)
+    )
     assert result is None
     assert argument_queries == []
 
 def test_recursive_downwards_object_visitor_skips_invalid_callee_ordinal(monkeypatch):
+    """A deferred callee whose ordinal never resolves (argidx still empty
+    after decompilation) must never reach prepare_new_scan: the frame is
+    deferred, retried once without progress, and finally dropped without
+    being scanned (ported from the pre-frame-API coverage on main)."""
     visitor_module = _load_visitor_module()
     visitor = visitor_module.RecursiveDownwardsObjectVisitor.__new__(
         visitor_module.RecursiveDownwardsObjectVisitor
     )
     visitor._cfunc = SimpleNamespace(entry_ea=0x401000)
     visitor._max_depth = None
-    visitor._current_depth = 0
-    visitor._new_for_visit = {(0x402000, 0)}
-    visitor._visit_base_offsets = {}
-    monkeypatch.setattr(visitor_module.RecursiveObjectVisitor, "_recursive_process", lambda self: None)
+    visitor._current_frame = _root_frame(visitor_module)
+    visitor._callee_base_offset = 0
+    visitor._new_for_visit = []
+    frame = _child_frame(visitor_module, 1, 0x402000, 0, 0)
+
+    invalid_callee = SimpleNamespace(entry_ea=0x402000, argidx=[], get_lvars=list)
     monkeypatch.setattr(
-        visitor_module,
-        "decompile",
-        lambda _ea: SimpleNamespace(entry_ea=0x402000, argidx=[], get_lvars=list),
+        visitor_module, "decompile", lambda _ea: invalid_callee, raising=False
+    )
+    monkeypatch.setattr(
+        visitor, "_refresh_decompilation_tree", lambda cfunc: cfunc, raising=False
     )
     prepared_calls = []
-    monkeypatch.setattr(visitor, "prepare_new_scan", lambda *args, **kwargs: prepared_calls.append(args), raising=False)
+    monkeypatch.setattr(
+        visitor,
+        "prepare_new_scan",
+        lambda *args, **kwargs: prepared_calls.append(args),
+        raising=False,
+    )
 
-    visitor._recursive_process()
-
+    # Direct: an unresolved ordinal defers the visit without preparing it.
+    assert visitor._execute_visit(frame) is visitor._VISIT_DEFERRED
     assert prepared_calls == []
+
+    # Loop-level: the deferred frame is retried once, makes no progress,
+    # and the scan terminates without ever preparing the visit.
+    visitor._scan_single_function = lambda: None
+    visitor._recursive_process()
+    assert prepared_calls == []
+    assert visitor._new_for_visit == []
+
+
+def test_recursive_visitor_preserves_empty_visited_set(monkeypatch):
+    visitor_module = _load_visitor_module()
+    supplied = set()
+    visitor = object.__new__(visitor_module.RecursiveObjectVisitor)
+    monkeypatch.setattr(
+        visitor_module.ObjectVisitor,
+        "__init__",
+        lambda self, cfunc, obj, data, skip_until_object: setattr(self, "_cfunc", cfunc),
+    )
+    visitor_module.RecursiveObjectVisitor.__init__(
+        visitor, SimpleNamespace(entry_ea=0), SimpleNamespace(), visited=supplied
+    )
+
+    assert visitor._visited is supplied
 
 
 def test_recursive_downwards_check_call_only_tracks_matched_argument(monkeypatch):
@@ -146,7 +211,7 @@ def test_recursive_downwards_check_call_only_tracks_matched_argument(monkeypatch
     monkeypatch.setattr(
         visitor,
         "_add_visit",
-        lambda func_ea, arg_idx: recorded_visits.append((func_ea, arg_idx)) or True,
+        lambda func_ea, arg_idx, *args: recorded_visits.append((func_ea, arg_idx)) or True,
         raising=False,
     )
     monkeypatch.setattr(
@@ -198,7 +263,7 @@ def test_recursive_downwards_check_call_follows_offset_expression(monkeypatch):
     monkeypatch.setattr(
         visitor,
         "_add_visit",
-        lambda func_ea, arg_idx: recorded_visits.append((func_ea, arg_idx)) or True,
+        lambda func_ea, arg_idx, *args: recorded_visits.append((func_ea, arg_idx)) or True,
         raising=False,
     )
     monkeypatch.setattr(
@@ -254,7 +319,14 @@ def test_extract_offset_expression_byte_pointer_add_is_unscaled():
     assert base is a1_var
     assert offset == 0x38
 
-def test_recursive_downwards_check_call_follows_member_address(monkeypatch):
+def test_recursive_downwards_check_call_skips_unplaceable_member_address(monkeypatch):
+    """``&a1->field`` / ``a1->field`` call arguments contain a ``memptr`` node
+    and cannot be pinned to a fixed offset of the scanned object: the deep
+    scan must NOT track the callee from them (fork behavior — the tracked
+    pointer inside such an expression is followed through the hierarchy
+    machinery instead). Only an argument whose value IS the tracked scan
+    object (``f(this->u32_28)`` during a sub-object scan) qualifies.
+    """
     visitor_module = _load_visitor_module()
     visitor = visitor_module.RecursiveDownwardsObjectVisitor.__new__(
         visitor_module.RecursiveDownwardsObjectVisitor
@@ -288,7 +360,7 @@ def test_recursive_downwards_check_call_follows_member_address(monkeypatch):
     monkeypatch.setattr(
         visitor,
         "_add_visit",
-        lambda func_ea, arg_idx: recorded_visits.append((func_ea, arg_idx)) or True,
+        lambda func_ea, arg_idx, *args: recorded_visits.append((func_ea, arg_idx)) or True,
         raising=False,
     )
     monkeypatch.setattr(
@@ -299,9 +371,10 @@ def test_recursive_downwards_check_call_follows_member_address(monkeypatch):
     )
 
     visitor._check_call(ref_expr)
+    visitor._check_call(member_expr)
 
-    assert recorded_visits == [(0x402000, 0)]
-    assert visitor._visit_base_offsets[(0x402000, 0)] == 0x33b0
+    assert recorded_visits == []
+    assert visitor._visit_base_offsets == {}
 
 
 def test_expression_references_object_ignores_bare_member_dereference(monkeypatch):
@@ -472,9 +545,11 @@ def test_recursive_downwards_object_visitor_retries_deferred_child_arguments(mon
     )
     visitor._cfunc = SimpleNamespace(entry_ea=0x401000)
     visitor._max_depth = None
-    visitor._current_depth = 0
-    visitor._new_for_visit = {(0x402000, 0), (0x403000, 0)}
-    visitor._visit_base_offsets = {}
+    visitor._current_frame = _root_frame(visitor_module)
+    visitor._new_for_visit = [
+        _child_frame(visitor_module, 1, 0x402000, 0, 0),
+        _child_frame(visitor_module, 2, 0x403000, 0, 0),
+    ]
     visitor._callee_base_offset = 0
 
     prepared_calls = []
@@ -539,6 +614,1944 @@ def test_recursive_downwards_object_visitor_retries_deferred_child_arguments(mon
     assert call_counts[0x402000] >= 2
 
 
+
+def test_scan_tree_cycle_terminates(monkeypatch):
+    visitor_module = _load_visitor_module()
+    visitor = visitor_module.RecursiveDownwardsObjectVisitor.__new__(
+        visitor_module.RecursiveDownwardsObjectVisitor
+    )
+    visitor._debug_scan_tree_root = "root"
+    visitor._debug_message = []
+    visitor._debug_scan_tree = {
+        ("root", -1): {("child", 0)},
+        ("child", 0): {("root", -1)},
+    }
+
+    visitor._prepare_scan_tree()
+
+    assert visitor._debug_message == [
+        "\n--- Scan Tree ---\nroot",
+        " |_ child(idx: 0)",
+        " |  |_ root(idx: -1)",
+    ]
+
+def test_process_finishes_after_recursive_failure(monkeypatch):
+    visitor_module = _load_visitor_module()
+    visitor = visitor_module.RecursiveDownwardsObjectVisitor.__new__(
+        visitor_module.RecursiveDownwardsObjectVisitor
+    )
+    events = []
+    error = RuntimeError("recursive failure")
+    visitor._start = lambda: events.append("start")
+    visitor._recursive_process = lambda: (events.append("recursive"), (_ for _ in ()).throw(error))[1]
+    visitor._finish = lambda: events.append("finish")
+    visitor.dump_scan_tree = lambda: events.append("dump")
+
+    with pytest.raises(RuntimeError) as raised:
+        visitor.process()
+
+    assert raised.value is error
+    assert events == ["start", "recursive", "finish"]
+
+def test_process_does_not_finish_when_start_fails(monkeypatch):
+    visitor_module = _load_visitor_module()
+    visitor = visitor_module.RecursiveDownwardsObjectVisitor.__new__(
+        visitor_module.RecursiveDownwardsObjectVisitor
+    )
+    events = []
+    error = RuntimeError("start failure")
+    visitor._start = lambda: (events.append("start"), (_ for _ in ()).throw(error))[1]
+    visitor._recursive_process = lambda: events.append("recursive")
+    visitor._finish = lambda: events.append("finish")
+    visitor.dump_scan_tree = lambda: events.append("dump")
+
+    with pytest.raises(RuntimeError) as raised:
+        visitor.process()
+
+    assert raised.value is error
+    assert events == ["start"]
+
+def test_recursive_process_does_not_finish_when_iteration_start_fails(monkeypatch):
+    visitor_module = _load_visitor_module()
+    visitor = visitor_module.RecursiveDownwardsObjectVisitor.__new__(
+        visitor_module.RecursiveDownwardsObjectVisitor
+    )
+    events = []
+    error = RuntimeError("iteration start failure")
+    visitor._start_iteration = lambda: (events.append("start"), (_ for _ in ()).throw(error))[1]
+    visitor._finish_iteration = lambda: events.append("finish")
+    monkeypatch.setattr(
+        visitor_module.RecursiveObjectVisitor,
+        "process",
+        lambda self: events.append("process"),
+    )
+    with pytest.raises(RuntimeError) as raised:
+        visitor_module.RecursiveObjectVisitor._recursive_process(visitor)
+
+    assert raised.value is error
+    assert events == ["start"]
+
+
+def test_iteration_finish_failure_takes_precedence(monkeypatch):
+    visitor_module = _load_visitor_module()
+    visitor = visitor_module.RecursiveDownwardsObjectVisitor.__new__(
+        visitor_module.RecursiveDownwardsObjectVisitor
+    )
+    pass_error = RuntimeError("pass failure")
+    finish_error = ValueError("finish failure")
+    monkeypatch.setattr(
+        visitor_module.ObjectVisitor,
+        "process",
+        lambda self: (_ for _ in ()).throw(pass_error),
+    )
+    visitor._finish_iteration = lambda: (_ for _ in ()).throw(finish_error)
+
+    with pytest.raises(ValueError) as raised:
+        visitor_module.RecursiveObjectVisitor._recursive_process(visitor)
+
+    assert raised.value is finish_error
+def test_recursive_process_propagates_iteration_finish_failure_after_pass(
+    monkeypatch,
+):
+    visitor_module = _load_visitor_module()
+    visitor = visitor_module.RecursiveDownwardsObjectVisitor.__new__(
+        visitor_module.RecursiveDownwardsObjectVisitor
+    )
+    events = []
+    error = ValueError("iteration finish failure")
+    visitor._start_iteration = lambda: events.append("start")
+    visitor._finish_iteration = lambda: (
+        events.append("finish"), (_ for _ in ()).throw(error)
+    )[1]
+    monkeypatch.setattr(
+        visitor_module.ObjectVisitor,
+        "process",
+        lambda self: events.append("process"),
+    )
+
+    with pytest.raises(ValueError) as raised:
+        visitor_module.RecursiveObjectVisitor._recursive_process(visitor)
+
+    assert raised.value is error
+    assert events == ["start", "process", "finish"]
+
+def test_recursive_finish_failure_takes_precedence_with_pass_failure(
+    monkeypatch,
+):
+    visitor_module = _load_visitor_module()
+    visitor = visitor_module.RecursiveDownwardsObjectVisitor.__new__(
+        visitor_module.RecursiveDownwardsObjectVisitor
+    )
+    events = []
+    pass_error = RuntimeError("pass failure")
+    finish_error = ValueError("finish failure")
+    visitor._start_iteration = lambda: events.append("start")
+    visitor._finish_iteration = lambda: (
+        events.append("finish"), (_ for _ in ()).throw(finish_error)
+    )[1]
+    monkeypatch.setattr(
+        visitor_module.ObjectVisitor,
+        "process",
+        lambda self: (
+            events.append("process"), (_ for _ in ()).throw(pass_error)
+        )[1],
+    )
+
+    with pytest.raises(ValueError) as raised:
+        visitor_module.RecursiveObjectVisitor._recursive_process(visitor)
+
+    assert raised.value is finish_error
+    assert events == ["start", "process", "finish"]
+
+def test_process_finish_failure_precedes_recursive_and_dump_failures(monkeypatch):
+    visitor_module = _load_visitor_module()
+    visitor = visitor_module.RecursiveDownwardsObjectVisitor.__new__(
+        visitor_module.RecursiveDownwardsObjectVisitor
+    )
+    events = []
+    recursive_error = RuntimeError("recursive failure")
+    finish_error = ValueError("finish failure")
+    dump_error = LookupError("dump failure")
+    visitor._start = lambda: events.append("start")
+    visitor._recursive_process = lambda: (
+        events.append("recursive"), (_ for _ in ()).throw(recursive_error)
+    )[1]
+    visitor._finish = lambda: (
+        events.append("finish"), (_ for _ in ()).throw(finish_error)
+    )[1]
+    visitor.dump_scan_tree = lambda: (
+        events.append("dump"), (_ for _ in ()).throw(dump_error)
+    )[1]
+
+    with pytest.raises(ValueError) as raised:
+        visitor.process()
+
+    assert raised.value is finish_error
+    assert events == ["start", "recursive", "finish"]
+
+def test_scan_tree_shared_descendant_renders_per_path(monkeypatch):
+    visitor_module = _load_visitor_module()
+    visitor = visitor_module.RecursiveDownwardsObjectVisitor.__new__(
+        visitor_module.RecursiveDownwardsObjectVisitor
+    )
+    visitor._debug_scan_tree_root = "root"
+    visitor._debug_message = []
+    visitor._debug_scan_tree = {
+        ("root", -1): {("left", 0), ("right", 0)},
+        ("left", 0): {("shared", 1)},
+        ("right", 0): {("shared", 1)},
+    }
+
+    visitor._prepare_scan_tree()
+
+    assert visitor._debug_message.count(" |  |_ shared(idx: 1)") == 2
+
+def test_process_skips_dump_when_finish_fails(monkeypatch):
+    visitor_module = _load_visitor_module()
+    visitor = visitor_module.RecursiveDownwardsObjectVisitor.__new__(
+        visitor_module.RecursiveDownwardsObjectVisitor
+    )
+    events = []
+    error = ValueError("finish failure")
+    visitor._start = lambda: events.append("start")
+    visitor._recursive_process = lambda: events.append("recursive")
+    visitor._finish = lambda: (events.append("finish"), (_ for _ in ()).throw(error))[1]
+    visitor.dump_scan_tree = lambda: events.append("dump")
+
+    with pytest.raises(ValueError) as raised:
+        visitor.process()
+
+    assert raised.value is error
+    assert events == ["start", "recursive", "finish"]
+def test_process_start_failure_short_circuits_all_later_callbacks(monkeypatch):
+    visitor_module = _load_visitor_module()
+    visitor = visitor_module.RecursiveDownwardsObjectVisitor.__new__(
+        visitor_module.RecursiveDownwardsObjectVisitor
+    )
+    events = []
+    start_error = RuntimeError("start failure")
+    visitor._start = lambda: (
+        events.append("start"), (_ for _ in ()).throw(start_error)
+    )[1]
+    visitor._recursive_process = lambda: events.append("recursive")
+    visitor._finish = lambda: events.append("finish")
+
+    with pytest.raises(RuntimeError) as raised:
+        visitor.process()
+
+    assert raised.value is start_error
+    assert events == ["start"]
+
+def test_process_start_failure_precedes_cleanup_failures(monkeypatch):
+    visitor_module = _load_visitor_module()
+    visitor = visitor_module.RecursiveDownwardsObjectVisitor.__new__(
+        visitor_module.RecursiveDownwardsObjectVisitor
+    )
+    events = []
+    start_error = RuntimeError("start failure")
+    visitor._start = lambda: (
+        events.append("start"), (_ for _ in ()).throw(start_error)
+    )[1]
+    visitor._recursive_process = lambda: events.append("recursive")
+    visitor._finish = lambda: (
+        events.append("finish"), (_ for _ in ()).throw(ValueError("finish"))
+    )[1]
+    visitor.dump_scan_tree = lambda: (
+        events.append("dump"), (_ for _ in ()).throw(LookupError("dump"))
+    )[1]
+
+    with pytest.raises(RuntimeError) as raised:
+        visitor.process()
+
+    assert raised.value is start_error
+    assert events == ["start"]
+
+def test_process_finish_failure_precedes_recursive_failure_after_start(
+    monkeypatch,
+):
+    visitor_module = _load_visitor_module()
+    visitor = visitor_module.RecursiveDownwardsObjectVisitor.__new__(
+        visitor_module.RecursiveDownwardsObjectVisitor
+    )
+    events = []
+    recursive_error = RuntimeError("recursive failure")
+    finish_error = ValueError("finish failure")
+    visitor._start = lambda: events.append("start")
+    visitor._recursive_process = lambda: (
+        events.append("recursive"), (_ for _ in ()).throw(recursive_error)
+    )[1]
+    visitor._finish = lambda: (
+        events.append("finish"), (_ for _ in ()).throw(finish_error)
+    )[1]
+    visitor.dump_scan_tree = lambda: events.append("dump")
+
+    with pytest.raises(ValueError) as raised:
+        visitor.process()
+
+    assert raised.value is finish_error
+    assert events == ["start", "recursive", "finish"]
+
+def test_process_orders_finish_before_dump_on_success(monkeypatch):
+    visitor_module = _load_visitor_module()
+    visitor = visitor_module.RecursiveDownwardsObjectVisitor.__new__(
+        visitor_module.RecursiveDownwardsObjectVisitor
+    )
+    events = []
+    visitor._start = lambda: events.append("start")
+    visitor._recursive_process = lambda: events.append("recursive")
+    visitor._finish = lambda: events.append("finish")
+    visitor.dump_scan_tree = lambda: events.append("dump")
+
+    visitor.process()
+
+    assert events == ["start", "recursive", "finish", "dump"]
+
+def test_process_propagates_dump_failure_after_finish(monkeypatch):
+    visitor_module = _load_visitor_module()
+    visitor = visitor_module.RecursiveDownwardsObjectVisitor.__new__(
+        visitor_module.RecursiveDownwardsObjectVisitor
+    )
+    events = []
+    error = RuntimeError("dump failure")
+    visitor._start = lambda: events.append("start")
+    visitor._recursive_process = lambda: events.append("recursive")
+    visitor._finish = lambda: events.append("finish")
+    visitor.dump_scan_tree = lambda: (
+        events.append("dump"), (_ for _ in ()).throw(error)
+    )[1]
+
+    with pytest.raises(RuntimeError) as raised:
+        visitor.process()
+
+    assert raised.value is error
+    assert events == ["start", "recursive", "finish", "dump"]
+def test_process_retries_full_lifecycle_after_dump_failure(monkeypatch):
+    visitor_module = _load_visitor_module()
+    visitor = visitor_module.RecursiveDownwardsObjectVisitor.__new__(
+        visitor_module.RecursiveDownwardsObjectVisitor
+    )
+    events = []
+    dump_calls = 0
+    dump_error = RuntimeError("dump failure")
+
+    visitor._start = lambda: events.append("start")
+    visitor._recursive_process = lambda: events.append("recursive")
+    visitor._finish = lambda: events.append("finish")
+
+    def dump():
+        nonlocal dump_calls
+        dump_calls += 1
+        events.append("dump")
+        if dump_calls == 1:
+            raise dump_error
+
+    visitor.dump_scan_tree = dump
+
+    with pytest.raises(RuntimeError) as raised:
+        visitor.process()
+    visitor.process()
+
+    assert raised.value is dump_error
+    assert events == [
+        "start",
+        "recursive",
+        "finish",
+        "dump",
+        "start",
+        "recursive",
+        "finish",
+        "dump",
+    ]
+
+def test_process_retries_full_lifecycle_after_recursive_failure(monkeypatch):
+    visitor_module = _load_visitor_module()
+    visitor = visitor_module.RecursiveDownwardsObjectVisitor.__new__(
+        visitor_module.RecursiveDownwardsObjectVisitor
+    )
+    events = []
+    recursive_calls = 0
+    recursive_error = RuntimeError("recursive failure")
+
+    visitor._start = lambda: events.append("start")
+
+    def recursive():
+        nonlocal recursive_calls
+        recursive_calls += 1
+        events.append("recursive")
+        if recursive_calls == 1:
+            raise recursive_error
+
+    visitor._recursive_process = recursive
+    visitor._finish = lambda: events.append("finish")
+    visitor.dump_scan_tree = lambda: events.append("dump")
+
+    with pytest.raises(RuntimeError) as raised:
+        visitor.process()
+    visitor.process()
+
+    assert raised.value is recursive_error
+    assert events == [
+        "start",
+        "recursive",
+        "finish",
+        "start",
+        "recursive",
+        "finish",
+        "dump",
+    ]
+
+def test_process_retries_full_lifecycle_after_finish_failure(monkeypatch):
+    visitor_module = _load_visitor_module()
+    visitor = visitor_module.RecursiveDownwardsObjectVisitor.__new__(
+        visitor_module.RecursiveDownwardsObjectVisitor
+    )
+    events = []
+    finish_calls = 0
+    finish_error = ValueError("finish failure")
+
+    visitor._start = lambda: events.append("start")
+    visitor._recursive_process = lambda: events.append("recursive")
+
+    def finish():
+        nonlocal finish_calls
+        finish_calls += 1
+        events.append("finish")
+        if finish_calls == 1:
+            raise finish_error
+
+    visitor._finish = finish
+    visitor.dump_scan_tree = lambda: events.append("dump")
+
+    with pytest.raises(ValueError) as raised:
+        visitor.process()
+    visitor.process()
+
+    assert raised.value is finish_error
+    assert events == [
+        "start",
+        "recursive",
+        "finish",
+        "start",
+        "recursive",
+        "finish",
+        "dump",
+    ]
+
+def test_process_retries_after_recursive_and_finish_failures(monkeypatch):
+    visitor_module = _load_visitor_module()
+    visitor = visitor_module.RecursiveDownwardsObjectVisitor.__new__(
+        visitor_module.RecursiveDownwardsObjectVisitor
+    )
+    events = []
+    recursive_calls = 0
+    finish_calls = 0
+    recursive_error = RuntimeError("recursive failure")
+    finish_error = ValueError("finish failure")
+
+    visitor._start = lambda: events.append("start")
+
+    def recursive():
+        nonlocal recursive_calls
+        recursive_calls += 1
+        events.append("recursive")
+        if recursive_calls == 1:
+            raise recursive_error
+
+    def finish():
+        nonlocal finish_calls
+        finish_calls += 1
+        events.append("finish")
+        if finish_calls == 1:
+            raise finish_error
+
+    visitor._recursive_process = recursive
+    visitor._finish = finish
+    visitor.dump_scan_tree = lambda: events.append("dump")
+
+    with pytest.raises(ValueError) as raised:
+        visitor.process()
+    visitor.process()
+
+    assert raised.value is finish_error
+    assert events == [
+        "start",
+        "recursive",
+        "finish",
+        "start",
+        "recursive",
+        "finish",
+        "dump",
+    ]
+
+@pytest.mark.parametrize("failure_count", [1, 2, 3])
+def test_process_retries_after_repeated_finish_failures(monkeypatch, failure_count):
+    visitor_module = _load_visitor_module()
+    visitor = visitor_module.RecursiveDownwardsObjectVisitor.__new__(
+        visitor_module.RecursiveDownwardsObjectVisitor
+    )
+    events = []
+    finish_calls = 0
+    finish_errors = [ValueError(f"finish failure {index}") for index in range(failure_count)]
+
+    visitor._start = lambda: events.append("start")
+    visitor._recursive_process = lambda: events.append("recursive")
+
+    def finish():
+        nonlocal finish_calls
+        events.append("finish")
+        if finish_calls < failure_count:
+            error = finish_errors[finish_calls]
+            finish_calls += 1
+            raise error
+        finish_calls += 1
+
+    visitor._finish = finish
+    visitor.dump_scan_tree = lambda: events.append("dump")
+
+    for error in finish_errors:
+        with pytest.raises(ValueError) as raised:
+            visitor.process()
+        assert raised.value is error
+
+    visitor.process()
+
+    assert events == [
+        *sum((["start", "recursive", "finish"] for _ in range(failure_count)), []),
+        "start",
+        "recursive",
+        "finish",
+        "dump",
+    ]
+
+@pytest.mark.parametrize("failure_count", [1, 2, 3])
+def test_process_retries_after_repeated_recursive_failures(
+    monkeypatch, failure_count
+):
+    visitor_module = _load_visitor_module()
+    visitor = visitor_module.RecursiveDownwardsObjectVisitor.__new__(
+        visitor_module.RecursiveDownwardsObjectVisitor
+    )
+    events = []
+    recursive_calls = 0
+    recursive_errors = [
+        RuntimeError(f"recursive failure {index}") for index in range(failure_count)
+    ]
+
+    visitor._start = lambda: events.append("start")
+
+    def recursive():
+        nonlocal recursive_calls
+        events.append("recursive")
+        if recursive_calls < failure_count:
+            error = recursive_errors[recursive_calls]
+            recursive_calls += 1
+            raise error
+        recursive_calls += 1
+
+    visitor._recursive_process = recursive
+    visitor._finish = lambda: events.append("finish")
+    visitor.dump_scan_tree = lambda: events.append("dump")
+
+    for error in recursive_errors:
+        with pytest.raises(RuntimeError) as raised:
+            visitor.process()
+        assert raised.value is error
+
+    visitor.process()
+
+    assert events == [
+        *sum((["start", "recursive", "finish"] for _ in range(failure_count)), []),
+        "start",
+        "recursive",
+        "finish",
+        "dump",
+    ]
+
+@pytest.mark.parametrize("failure_count", [1, 2, 3])
+def test_process_retries_after_repeated_dump_failures(monkeypatch, failure_count):
+    visitor_module = _load_visitor_module()
+    visitor = visitor_module.RecursiveDownwardsObjectVisitor.__new__(
+        visitor_module.RecursiveDownwardsObjectVisitor
+    )
+    events = []
+    dump_calls = 0
+    dump_errors = [
+        RuntimeError(f"dump failure {index}") for index in range(failure_count)
+    ]
+
+    visitor._start = lambda: events.append("start")
+    visitor._recursive_process = lambda: events.append("recursive")
+    visitor._finish = lambda: events.append("finish")
+
+    def dump():
+        nonlocal dump_calls
+        events.append("dump")
+        if dump_calls < failure_count:
+            error = dump_errors[dump_calls]
+            dump_calls += 1
+            raise error
+        dump_calls += 1
+
+    visitor.dump_scan_tree = dump
+
+    for error in dump_errors:
+        with pytest.raises(RuntimeError) as raised:
+            visitor.process()
+        assert raised.value is error
+
+    visitor.process()
+    assert events == [
+        event
+        for _ in range(failure_count + 1)
+        for event in ["start", "recursive", "finish", "dump"]
+    ]
+
+def test_process_retry_callback_counts_after_dump_failures(monkeypatch):
+    visitor_module = _load_visitor_module()
+    visitor = visitor_module.RecursiveDownwardsObjectVisitor.__new__(
+        visitor_module.RecursiveDownwardsObjectVisitor
+    )
+    events = []
+    counts = {"start": 0, "recursive": 0, "finish": 0, "dump": 0}
+    dump_errors = [RuntimeError("first dump failure"), RuntimeError("second dump failure")]
+
+    def callback(name):
+        def run():
+            counts[name] += 1
+            events.append(name)
+
+        return run
+
+    visitor._start = callback("start")
+    visitor._recursive_process = callback("recursive")
+    visitor._finish = callback("finish")
+
+    def dump():
+        counts["dump"] += 1
+        events.append("dump")
+        if dump_errors:
+            raise dump_errors.pop(0)
+
+    visitor.dump_scan_tree = dump
+
+    for expected in ["first dump failure", "second dump failure"]:
+        with pytest.raises(RuntimeError, match=expected):
+            visitor.process()
+    visitor.process()
+
+    assert counts == {"start": 3, "recursive": 3, "finish": 3, "dump": 3}
+    assert events == [
+        "start",
+        "recursive",
+        "finish",
+        "dump",
+        "start",
+        "recursive",
+        "finish",
+        "dump",
+        "start",
+        "recursive",
+        "finish",
+        "dump",
+    ]
+
+def test_process_recovers_after_mixed_lifecycle_failures(monkeypatch):
+    visitor_module = _load_visitor_module()
+    visitor = visitor_module.RecursiveDownwardsObjectVisitor.__new__(
+        visitor_module.RecursiveDownwardsObjectVisitor
+    )
+    events = []
+    recursive_calls = 0
+    finish_calls = 0
+    dump_calls = 0
+    recursive_error = RuntimeError("recursive failure")
+    finish_error = ValueError("finish failure")
+    dump_error = OSError("dump failure")
+
+    visitor._start = lambda: events.append("start")
+
+    def recursive():
+        nonlocal recursive_calls
+        recursive_calls += 1
+        events.append("recursive")
+        if recursive_calls == 1:
+            raise recursive_error
+
+    def finish():
+        nonlocal finish_calls
+        finish_calls += 1
+        events.append("finish")
+        if finish_calls == 2:
+            raise finish_error
+
+    def dump():
+        nonlocal dump_calls
+        dump_calls += 1
+        events.append("dump")
+        if dump_calls == 1:
+            raise dump_error
+
+    visitor._recursive_process = recursive
+    visitor._finish = finish
+    visitor.dump_scan_tree = dump
+
+    with pytest.raises(RuntimeError) as raised:
+        visitor.process()
+    assert raised.value is recursive_error
+
+    with pytest.raises(ValueError) as raised:
+        visitor.process()
+    assert raised.value is finish_error
+
+    with pytest.raises(OSError) as raised:
+        visitor.process()
+    assert raised.value is dump_error
+
+    visitor.process()
+
+    assert events == [
+        "start", "recursive", "finish",
+        "start", "recursive", "finish",
+        "start", "recursive", "finish", "dump",
+        "start", "recursive", "finish", "dump",
+    ]
+
+def test_process_retries_cleanup_precedence_until_recovery(monkeypatch):
+    visitor_module = _load_visitor_module()
+    visitor = visitor_module.RecursiveDownwardsObjectVisitor.__new__(
+        visitor_module.RecursiveDownwardsObjectVisitor
+    )
+    events = []
+    recursive_calls = 0
+    finish_calls = 0
+    recursive_error = RuntimeError("recursive failure")
+    finish_errors = [ValueError("first finish failure"), ValueError("second finish failure")]
+
+    visitor._start = lambda: events.append("start")
+
+    def recursive():
+        nonlocal recursive_calls
+        recursive_calls += 1
+        events.append("recursive")
+        if recursive_calls == 1:
+            raise recursive_error
+
+    def finish():
+        nonlocal finish_calls
+        events.append("finish")
+        if finish_calls < len(finish_errors):
+            error = finish_errors[finish_calls]
+            finish_calls += 1
+            raise error
+        finish_calls += 1
+
+    visitor._recursive_process = recursive
+    visitor._finish = finish
+    visitor.dump_scan_tree = lambda: events.append("dump")
+
+    with pytest.raises(ValueError) as raised:
+        visitor.process()
+    assert raised.value is finish_errors[0]
+
+    with pytest.raises(ValueError) as raised:
+        visitor.process()
+    assert raised.value is finish_errors[1]
+
+    visitor.process()
+
+    assert events == [
+        "start", "recursive", "finish",
+        "start", "recursive", "finish",
+        "start", "recursive", "finish", "dump",
+    ]
+
+def test_process_finish_failure_takes_precedence_over_dump_failure(monkeypatch):
+    visitor_module = _load_visitor_module()
+    visitor = visitor_module.RecursiveDownwardsObjectVisitor.__new__(
+        visitor_module.RecursiveDownwardsObjectVisitor
+    )
+    events = []
+    finish_error = ValueError("finish failure")
+    dump_error = RuntimeError("dump failure")
+    visitor._start = lambda: events.append("start")
+    visitor._recursive_process = lambda: events.append("recursive")
+    visitor._finish = lambda: (
+        events.append("finish"), (_ for _ in ()).throw(finish_error)
+    )[1]
+    visitor.dump_scan_tree = lambda: (
+        events.append("dump"), (_ for _ in ()).throw(dump_error)
+    )[1]
+
+    with pytest.raises(ValueError) as raised:
+        visitor.process()
+
+    assert raised.value is finish_error
+    assert events == ["start", "recursive", "finish"]
+
+def test_dump_scan_tree_propagates_logging_failure(monkeypatch):
+    visitor_module = _load_visitor_module()
+    visitor = visitor_module.RecursiveDownwardsObjectVisitor.__new__(
+        visitor_module.RecursiveDownwardsObjectVisitor
+    )
+    visitor._debug_scan_tree_root = "root"
+    visitor._debug_message = ["stale"]
+    visitor._debug_scan_tree = {}
+    error = RuntimeError("logger failure")
+    monkeypatch.setattr(
+        visitor_module,
+        "log_info",
+        lambda _message: (_ for _ in ()).throw(error),
+    )
+
+    with pytest.raises(RuntimeError) as raised:
+        visitor.dump_scan_tree()
+
+    assert raised.value is error
+    assert visitor._debug_message == ["\n--- Scan Tree ---\nroot"]
+
+def test_dump_scan_tree_recovers_after_logging_failure(monkeypatch):
+    visitor_module = _load_visitor_module()
+    visitor = visitor_module.RecursiveDownwardsObjectVisitor.__new__(
+        visitor_module.RecursiveDownwardsObjectVisitor
+    )
+    visitor._debug_scan_tree_root = "root"
+    visitor._debug_message = ["stale"]
+    visitor._debug_scan_tree = {}
+    calls = []
+    error = RuntimeError("logger failure")
+
+    def log_info(message):
+        calls.append(message)
+        if len(calls) == 1:
+            raise error
+
+    monkeypatch.setattr(visitor_module, "log_info", log_info)
+
+    with pytest.raises(RuntimeError) as raised:
+        visitor.dump_scan_tree()
+    visitor.dump_scan_tree()
+
+    assert raised.value is error
+    assert len(calls) == 2
+    assert visitor._debug_message == ["\n--- Scan Tree ---\nroot"]
+
+def test_dump_scan_tree_preserves_debug_message_identity(monkeypatch):
+    visitor_module = _load_visitor_module()
+    visitor = visitor_module.RecursiveDownwardsObjectVisitor.__new__(
+        visitor_module.RecursiveDownwardsObjectVisitor
+    )
+    visitor._debug_scan_tree_root = "root"
+    visitor._debug_message = ["stale"]
+    original = visitor._debug_message
+    visitor._debug_scan_tree = {}
+    monkeypatch.setattr(visitor_module, "log_info", lambda _message: None)
+
+    visitor.dump_scan_tree()
+
+    assert visitor._debug_message is original
+    assert original == ["\n--- Scan Tree ---\nroot"]
+
+def test_dump_scan_tree_recovers_after_render_failure(monkeypatch):
+    visitor_module = _load_visitor_module()
+    visitor = visitor_module.RecursiveDownwardsObjectVisitor.__new__(
+        visitor_module.RecursiveDownwardsObjectVisitor
+    )
+    visitor._debug_scan_tree_root = "root"
+    visitor._debug_message = ["stale"]
+    visitor._debug_scan_tree = {}
+    error = RuntimeError("render failure")
+    original_prepare = visitor._prepare_scan_tree
+    calls = []
+
+    def prepare(*args, **kwargs):
+        calls.append(True)
+        if len(calls) == 1:
+            raise error
+        return original_prepare(*args, **kwargs)
+
+    monkeypatch.setattr(visitor, "_prepare_scan_tree", prepare)
+    monkeypatch.setattr(visitor_module, "log_info", lambda _message: None)
+
+    with pytest.raises(RuntimeError) as raised:
+        visitor.dump_scan_tree()
+    visitor.dump_scan_tree()
+
+    assert raised.value is error
+    assert visitor._debug_message == ["\n--- Scan Tree ---\nroot"]
+
+def test_prepare_scan_tree_cleans_path_after_nested_failure(monkeypatch):
+    visitor_module = _load_visitor_module()
+    visitor = visitor_module.RecursiveDownwardsObjectVisitor.__new__(
+        visitor_module.RecursiveDownwardsObjectVisitor
+    )
+    visitor._debug_scan_tree_root = "root"
+    visitor._debug_message = []
+    visitor._debug_scan_tree = {("root", -1): {("child", 0)}}
+    path = set()
+    original = visitor._prepare_scan_tree
+    def prepare(*args, **kwargs):
+        raise RuntimeError("nested render failure")
+    monkeypatch.setattr(visitor, "_prepare_scan_tree", prepare)
+    with pytest.raises(RuntimeError, match="nested render failure"):
+        visitor._prepare_scan_tree(_path=path)
+    assert path == set()
+    monkeypatch.setattr(visitor, "_prepare_scan_tree", original)
+    visitor._debug_message.clear()
+    visitor._prepare_scan_tree(_path=path)
+    assert path == set()
+
+def test_prepare_scan_tree_cleans_path_after_cyclic_failure(monkeypatch):
+    visitor_module = _load_visitor_module()
+    visitor = visitor_module.RecursiveDownwardsObjectVisitor.__new__(
+        visitor_module.RecursiveDownwardsObjectVisitor
+    )
+    visitor._debug_scan_tree_root = "root"
+    visitor._debug_message = []
+    visitor._debug_scan_tree = {("root", -1): {("child", 0)}}
+    path = set()
+    original = visitor._prepare_scan_tree
+    monkeypatch.setattr(visitor, "_prepare_scan_tree", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("cyclic render failure")))
+    with pytest.raises(RuntimeError, match="cyclic render failure"):
+        visitor._prepare_scan_tree(_path=path)
+    assert path == set()
+    monkeypatch.setattr(visitor, "_prepare_scan_tree", original)
+
+def test_prepare_scan_tree_retries_shared_cyclic_paths_after_failure():
+    visitor_module = _load_visitor_module()
+    visitor = visitor_module.RecursiveDownwardsObjectVisitor.__new__(
+        visitor_module.RecursiveDownwardsObjectVisitor
+    )
+    visitor._debug_scan_tree_root = "root"
+    visitor._debug_message = []
+    visitor._debug_scan_tree = {
+        ("root", -1): {("left", 0), ("right", 0)},
+        ("left", 0): {("shared", 0)},
+        ("right", 0): {("shared", 0)},
+        ("shared", 0): {("root", -1)},
+    }
+    path = set()
+    visitor._prepare_scan_tree(_path=path)
+    assert path == set()
+
+def test_prepare_scan_tree_deep_shared_cycle_retry_preserves_formatting():
+    visitor_module = _load_visitor_module()
+    visitor = visitor_module.RecursiveDownwardsObjectVisitor.__new__(
+        visitor_module.RecursiveDownwardsObjectVisitor
+    )
+    visitor._debug_scan_tree_root = "root"
+    visitor._debug_message = []
+    visitor._debug_scan_tree = {
+        ("root", -1): {("a", 0), ("b", 0)},
+        ("a", 0): {("shared", 0)},
+        ("b", 0): {("shared", 0)},
+        ("shared", 0): {("deep", 0)},
+        ("deep", 0): {("root", -1)},
+    }
+    path = set()
+    visitor._prepare_scan_tree(_path=path)
+    assert path == set()
+def test_prepare_scan_tree_renders_deep_chain_and_cleans_path():
+    visitor_module = _load_visitor_module()
+    visitor = visitor_module.RecursiveDownwardsObjectVisitor.__new__(
+        visitor_module.RecursiveDownwardsObjectVisitor
+    )
+    visitor._debug_scan_tree_root = "root"
+    visitor._debug_message = []
+    visitor._debug_scan_tree = {
+        (f"node-{index}", 0): {(f"node-{index + 1}", 0)}
+        for index in range(99)
+    }
+    visitor._debug_scan_tree[("root", -1)] = {("node-0", 0)}
+    path = set()
+
+    visitor._prepare_scan_tree(_path=path)
+
+    assert path == set()
+    assert len(visitor._debug_message) == 101
+    assert visitor._debug_message[0] == "\n--- Scan Tree ---\nroot"
+    assert visitor._debug_message[1] == " |_ node-0(idx: 0)"
+    assert visitor._debug_message[-1].endswith("node-99(idx: 0)")
+
+def test_prepare_scan_tree_exceeds_python_recursion_depth():
+    visitor_module = _load_visitor_module()
+    visitor = visitor_module.RecursiveDownwardsObjectVisitor.__new__(
+        visitor_module.RecursiveDownwardsObjectVisitor
+    )
+    visitor._debug_scan_tree_root = "root"
+    visitor._debug_message = []
+    depth = 1500
+    visitor._debug_scan_tree = {
+        (f"node-{index}", 0): {(f"node-{index + 1}", 0)}
+        for index in range(depth - 1)
+    }
+    visitor._debug_scan_tree[("root", -1)] = {("node-0", 0)}
+
+    visitor._prepare_scan_tree()
+
+    assert len(visitor._debug_message) == depth + 1
+    assert visitor._debug_message[-1].endswith(f"node-{depth - 1}(idx: 0)")
+
+
+def test_prepare_scan_tree_preserves_caller_path_keys():
+    visitor_module = _load_visitor_module()
+    visitor = visitor_module.RecursiveDownwardsObjectVisitor.__new__(
+        visitor_module.RecursiveDownwardsObjectVisitor
+    )
+    visitor._debug_scan_tree_root = "root"
+    visitor._debug_message = []
+    visitor._debug_scan_tree = {("root", -1): {("child", 0)}}
+    caller_key = ("caller", 7)
+    path = {caller_key}
+
+    visitor._prepare_scan_tree(_path=path)
+
+    assert path == {caller_key}
+    assert visitor._debug_message[-1] == " |_ child(idx: 0)"
+
+
+def test_prepare_scan_tree_restores_caller_path_keys_on_failure(monkeypatch):
+    visitor_module = _load_visitor_module()
+    visitor = visitor_module.RecursiveDownwardsObjectVisitor.__new__(
+        visitor_module.RecursiveDownwardsObjectVisitor
+    )
+    visitor._debug_scan_tree_root = "root"
+    visitor._debug_message = []
+    visitor._debug_scan_tree = {("root", -1): {("child", 0)}}
+    caller_key = ("caller", 7)
+    path = {caller_key}
+    original_prepare = visitor._prepare_scan_tree
+
+    def fail(*args, **kwargs):
+        raise RuntimeError("message failure")
+
+    monkeypatch.setattr(visitor, "_prepare_scan_tree", fail)
+    with pytest.raises(RuntimeError, match="message failure"):
+        visitor._prepare_scan_tree(_path=path)
+    assert path == {caller_key}
+    monkeypatch.setattr(visitor, "_prepare_scan_tree", original_prepare)
+
+def test_prepare_scan_tree_cleans_path_after_message_failure():
+    visitor_module = _load_visitor_module()
+    visitor = visitor_module.RecursiveDownwardsObjectVisitor.__new__(
+        visitor_module.RecursiveDownwardsObjectVisitor
+    )
+    visitor._debug_scan_tree_root = "root"
+    visitor._debug_scan_tree = {("root", -1): {("child", 0)}}
+    visitor._debug_message = []
+    caller_key = ("caller", 7)
+    path = {caller_key}
+
+    class FailingMessage(list):
+        def append(self, value):
+            if value.startswith(" |_"):
+                raise RuntimeError("message failure")
+            super().append(value)
+
+    visitor._debug_message = FailingMessage()
+    with pytest.raises(RuntimeError, match="message failure"):
+        visitor._prepare_scan_tree(_path=path)
+
+    assert visitor._debug_message == ["\n--- Scan Tree ---\nroot"]
+def test_dump_scan_tree_retry_uses_current_tree_after_logger_failure(monkeypatch):
+    visitor_module = _load_visitor_module()
+    visitor = visitor_module.RecursiveDownwardsObjectVisitor.__new__(
+        visitor_module.RecursiveDownwardsObjectVisitor
+    )
+    visitor._debug_scan_tree_root = "root"
+    visitor._debug_message = ["stale"]
+    visitor._debug_scan_tree = {("root", -1): {("old", 0)}}
+    messages = []
+    error = RuntimeError("logger failure")
+
+    def log_info(message):
+        messages.append(message)
+        if len(messages) == 1:
+            raise error
+
+    monkeypatch.setattr(visitor_module, "log_info", log_info)
+    with pytest.raises(RuntimeError) as raised:
+        visitor.dump_scan_tree()
+
+    visitor._debug_scan_tree = {("root", -1): {("new", 0)}}
+    original_message = visitor._debug_message
+    visitor.dump_scan_tree()
+
+    assert raised.value is error
+    assert visitor._debug_message is original_message
+    assert "old(idx: 0)" not in messages[1]
+    assert "new(idx: 0)" in messages[1]
+
+def test_dump_scan_tree_retry_uses_current_root_after_logger_failure(monkeypatch):
+    visitor_module = _load_visitor_module()
+    visitor = visitor_module.RecursiveDownwardsObjectVisitor.__new__(
+        visitor_module.RecursiveDownwardsObjectVisitor
+    )
+    visitor._debug_scan_tree_root = "old-root"
+    visitor._debug_message = ["stale"]
+    visitor._debug_scan_tree = {("old-root", -1): {("old", 0)}}
+    messages = []
+
+    def log_info(message):
+        messages.append(message)
+        if len(messages) == 1:
+            raise RuntimeError("logger failure")
+
+    monkeypatch.setattr(visitor_module, "log_info", log_info)
+    with pytest.raises(RuntimeError, match="logger failure"):
+        visitor.dump_scan_tree()
+
+    visitor._debug_scan_tree_root = "new-root"
+    visitor._debug_scan_tree = {("new-root", -1): {("new", 0)}}
+    visitor.dump_scan_tree()
+
+    assert "new-root" in messages[1]
+    assert "old-root" not in messages[1]
+    assert "new(idx: 0)" in messages[1]
+    assert "old(idx: 0)" not in messages[1]
+
+def test_dump_scan_tree_retry_uses_current_root_after_render_failure(monkeypatch):
+    visitor_module = _load_visitor_module()
+    visitor = visitor_module.RecursiveDownwardsObjectVisitor.__new__(
+        visitor_module.RecursiveDownwardsObjectVisitor
+    )
+    visitor._debug_scan_tree_root = "old-root"
+    visitor._debug_message = ["stale"]
+    visitor._debug_scan_tree = {("old-root", -1): {("old", 0)}}
+    original_prepare = visitor._prepare_scan_tree
+    calls = []
+
+    def prepare(*args, **kwargs):
+        calls.append(True)
+        if len(calls) == 1:
+            raise RuntimeError("render failure")
+        return original_prepare(*args, **kwargs)
+
+    monkeypatch.setattr(visitor, "_prepare_scan_tree", prepare)
+    with pytest.raises(RuntimeError, match="render failure"):
+        visitor.dump_scan_tree()
+
+    visitor._debug_scan_tree_root = "new-root"
+    visitor._debug_scan_tree = {("new-root", -1): {("new", 0)}}
+    messages = []
+    monkeypatch.setattr(visitor_module, "log_info", messages.append)
+    visitor.dump_scan_tree()
+
+    assert visitor._debug_message is not None
+    assert "new-root" in messages[0]
+    assert "old-root" not in messages[0]
+    assert "new(idx: 0)" in messages[0]
+    assert "old(idx: 0)" not in messages[0]
+
+def test_dump_scan_tree_recovers_after_render_and_logger_failures(monkeypatch):
+    visitor_module = _load_visitor_module()
+    visitor = visitor_module.RecursiveDownwardsObjectVisitor.__new__(
+        visitor_module.RecursiveDownwardsObjectVisitor
+    )
+    visitor._debug_scan_tree_root = "old-root"
+    visitor._debug_message = ["stale"]
+    visitor._debug_scan_tree = {("old-root", -1): {("old", 0)}}
+    original_message = visitor._debug_message
+    original_prepare = visitor._prepare_scan_tree
+    prepare_calls = []
+    log_calls = []
+
+    def prepare(*args, **kwargs):
+        prepare_calls.append(True)
+        if len(prepare_calls) == 1:
+            raise RuntimeError("render failure")
+        return original_prepare(*args, **kwargs)
+
+    def log_info(message):
+        log_calls.append(message)
+        if len(log_calls) == 1:
+            raise RuntimeError("logger failure")
+
+    monkeypatch.setattr(visitor, "_prepare_scan_tree", prepare)
+    monkeypatch.setattr(visitor_module, "log_info", log_info)
+    with pytest.raises(RuntimeError, match="render failure"):
+        visitor.dump_scan_tree()
+
+    visitor._debug_scan_tree_root = "new-root"
+    visitor._debug_scan_tree = {("new-root", -1): {("new", 0)}}
+    with pytest.raises(RuntimeError, match="logger failure"):
+        visitor.dump_scan_tree()
+    visitor.dump_scan_tree()
+
+    assert visitor._debug_message is original_message
+    assert "new-root" in log_calls[-1]
+    assert "new(idx: 0)" in log_calls[-1]
+    assert "old-root" not in log_calls[-1]
+    assert "old(idx: 0)" not in log_calls[-1]
+
+def test_dump_scan_tree_retry_uses_final_mutated_state(monkeypatch):
+    visitor_module = _load_visitor_module()
+    visitor = visitor_module.RecursiveDownwardsObjectVisitor.__new__(
+        visitor_module.RecursiveDownwardsObjectVisitor
+    )
+    visitor._debug_scan_tree_root = "first-root"
+    visitor._debug_message = ["stale"]
+    visitor._debug_scan_tree = {("first-root", -1): {("first", 0)}}
+    original_message = visitor._debug_message
+    messages = []
+    failures = iter(("first failure", "second failure"))
+
+    def log_info(message):
+        messages.append(message)
+        try:
+            failure = next(failures)
+        except StopIteration:
+            return
+        raise RuntimeError(failure)
+
+    monkeypatch.setattr(visitor_module, "log_info", log_info)
+    with pytest.raises(RuntimeError, match="first failure"):
+        visitor.dump_scan_tree()
+    visitor._debug_scan_tree_root = "second-root"
+    visitor._debug_scan_tree = {("second-root", -1): {("second", 0)}}
+    with pytest.raises(RuntimeError, match="second failure"):
+        visitor.dump_scan_tree()
+    visitor._debug_scan_tree_root = "final-root"
+    visitor._debug_scan_tree = {("final-root", -1): {("final", 0)}}
+    visitor.dump_scan_tree()
+
+    assert visitor._debug_message is original_message
+    assert "final-root" in messages[-1]
+    assert "final(idx: 0)" in messages[-1]
+    assert all(value not in messages[-1] for value in ("first", "second"))
+
+def test_dump_scan_tree_retry_handles_empty_current_tree(monkeypatch):
+    visitor_module = _load_visitor_module()
+    visitor = visitor_module.RecursiveDownwardsObjectVisitor.__new__(
+        visitor_module.RecursiveDownwardsObjectVisitor
+    )
+    visitor._debug_scan_tree_root = "root"
+    visitor._debug_message = ["stale"]
+    visitor._debug_scan_tree = {("root", -1): {("child", 0)}}
+    original_message = visitor._debug_message
+    messages = []
+
+    def log_info(message):
+        messages.append(message)
+        if len(messages) == 1:
+            raise RuntimeError("logger failure")
+
+    monkeypatch.setattr(visitor_module, "log_info", log_info)
+    with pytest.raises(RuntimeError, match="logger failure"):
+        visitor.dump_scan_tree()
+
+    visitor._debug_scan_tree = {}
+    visitor.dump_scan_tree()
+
+    assert visitor._debug_message is original_message
+    assert messages[-1].startswith("\n--- Scan Tree ---\nroot\n---------------")
+    assert "child(idx: 0)" not in messages[-1]
+
+def test_dump_scan_tree_retry_handles_absent_current_root(monkeypatch):
+    visitor_module = _load_visitor_module()
+    visitor = visitor_module.RecursiveDownwardsObjectVisitor.__new__(
+        visitor_module.RecursiveDownwardsObjectVisitor
+    )
+    visitor._debug_scan_tree_root = "root"
+    visitor._debug_message = ["stale"]
+    visitor._debug_scan_tree = {("root", -1): {("child", 0)}}
+    original_message = visitor._debug_message
+    messages = []
+
+    def log_info(message):
+        messages.append(message)
+        if len(messages) == 1:
+            raise RuntimeError("logger failure")
+
+    monkeypatch.setattr(visitor_module, "log_info", log_info)
+    with pytest.raises(RuntimeError, match="logger failure"):
+        visitor.dump_scan_tree()
+
+    visitor._debug_scan_tree = {("other", -1): {("other-child", 0)}}
+    visitor.dump_scan_tree()
+
+    assert visitor._debug_message is original_message
+    assert messages[-1].startswith("\n--- Scan Tree ---\nroot\n---------------")
+    assert "child(idx: 0)" not in messages[-1]
+    assert "other-child(idx: 0)" not in messages[-1]
+
+def test_prepare_scan_tree_propagates_null_mapping_error_and_preserves_path():
+    visitor_module = _load_visitor_module()
+    visitor = visitor_module.RecursiveDownwardsObjectVisitor.__new__(
+        visitor_module.RecursiveDownwardsObjectVisitor
+    )
+    visitor._debug_scan_tree_root = "root"
+    visitor._debug_message = []
+    visitor._debug_scan_tree = None
+    caller_key = ("caller", 7)
+    path = {caller_key}
+
+    with pytest.raises(AttributeError):
+        visitor._prepare_scan_tree(_path=path)
+
+    assert path == {caller_key}
+    assert visitor._debug_message == ["\n--- Scan Tree ---\nroot"]
+
+def test_dump_scan_tree_recovers_after_null_mapping_failure(monkeypatch):
+    visitor_module = _load_visitor_module()
+    visitor = visitor_module.RecursiveDownwardsObjectVisitor.__new__(
+        visitor_module.RecursiveDownwardsObjectVisitor
+    )
+    visitor._debug_scan_tree_root = "root"
+    visitor._debug_message = ["stale"]
+    visitor._debug_scan_tree = None
+    original_message = visitor._debug_message
+    messages = []
+    monkeypatch.setattr(visitor_module, "log_info", messages.append)
+
+    with pytest.raises(AttributeError):
+        visitor.dump_scan_tree()
+
+    visitor._debug_scan_tree = {("root", -1): {("recovered", 0)}}
+    visitor.dump_scan_tree()
+
+    assert visitor._debug_message is original_message
+    assert "recovered(idx: 0)" in messages[0]
+    assert "stale" not in messages[0]
+
+def test_dump_scan_tree_repeated_null_failures_reset_diagnostics(monkeypatch):
+    visitor_module = _load_visitor_module()
+    visitor = visitor_module.RecursiveDownwardsObjectVisitor.__new__(
+        visitor_module.RecursiveDownwardsObjectVisitor
+    )
+    visitor._debug_scan_tree_root = "root"
+    visitor._debug_message = ["stale"]
+    visitor._debug_scan_tree = None
+    original_message = visitor._debug_message
+    messages = []
+    monkeypatch.setattr(visitor_module, "log_info", messages.append)
+
+    for _ in range(2):
+        with pytest.raises(AttributeError):
+            visitor.dump_scan_tree()
+        assert visitor._debug_message is original_message
+        assert visitor._debug_message == ["\n--- Scan Tree ---\nroot"]
+
+    visitor._debug_scan_tree = {("root", -1): {("recovered", 0)}}
+    visitor.dump_scan_tree()
+
+    assert visitor._debug_message is original_message
+    assert len(messages) == 1
+    assert "recovered(idx: 0)" in messages[0]
+
+def test_dump_scan_tree_recovers_null_root_and_logger_transitions(monkeypatch):
+    visitor_module = _load_visitor_module()
+    visitor = visitor_module.RecursiveDownwardsObjectVisitor.__new__(
+        visitor_module.RecursiveDownwardsObjectVisitor
+    )
+    visitor._debug_scan_tree_root = "old-root"
+    visitor._debug_message = ["stale"]
+    visitor._debug_scan_tree = None
+    original_message = visitor._debug_message
+    messages = []
+
+    def log_info(message):
+        messages.append(message)
+        if len(messages) == 1:
+            raise RuntimeError("logger failure")
+
+    monkeypatch.setattr(visitor_module, "log_info", log_info)
+    with pytest.raises(AttributeError):
+        visitor.dump_scan_tree()
+
+    visitor._debug_scan_tree_root = "new-root"
+    visitor._debug_scan_tree = {("new-root", -1): {("new", 0)}}
+    with pytest.raises(RuntimeError, match="logger failure"):
+        visitor.dump_scan_tree()
+    visitor.dump_scan_tree()
+
+    assert visitor._debug_message is original_message
+    assert "new-root" in messages[-1]
+    assert "new(idx: 0)" in messages[-1]
+    assert "old-root" not in messages[-1]
+
+def test_dump_scan_tree_null_root_logger_then_empty_final_state(monkeypatch):
+    visitor_module = _load_visitor_module()
+    visitor = visitor_module.RecursiveDownwardsObjectVisitor.__new__(
+        visitor_module.RecursiveDownwardsObjectVisitor
+    )
+    visitor._debug_scan_tree_root = "root"
+    visitor._debug_message = ["stale"]
+    visitor._debug_scan_tree = None
+    original_message = visitor._debug_message
+    messages = []
+
+    def log_info(message):
+        messages.append(message)
+        if len(messages) == 1:
+            raise RuntimeError("logger failure")
+
+    monkeypatch.setattr(visitor_module, "log_info", log_info)
+    with pytest.raises(AttributeError):
+        visitor.dump_scan_tree()
+    visitor._debug_scan_tree = {("root", -1): {("child", 0)}}
+    with pytest.raises(RuntimeError, match="logger failure"):
+        visitor.dump_scan_tree()
+    visitor._debug_scan_tree = {}
+    visitor.dump_scan_tree()
+
+    assert visitor._debug_message is original_message
+    assert messages[-1] == "\n--- Scan Tree ---\nroot\n---------------"
+    assert "child(idx: 0)" not in messages[-1]
+
+def test_dump_scan_tree_recovery_then_repeated_success_has_no_duplicates(monkeypatch):
+    visitor_module = _load_visitor_module()
+    visitor = visitor_module.RecursiveDownwardsObjectVisitor.__new__(
+        visitor_module.RecursiveDownwardsObjectVisitor
+    )
+    visitor._debug_scan_tree_root = "root"
+    visitor._debug_message = ["stale"]
+    visitor._debug_scan_tree = None
+    original_message = visitor._debug_message
+    messages = []
+    monkeypatch.setattr(visitor_module, "log_info", messages.append)
+
+    with pytest.raises(AttributeError):
+        visitor.dump_scan_tree()
+    visitor._debug_scan_tree = {("root", -1): {("child", 0)}}
+    visitor.dump_scan_tree()
+    first = messages[-1]
+    visitor.dump_scan_tree()
+    second = messages[-1]
+
+    assert visitor._debug_message is original_message
+    assert second == first
+    assert second.count("root") == 1
+    assert second.count("child(idx: 0)") == 1
+
+def test_dump_scan_tree_successive_mutations_use_current_output(monkeypatch):
+    visitor_module = _load_visitor_module()
+    visitor = visitor_module.RecursiveDownwardsObjectVisitor.__new__(
+        visitor_module.RecursiveDownwardsObjectVisitor
+    )
+    visitor._debug_scan_tree_root = "root-a"
+    visitor._debug_message = ["stale"]
+    visitor._debug_scan_tree = {("root-a", -1): {("child-a", 0)}}
+    original_message = visitor._debug_message
+    messages = []
+    monkeypatch.setattr(visitor_module, "log_info", messages.append)
+
+    visitor.dump_scan_tree()
+    visitor._debug_scan_tree = {("root-a", -1): {("child-b", 0)}}
+    visitor.dump_scan_tree()
+    visitor._debug_scan_tree_root = "root-c"
+    visitor._debug_scan_tree = {("root-c", -1): {("child-c", 0)}}
+    visitor.dump_scan_tree()
+
+    assert visitor._debug_message is original_message
+    assert "child-a(idx: 0)" in messages[0]
+    assert "child-b(idx: 0)" in messages[1]
+    assert "child-a(idx: 0)" not in messages[1]
+    assert "root-c" in messages[2]
+    assert "child-c(idx: 0)" in messages[2]
+    assert "root-a" not in messages[2]
+
+def test_dump_scan_tree_empty_then_restored_tree_uses_current_output(monkeypatch):
+    visitor_module = _load_visitor_module()
+    visitor = visitor_module.RecursiveDownwardsObjectVisitor.__new__(
+        visitor_module.RecursiveDownwardsObjectVisitor
+    )
+    visitor._debug_scan_tree_root = "root"
+    visitor._debug_message = ["stale"]
+    visitor._debug_scan_tree = {("root", -1): {("old", 0)}}
+    original_message = visitor._debug_message
+    messages = []
+    monkeypatch.setattr(visitor_module, "log_info", messages.append)
+
+    visitor.dump_scan_tree()
+    visitor._debug_scan_tree = {}
+    visitor.dump_scan_tree()
+    visitor._debug_scan_tree = {("root", -1): {("restored", 1)}}
+    visitor.dump_scan_tree()
+
+    assert visitor._debug_message is original_message
+    assert "old(idx: 0)" in messages[0]
+    assert messages[1] == "\n--- Scan Tree ---\nroot\n---------------"
+    assert "restored(idx: 1)" in messages[2]
+    assert "old(idx: 0)" not in messages[2]
+
+def test_dump_scan_tree_repeated_empty_restore_root_cycles_are_current(monkeypatch):
+    visitor_module = _load_visitor_module()
+    visitor = visitor_module.RecursiveDownwardsObjectVisitor.__new__(
+        visitor_module.RecursiveDownwardsObjectVisitor
+    )
+    visitor._debug_scan_tree_root = "root-a"
+    visitor._debug_message = ["stale"]
+    visitor._debug_scan_tree = {}
+    original_message = visitor._debug_message
+    messages = []
+    monkeypatch.setattr(visitor_module, "log_info", messages.append)
+
+    visitor.dump_scan_tree()
+    visitor._debug_scan_tree = {("root-a", -1): {("child-a", 0)}}
+    visitor.dump_scan_tree()
+    visitor._debug_scan_tree_root = "root-b"
+    visitor._debug_scan_tree = {}
+    visitor.dump_scan_tree()
+    visitor._debug_scan_tree = {("root-b", -1): {("child-b", 1)}}
+    visitor.dump_scan_tree()
+
+    assert visitor._debug_message is original_message
+    assert messages[0] == "\n--- Scan Tree ---\nroot-a\n---------------"
+    assert "child-a(idx: 0)" in messages[1]
+    assert messages[2] == "\n--- Scan Tree ---\nroot-b\n---------------"
+    assert "child-a(idx: 0)" not in messages[2]
+    assert "child-b(idx: 1)" in messages[3]
+    assert "root-a" not in messages[3]
+
+def test_dump_scan_tree_late_logger_failure_retry_is_current(monkeypatch):
+    visitor_module = _load_visitor_module()
+    visitor = visitor_module.RecursiveDownwardsObjectVisitor.__new__(
+        visitor_module.RecursiveDownwardsObjectVisitor
+    )
+    visitor._debug_scan_tree_root = "root-a"
+    visitor._debug_message = ["stale"]
+    visitor._debug_scan_tree = {}
+    original_message = visitor._debug_message
+    messages = []
+    calls = 0
+
+    def log_info(message):
+        nonlocal calls
+        calls += 1
+        messages.append(message)
+        if calls == 3:
+            raise RuntimeError("late logger failure")
+
+    monkeypatch.setattr(visitor_module, "log_info", log_info)
+    visitor.dump_scan_tree()
+    visitor._debug_scan_tree = {("root-a", -1): {("child-a", 0)}}
+    visitor.dump_scan_tree()
+    visitor._debug_scan_tree_root = "root-b"
+    visitor._debug_scan_tree = {("root-b", -1): {("child-b", 1)}}
+    with pytest.raises(RuntimeError, match="late logger failure"):
+        visitor.dump_scan_tree()
+    visitor.dump_scan_tree()
+
+    assert visitor._debug_message is original_message
+    assert "root-b" in messages[-1]
+    assert "child-b(idx: 1)" in messages[-1]
+    assert "root-a" not in messages[-1]
+    assert "child-a(idx: 0)" not in messages[-1]
+
+def test_dump_scan_tree_multiple_logger_failures_rebuild_current_state(monkeypatch):
+    visitor_module = _load_visitor_module()
+    visitor = visitor_module.RecursiveDownwardsObjectVisitor.__new__(
+        visitor_module.RecursiveDownwardsObjectVisitor
+    )
+    visitor._debug_scan_tree_root = "root-a"
+    visitor._debug_message = ["stale"]
+    visitor._debug_scan_tree = {("root-a", -1): {("child-a", 0)}}
+    original_message = visitor._debug_message
+    messages = []
+    calls = 0
+
+    def log_info(message):
+        nonlocal calls
+        calls += 1
+        messages.append(message)
+        if calls in {2, 3}:
+            raise RuntimeError(f"logger failure {calls}")
+
+    monkeypatch.setattr(visitor_module, "log_info", log_info)
+    visitor.dump_scan_tree()
+    visitor._debug_scan_tree_root = "root-b"
+    visitor._debug_scan_tree = {("root-b", -1): {("child-b", 1)}}
+    with pytest.raises(RuntimeError, match="logger failure 2"):
+        visitor.dump_scan_tree()
+    visitor._debug_scan_tree_root = "root-c"
+    visitor._debug_scan_tree = {}
+    with pytest.raises(RuntimeError, match="logger failure 3"):
+        visitor.dump_scan_tree()
+    visitor._debug_scan_tree = {("root-c", -1): {("child-c", 2)}}
+    visitor.dump_scan_tree()
+
+    assert visitor._debug_message is original_message
+    assert "root-c" in messages[-1]
+    assert "child-c(idx: 2)" in messages[-1]
+    assert "root-a" not in messages[-1]
+    assert "root-b" not in messages[-1]
+    assert "child-b(idx: 1)" not in messages[-1]
+
+def test_dump_scan_tree_empty_logger_failures_then_restore_current_state(monkeypatch):
+    visitor_module = _load_visitor_module()
+    visitor = visitor_module.RecursiveDownwardsObjectVisitor.__new__(
+        visitor_module.RecursiveDownwardsObjectVisitor
+    )
+    visitor._debug_scan_tree_root = "root-a"
+    visitor._debug_message = ["stale"]
+    visitor._debug_scan_tree = {("root-a", -1): {("child-a", 0)}}
+    original_message = visitor._debug_message
+    messages = []
+    calls = 0
+
+    def log_info(message):
+        nonlocal calls
+        calls += 1
+        messages.append(message)
+        if calls in {2, 3}:
+            raise RuntimeError(f"logger failure {calls}")
+
+    monkeypatch.setattr(visitor_module, "log_info", log_info)
+    visitor.dump_scan_tree()
+    visitor._debug_scan_tree = {}
+    with pytest.raises(RuntimeError, match="logger failure 2"):
+        visitor.dump_scan_tree()
+    visitor._debug_scan_tree_root = "root-b"
+    visitor._debug_scan_tree = {("root-b", -1): {("child-b", 1)}}
+    with pytest.raises(RuntimeError, match="logger failure 3"):
+        visitor.dump_scan_tree()
+    visitor.dump_scan_tree()
+
+    assert visitor._debug_message is original_message
+    assert "root-b" in messages[-1]
+    assert "child-b(idx: 1)" in messages[-1]
+    assert "root-a" not in messages[-1]
+    assert "child-a(idx: 0)" not in messages[-1]
+
+def test_dump_scan_tree_mutated_empty_root_logger_retry_is_current(monkeypatch):
+    visitor_module = _load_visitor_module()
+    visitor = visitor_module.RecursiveDownwardsObjectVisitor.__new__(
+        visitor_module.RecursiveDownwardsObjectVisitor
+    )
+    visitor._debug_scan_tree_root = "root-a"
+    visitor._debug_message = ["stale"]
+    visitor._debug_scan_tree = {}
+    original_message = visitor._debug_message
+    messages = []
+    calls = 0
+
+    def log_info(message):
+        nonlocal calls
+        calls += 1
+        messages.append(message)
+        if calls == 2:
+            raise RuntimeError("logger failure")
+
+    monkeypatch.setattr(visitor_module, "log_info", log_info)
+    visitor.dump_scan_tree()
+    visitor._debug_scan_tree_root = "root-b"
+    with pytest.raises(RuntimeError, match="logger failure"):
+        visitor.dump_scan_tree()
+    visitor._debug_scan_tree = {("root-b", -1): {("child-b", 1)}}
+    visitor.dump_scan_tree()
+
+    assert visitor._debug_message is original_message
+    assert messages[0] == "\n--- Scan Tree ---\nroot-a\n---------------"
+    assert "root-b" in messages[-1]
+    assert "child-b(idx: 1)" in messages[-1]
+    assert "root-a" not in messages[-1]
+
+def test_dump_scan_tree_logger_failure_then_restoration_cycle_is_current(monkeypatch):
+    visitor_module = _load_visitor_module()
+    visitor = visitor_module.RecursiveDownwardsObjectVisitor.__new__(
+        visitor_module.RecursiveDownwardsObjectVisitor
+    )
+    visitor._debug_scan_tree_root = "root-a"
+    visitor._debug_message = ["stale"]
+    visitor._debug_scan_tree = {("root-a", -1): {("child-a", 0)}}
+    original_message = visitor._debug_message
+    messages = []
+    calls = 0
+
+    def log_info(message):
+        nonlocal calls
+        calls += 1
+        messages.append(message)
+        if calls == 3:
+            raise RuntimeError("logger failure")
+
+    monkeypatch.setattr(visitor_module, "log_info", log_info)
+    visitor.dump_scan_tree()
+    visitor._debug_scan_tree_root = "root-b"
+    visitor._debug_scan_tree = {("root-b", -1): {("child-b", 1)}}
+    visitor.dump_scan_tree()
+    visitor._debug_scan_tree_root = "root-c"
+    visitor._debug_scan_tree = {}
+    with pytest.raises(RuntimeError, match="logger failure"):
+        visitor.dump_scan_tree()
+    visitor._debug_scan_tree_root = "root-d"
+    visitor._debug_scan_tree = {("root-d", -1): {("child-d", 2)}}
+    visitor.dump_scan_tree()
+
+    assert visitor._debug_message is original_message
+    assert "root-d" in messages[-1]
+    assert "child-d(idx: 2)" in messages[-1]
+    assert "root-a" not in messages[-1]
+    assert "root-b" not in messages[-1]
+    assert "root-c" not in messages[-1]
+
+def test_dump_scan_tree_repeated_restoration_failures_use_latest_state(monkeypatch):
+    visitor_module = _load_visitor_module()
+    visitor = visitor_module.RecursiveDownwardsObjectVisitor.__new__(
+        visitor_module.RecursiveDownwardsObjectVisitor
+    )
+    visitor._debug_scan_tree_root = "root-a"
+    visitor._debug_message = ["stale"]
+    visitor._debug_scan_tree = {("root-a", -1): {("child-a", 0)}}
+    original_message = visitor._debug_message
+    messages = []
+    calls = 0
+
+    def log_info(message):
+        nonlocal calls
+        calls += 1
+        messages.append(message)
+        if calls in {3, 5}:
+            raise RuntimeError(f"logger failure {calls}")
+
+    monkeypatch.setattr(visitor_module, "log_info", log_info)
+    visitor.dump_scan_tree()
+    visitor._debug_scan_tree_root = "root-b"
+    visitor._debug_scan_tree = {("root-b", -1): {("child-b", 1)}}
+    visitor.dump_scan_tree()
+    visitor._debug_scan_tree_root = "root-c"
+    visitor._debug_scan_tree = {}
+    with pytest.raises(RuntimeError, match="logger failure 3"):
+        visitor.dump_scan_tree()
+    visitor._debug_scan_tree_root = "root-d"
+    visitor._debug_scan_tree = {("root-d", -1): {("child-d", 2)}}
+    visitor.dump_scan_tree()
+    visitor._debug_scan_tree_root = "root-e"
+    visitor._debug_scan_tree = {}
+    with pytest.raises(RuntimeError, match="logger failure 5"):
+        visitor.dump_scan_tree()
+    visitor._debug_scan_tree = {("root-e", -1): {("child-e", 3)}}
+    visitor.dump_scan_tree()
+
+    assert visitor._debug_message is original_message
+    assert "root-e" in messages[-1]
+    assert "child-e(idx: 3)" in messages[-1]
+    for stale_root in ("root-a", "root-b", "root-c", "root-d"):
+        assert stale_root not in messages[-1]
+
+def test_dump_scan_tree_three_recovery_cycles_keep_latest_state(monkeypatch):
+    visitor_module = _load_visitor_module()
+    visitor = visitor_module.RecursiveDownwardsObjectVisitor.__new__(
+        visitor_module.RecursiveDownwardsObjectVisitor
+    )
+    visitor._debug_scan_tree_root = "root-a"
+    visitor._debug_message = ["stale"]
+    visitor._debug_scan_tree = {}
+    original_message = visitor._debug_message
+    messages = []
+    calls = 0
+
+    def log_info(message):
+        nonlocal calls
+        calls += 1
+        messages.append(message)
+        if calls in {2, 4, 6}:
+            raise RuntimeError(f"logger failure {calls}")
+
+    monkeypatch.setattr(visitor_module, "log_info", log_info)
+    visitor.dump_scan_tree()
+    visitor._debug_scan_tree = {("root-a", -1): {("child-a", 0)}}
+    with pytest.raises(RuntimeError, match="logger failure 2"):
+        visitor.dump_scan_tree()
+    visitor._debug_scan_tree_root = "root-b"
+    visitor._debug_scan_tree = {}
+    visitor.dump_scan_tree()
+    visitor._debug_scan_tree = {("root-b", -1): {("child-b", 1)}}
+    with pytest.raises(RuntimeError, match="logger failure 4"):
+        visitor.dump_scan_tree()
+    visitor._debug_scan_tree_root = "root-c"
+    visitor._debug_scan_tree = {}
+    visitor.dump_scan_tree()
+    visitor._debug_scan_tree = {("root-c", -1): {("child-c", 2)}}
+    with pytest.raises(RuntimeError, match="logger failure 6"):
+        visitor.dump_scan_tree()
+    visitor._debug_scan_tree = {("root-c", -1): {("child-final", 3)}}
+    visitor.dump_scan_tree()
+
+    assert visitor._debug_message is original_message
+    assert "root-c" in messages[-1]
+    assert "child-final(idx: 3)" in messages[-1]
+    for stale in ("root-a", "root-b", "child-a", "child-b", "child-c(idx: 2)"):
+        assert stale not in messages[-1]
+
+def test_dump_scan_tree_four_recovery_cycles_keep_latest_state(monkeypatch):
+    visitor_module = _load_visitor_module()
+    visitor = visitor_module.RecursiveDownwardsObjectVisitor.__new__(
+        visitor_module.RecursiveDownwardsObjectVisitor
+    )
+    visitor._debug_scan_tree_root = "root-a"
+    visitor._debug_message = ["stale"]
+    visitor._debug_scan_tree = {}
+    original_message = visitor._debug_message
+    messages = []
+    calls = 0
+
+    def log_info(message):
+        nonlocal calls
+        calls += 1
+        messages.append(message)
+        if calls in {2, 4, 6, 8}:
+            raise RuntimeError(f"logger failure {calls}")
+
+    monkeypatch.setattr(visitor_module, "log_info", log_info)
+    visitor.dump_scan_tree()
+    for number, failure_call in enumerate((2, 4, 6, 8), start=0):
+        root = chr(ord("a") + number)
+        child = f"child-{root}"
+        visitor._debug_scan_tree_root = f"root-{root}"
+        visitor._debug_scan_tree = {}
+        with pytest.raises(RuntimeError, match=f"logger failure {failure_call}"):
+            visitor.dump_scan_tree()
+        visitor._debug_scan_tree = {
+            (f"root-{root}", -1): {(child, number)}
+        }
+        if number < 3:
+            visitor.dump_scan_tree()
+    visitor.dump_scan_tree()
+
+    assert visitor._debug_message is original_message
+    assert "root-d" in messages[-1]
+    assert "child-d(idx: 3)" in messages[-1]
+    for stale in ("root-a", "root-b", "root-c", "child-a", "child-b", "child-c"):
+        assert stale not in messages[-1]
+
+@pytest.mark.parametrize("failure_call", [1, 2, 3, 4])
+def test_dump_scan_tree_parametrized_failure_rebuilds_current_state(
+    monkeypatch, failure_call
+):
+    visitor_module = _load_visitor_module()
+    visitor = visitor_module.RecursiveDownwardsObjectVisitor.__new__(
+        visitor_module.RecursiveDownwardsObjectVisitor
+    )
+    visitor._debug_scan_tree_root = "initial"
+    visitor._debug_message = ["stale"]
+    visitor._debug_scan_tree = {("initial", -1): {("old", 0)}}
+    original_message = visitor._debug_message
+    messages = []
+    calls = 0
+
+    def log_info(message):
+        nonlocal calls
+        calls += 1
+        messages.append(message)
+        if calls == failure_call:
+            raise RuntimeError(f"logger failure {failure_call}")
+
+    monkeypatch.setattr(visitor_module, "log_info", log_info)
+    for call in range(1, failure_call + 1):
+        visitor._debug_scan_tree_root = f"root-{call}"
+        visitor._debug_scan_tree = {}
+        if call == failure_call:
+            with pytest.raises(
+                RuntimeError, match=f"logger failure {failure_call}"
+            ):
+                visitor.dump_scan_tree()
+        else:
+            visitor.dump_scan_tree()
+    visitor._debug_scan_tree = {
+        (f"root-{failure_call}", -1): {("final", failure_call)}
+    }
+    visitor.dump_scan_tree()
+
+    assert visitor._debug_message is original_message
+    assert f"root-{failure_call}" in messages[-1]
+    assert f"final(idx: {failure_call})" in messages[-1]
+    assert "initial" not in messages[-1]
+    assert "old(idx: 0)" not in messages[-1]
+
+def test_scan_tree_debug_output_is_deterministic(monkeypatch):
+    visitor_module = _load_visitor_module()
+    visitor = visitor_module.RecursiveDownwardsObjectVisitor.__new__(
+        visitor_module.RecursiveDownwardsObjectVisitor
+    )
+    visitor._debug_scan_tree_root = "root"
+    visitor._debug_message = []
+    visitor._debug_scan_tree = {
+        ("root", -1): {("zeta", 2), ("alpha", 1)},
+    }
+
+    visitor._prepare_scan_tree()
+
+    assert visitor._debug_message == [
+        "\n--- Scan Tree ---\nroot",
+        " |_ alpha(idx: 1)",
+        " |_ zeta(idx: 2)",
+    ]
+
+def test_recursive_downwards_object_visitor_processes_deferred_children(monkeypatch):
+    visitor_module = _load_visitor_module()
+    visitor = visitor_module.RecursiveDownwardsObjectVisitor.__new__(
+        visitor_module.RecursiveDownwardsObjectVisitor
+    )
+    visitor._new_for_visit = [
+        _child_frame(visitor_module, 1, 0x403000, 1, 4),
+        _child_frame(visitor_module, 2, 0x402000, 0, 2),
+    ]
+    calls = []
+
+    def execute(frame):
+        calls.append((frame.function_ea, frame.argument_index, frame.base_offset))
+        return []
+
+    visitor._execute_visit = execute
+    visitor._scan_single_function = lambda: None
+
+    visitor._recursive_process()
+
+    assert calls == [(0x403000, 1, 4), (0x402000, 0, 2)]
+    assert visitor._new_for_visit == []
+
+
+def test_dump_scan_tree_resets_debug_message(monkeypatch):
+    visitor_module = _load_visitor_module()
+    visitor = visitor_module.RecursiveDownwardsObjectVisitor.__new__(
+        visitor_module.RecursiveDownwardsObjectVisitor
+    )
+    visitor._debug_scan_tree_root = "root"
+    visitor._debug_message = ["stale"]
+    visitor._debug_scan_tree = {}
+    rendered = []
+    monkeypatch.setattr(visitor_module, "log_info", rendered.append)
+
+    visitor.dump_scan_tree()
+    first = list(visitor._debug_message)
+    visitor.dump_scan_tree()
+
+    assert visitor._debug_message == first
+    assert len(rendered) == 2
+
+def test_recursive_downwards_object_visitor_stops_permanently_deferred_visit(monkeypatch):
+    visitor_module = _load_visitor_module()
+    visitor = visitor_module.RecursiveDownwardsObjectVisitor.__new__(
+        visitor_module.RecursiveDownwardsObjectVisitor
+    )
+    visitor._new_for_visit = [_child_frame(visitor_module, 1, 0x402000, 0, 0)]
+    visitor._execute_visit = lambda *args: visitor._VISIT_DEFERRED
+    visitor._scan_single_function = lambda: None
+
+    visitor._recursive_process()
+
+    assert visitor._new_for_visit == []
+
+def test_recursive_downwards_object_visitor_clears_queue_on_scan_failure(monkeypatch):
+    visitor_module = _load_visitor_module()
+    visitor = visitor_module.RecursiveDownwardsObjectVisitor.__new__(
+        visitor_module.RecursiveDownwardsObjectVisitor
+    )
+    visitor._new_for_visit = [_child_frame(visitor_module, 1, 0x402000, 0, 0)]
+    error = RuntimeError("scan failed")
+
+    def fail_scan():
+        visitor._new_for_visit.append(_child_frame(visitor_module, 2, 0x403000, 1, 0))
+        raise error
+
+    monkeypatch.setattr(visitor, "_scan_single_function", fail_scan)
+
+    with pytest.raises(RuntimeError) as raised:
+        visitor._recursive_process()
+
+    assert raised.value is error
+    assert visitor._new_for_visit == []
 def test_recursive_downwards_object_visitor_refreshes_tree_before_scanning(monkeypatch):
     visitor_module = _load_visitor_module()
     visitor = visitor_module.RecursiveDownwardsObjectVisitor.__new__(
@@ -546,9 +2559,8 @@ def test_recursive_downwards_object_visitor_refreshes_tree_before_scanning(monke
     )
     visitor._cfunc = SimpleNamespace(entry_ea=0x401000)
     visitor._max_depth = None
-    visitor._current_depth = 0
-    visitor._new_for_visit = {(0x402000, 0)}
-    visitor._visit_base_offsets = {}
+    visitor._current_frame = _root_frame(visitor_module)
+    visitor._new_for_visit = [_child_frame(visitor_module, 1, 0x402000, 0, 0)]
     visitor._callee_base_offset = 0
 
     prepared_calls = []
@@ -726,8 +2738,6 @@ class _AllocVar(_VISITOR_MODULE_FOR_SHIM.ScanObject):
         self.id = object()
 
 
-
-
 def test_upwards_prepare_merges_lvars_without_alloc_size():
     visitor_module = _load_visitor_module()
     visitor = visitor_module.RecursiveUpwardsObjectVisitor.__new__(
@@ -776,6 +2786,39 @@ def test_upwards_prepare_merges_lvars_with_matching_alloc_sizes():
     visitor._prepare()
     names = sorted(o.name for o in visitor._objects)
     assert names == ["v1", "v2"]
+
+def test_upwards_prepare_rejects_phi_parent_with_conflicting_child_sizes():
+    visitor_module = _load_visitor_module()
+    visitor = visitor_module.RecursiveUpwardsObjectVisitor.__new__(
+        visitor_module.RecursiveUpwardsObjectVisitor
+    )
+    # void *p; if (c) p = a(0x2C); else p = b(0x38);  ->  the unknown-size
+    # phi parent p must NOT batch-accept two DIFFERENT known sizes into
+    # the closure (R3.12 fold); its propagation is rejected entirely.
+    p = _AllocVar("p")  # unknown (phi)
+    a = _AllocVar("a", alloc_size=0x2C)
+    b = _AllocVar("b", alloc_size=0x38)
+    visitor._objects = [p]
+    visitor._tree = {p: {a, b}}
+    visitor._prepare()
+    names = [o.name for o in visitor._objects]
+    assert names == ["p"]
+
+
+def test_upwards_prepare_accepts_phi_parent_with_consistent_child_sizes():
+    visitor_module = _load_visitor_module()
+    visitor = visitor_module.RecursiveUpwardsObjectVisitor.__new__(
+        visitor_module.RecursiveUpwardsObjectVisitor
+    )
+    # Same shape but consistent known sizes: both children merge.
+    p = _AllocVar("p")  # unknown (phi)
+    a = _AllocVar("a", alloc_size=0x2C)
+    b = _AllocVar("b", alloc_size=0x2C)
+    visitor._objects = [p]
+    visitor._tree = {p: {a, b}}
+    visitor._prepare()
+    names = sorted(o.name for o in visitor._objects)
+    assert names == ["a", "b", "p"]
 
 
 def test_recursive_upwards_check_call_only_tracks_matched_argument(monkeypatch):

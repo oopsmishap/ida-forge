@@ -6,10 +6,11 @@ import ida_kernwin
 
 from forge.api.hexrays import decompile, get_funcs_referencing_address, is_legal_type
 from forge.api.scan_object import GlobalVariableObject, ObjectType, ScanObject
-from forge.api.scanner import NewDeepScanVisitor, NewShallowScanVisitor
+from forge.api.scanner import NewShallowScanVisitor
 from forge.api.ui_actions import HexRaysPopupAction, UIMenuAction, register_action
-from forge.util.logging import log_warning
+from forge.util.logging import log_info, log_warning
 
+from .child_scan import HierarchyScanRequest
 from .config import config
 from .form import structure_form
 
@@ -80,12 +81,17 @@ class StructureBuilderAction(HexRaysPopupAction):
     @staticmethod
     def _ensure_structure_selected() -> bool:
         if structure_form.current_structure is not None:
-            structure_form.ensure_ui()
             return True
 
-        structure_form.show()
-        created_structure = structure_form.prompt_create_structure()
+        # Auto-create a scan-target structure with no modal: an empty name
+        # triggers the auto-naming path in StructureBuilderForm.create_structure
+        # (is_auto_named = not clean_name), so no name prompt or form show().
+        created_structure = structure_form.create_structure("")
         if created_structure is not None:
+            log_info(
+                f"Forge: scanning into new structure '{created_structure.name}' "
+                "(rename it from the Structure Builder when ready)"
+            )
             return True
 
         log_warning(
@@ -116,7 +122,12 @@ class ShallowScanAction(StructureBuilderAction):
                 cfunc, origin, obj, structure_form.current_structure
             )
             visitor.process()
+            log_info(
+                f"Forge: shallow-scanned '{obj.name}' into "
+                f"'{structure_form.current_structure.name}'"
+            )
             structure_form.update_structure_fields()
+            hx_view.refresh_view(True)
 
 
 @register_action
@@ -132,7 +143,7 @@ class DeepScanAction(StructureBuilderAction):
         cloned.tinfo = obj.tinfo
         return cloned
 
-    def _scan_global_references(self, obj, origin, max_depth):
+    def _scan_global_references(self, obj, max_depth):
         xref_functions = sorted(get_funcs_referencing_address(obj.object_ea))
         if not xref_functions:
             log_warning(
@@ -147,21 +158,42 @@ class DeepScanAction(StructureBuilderAction):
             has_multiple_roots=len(xref_functions) > 1,
         )
 
+        skipped_roots = []
+        requests = []
         for func_ea in xref_functions:
             cfunc = decompile(func_ea)
             if cfunc is None:
+                skipped_roots.append(func_ea)
                 continue
 
             prepared_cfunc = self._prepare_function(cfunc)
-            visitor = NewDeepScanVisitor(
-                prepared_cfunc,
-                origin,
-                self._clone_global_object(obj),
+            requests.append(
+                HierarchyScanRequest(
+                    cfunc=prepared_cfunc,
+                    obj=self._clone_global_object(obj),
+                    source_base=0,
+                )
+            )
+
+        if requests:
+            structure_form._run_deep_hierarchy_scan(
                 structure_form.current_structure,
-                recurse_calls=True,
+                requests,
                 max_depth=max_depth,
             )
-            visitor.process()
+
+        if skipped_roots:
+            skipped = ", ".join(hex(ea) for ea in skipped_roots)
+            log_warning(
+                f"Skipped global scan roots that could not be decompiled: {skipped}",
+                True,
+            )
+
+        log_info(
+            f"Forge: deep-scanned '{obj.name}' across "
+            f"{len(xref_functions)} referencing function(s) into "
+            f"'{structure_form.current_structure.name}'"
+        )
 
     @staticmethod
     def _prompt_scan_depth() -> int | None:
@@ -180,35 +212,104 @@ class DeepScanAction(StructureBuilderAction):
         except ValueError:
             return default
 
-    def activate(self, ctx):
+    def _run(self, ctx, max_depth: int | None) -> None:
         if not self._ensure_structure_selected():
             return
 
+        hx_view = ida_hexrays.get_widget_vdui(ctx.widget)
+        cfunc = hx_view.cfunc
+
+        obj = self.create_scan_object(cfunc, hx_view.item)
+        if not obj:
+            return
+
+        if obj.id == ObjectType.global_object:
+            self._scan_global_references(obj, max_depth)
+        else:
+            prepared_cfunc = self._prepare_function(cfunc)
+            self._set_root_scan_provenance(
+                obj,
+                root_function_ea=prepared_cfunc.entry_ea,
+            )
+            if prepared_cfunc.entry_ea == cfunc.entry_ea:
+                hx_view.refresh_view(True)
+            structure_form._run_deep_hierarchy_scan(
+                structure_form.current_structure,
+                (
+                    HierarchyScanRequest(
+                        cfunc=prepared_cfunc,
+                        obj=obj,
+                        source_base=0,
+                    ),
+                ),
+                max_depth=max_depth,
+            )
+            log_info(
+                f"Forge: deep-scanned '{obj.name}' into "
+                f"'{structure_form.current_structure.name}'"
+            )
+            hx_view.refresh_view(True)
+        structure_form.update_structure_fields()
+
+    def activate(self, ctx):
+        default_depth = config.get_class_config(type(config)).get(
+            "default_deep_scan_depth", 0
+        )
+        max_depth = None if default_depth <= 0 else default_depth
+        self._run(ctx, max_depth)
+
+
+@register_action
+class DeepScanCustomDepthAction(DeepScanAction):
+    name = "Deep Scan (Custom Depth)"
+    description = "Deep Scan (Custom Depth)"
+    hotkey = config["deep_scan_custom_depth_hotkey"]
+
+    def activate(self, ctx):
         depth = self._prompt_scan_depth()
         if depth is None:
             return
         max_depth = None if depth <= 0 else depth
+        self._run(ctx, max_depth)
+
+
+@register_action
+class FinalizeStructureAction(HexRaysPopupAction):
+    name = "Finalize Structure"
+    description = "Finalize Structure"
+    hotkey = config["finalize_hotkey"]
+
+    def check(self, hx_view: ida_hexrays.vdui_t):
+        structure = structure_form.current_structure
+        return structure is not None and bool(structure.members)
+
+    def activate(self, ctx):
+        structure = structure_form.current_structure
+        if structure is None:
+            log_warning(
+                "No structure selected.\nScan a variable first.",
+                True,
+            )
+            return
+
+        structure.auto_resolve()
+        tinfo = structure.create_type_if_ready(
+            structure_form.structures, headless=True
+        )
+        structure_form.update_structure_fields()
 
         hx_view = ida_hexrays.get_widget_vdui(ctx.widget)
-        cfunc = hx_view.cfunc
-        origin = structure_form.current_structure.main_offset
-
-        obj = self.create_scan_object(cfunc, hx_view.item)
-        if obj:
-            if obj.id == ObjectType.global_object:
-                self._scan_global_references(obj, origin, max_depth)
-            else:
-                prepared_cfunc = self._prepare_function(cfunc)
-                self._set_root_scan_provenance(
-                    obj,
-                    root_function_ea=prepared_cfunc.entry_ea,
-                )
-                if prepared_cfunc.entry_ea == cfunc.entry_ea:
-                    hx_view.refresh_view(True)
-                visitor = NewDeepScanVisitor(
-                    prepared_cfunc, origin, obj, structure_form.current_structure,
-                    recurse_calls=True,
-                    max_depth=max_depth,
-                )
-                visitor.process()
-            structure_form.update_structure_fields()
+        if tinfo is not None:
+            stats = structure.get_stats()
+            log_info(
+                f"Forge: created type '{structure.name}' "
+                f"({stats.enabled_members} members)"
+            )
+            if hx_view is not None:
+                hx_view.refresh_view(True)
+        else:
+            log_warning(
+                f"Forge: could not finalize '{structure.name}'; "
+                "see the Output window for details.",
+                True,
+            )

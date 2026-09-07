@@ -11,6 +11,7 @@ dependencies = ["toml>=0.10"]
 
 [project.optional-dependencies]
 dev = ["pytest>=8.0"]
+ida = ["ida-domain>=0.5.1"]
 
 [tool.setuptools]
 package-dir = {"" = "src"}

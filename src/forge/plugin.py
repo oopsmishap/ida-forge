@@ -4,7 +4,10 @@ import logging
 from contextlib import suppress
 from typing import Any, Callable
 
-import ida_expr
+try:
+    import ida_expr
+except ImportError:  # pragma: no cover - headless import only
+    ida_expr = None
 
 AUTHOR: str = "@oopsmishap"
 
@@ -34,6 +37,8 @@ def _register_idc_func(name: str, func: Callable[..., Any], arg_types: tuple) ->
     module is imported by the logging module itself — importing it here would be
     circular. The forge handler is attached to the same ``forge`` logger.
     """
+    if ida_expr is None:
+        return
     try:
         ida_expr.add_idc_func(name, func, arg_types)
     except Exception as exc:  # noqa: BLE001 — IDA-version tolerance
@@ -48,6 +53,11 @@ def register_idc_func(plugmod: Any) -> None:
     ``plugmod`` is expected to expose ``get_state(index: int) -> str`` and
     ``add_state(value: str) -> int`` methods.
     """
+    if ida_expr is None:
+        logging.getLogger("forge").warning(
+            "Skipping IDC state registration: ida_expr is unavailable"
+        )
+        return
     for name in (_GET_STATE_NAME, _SET_STATE_NAME):
         # removing an unregistered name is expected
         with suppress(Exception):
@@ -58,7 +68,9 @@ def register_idc_func(plugmod: Any) -> None:
 
 
 def unregister_idc_func() -> None:
-    """Remove the cross-plugin IDC accessors registered by :func:`register_idc_func`."""
+    """Remove the cross-plugin IDC accessors when the SDK is available."""
+    if ida_expr is None:
+        return
     for name in (_GET_STATE_NAME, _SET_STATE_NAME):
         # the plugin may not have registered yet
         with suppress(Exception):

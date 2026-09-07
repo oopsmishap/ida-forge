@@ -64,14 +64,19 @@ def _load_qt_binding():
             )
 
             return QtCore, QtGui, QtWidgets, QtCore.Signal, "PySide6"
-        except (ImportError, NotImplementedError):
+        except Exception:  # noqa: BLE001 — deliberate: headless idalib raises
+            # RuntimeError at PySide6's own prerequisite check and Windows DLL
+            # load failures surface as OSError; any of those must degrade to
+            # the next binding instead of killing the module import.
             pass
 
     try:
-        from PyQt5 import QtCore
+        from PyQt5 import QtCore, QtGui, QtWidgets
 
-        return QtCore, QtCore, QtCore, QtCore.pyqtSignal, "PyQt5"
-    except (ImportError, NotImplementedError):
+        return QtCore, QtGui, QtWidgets, QtCore.pyqtSignal, "PyQt5"
+    except Exception:  # noqa: BLE001 — same deliberate headless degradation
+        # as the PySide6 branch above: a real PyQt5-only environment keeps the
+        # real binding, everything headless falls through to the inert stubs.
         namespace = _DummyQtNamespace()
         return namespace, namespace, namespace, _dummy_signal, "stub"
 

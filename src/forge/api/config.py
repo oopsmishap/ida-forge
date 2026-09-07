@@ -4,12 +4,17 @@ from copy import deepcopy
 from pathlib import Path
 from typing import Any, ClassVar
 
-import ida_diskio
-
-try:  # stdlib tomllib on Python 3.11+ (IDA 9.x ships 3.12)
+try:
     import tomllib
-except ImportError:  # Python 3.9/3.10 read via the `toml` package
+except ModuleNotFoundError:  # pragma: no cover - Python 3.10
     tomllib = None
+
+from forge.api.domain import current_database
+
+try:
+    import ida_diskio
+except ImportError:  # pragma: no cover - outside IDA
+    ida_diskio = None
 
 from forge.util.logging import log_debug, log_error
 
@@ -60,6 +65,16 @@ def _dump_toml_file(path: Path, data: dict) -> None:
 
 ConfigDict = dict[str, Any]
 
+def _domain_user_idadir() -> str | None:
+    """Return Domain's configured user directory when available."""
+    try:
+        domain_db = current_database(required=False)
+    except Exception:  # noqa: BLE001 — config remains usable outside IDA
+        return None
+    metadata = getattr(domain_db, "metadata", None) if domain_db is not None else None
+    user_dir = getattr(metadata, "user_idadir", None)
+    return str(user_dir) if user_dir else None
+
 
 class ConfigBase:
     """Base class for TOML-backed configuration management."""
@@ -68,13 +83,14 @@ class ConfigBase:
     default_config: ClassVar[ConfigDict] = {}
 
     def __init__(self, config_name: str):
-        if not self.name:
-            raise ValueError("Config class must define a name attribute.")
-
+        user_dir = _domain_user_idadir()
+        if user_dir is None and ida_diskio is not None:
+            user_dir = ida_diskio.get_user_idadir()
+        if user_dir is None:
+            user_dir = str(Path.home() / ".idapro")
+        self._config_path = Path(user_dir) / "cfg" / f"{config_name}.toml"
         self._config_name = config_name
-        self._config_path = Path(ida_diskio.get_user_idadir()) / "cfg" / f"{config_name}.toml"
         self._config: ConfigDict = self._load_config()
-
     def _load_config(self) -> ConfigDict:
         """Load the full configuration file."""
         try:

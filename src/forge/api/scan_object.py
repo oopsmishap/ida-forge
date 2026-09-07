@@ -8,8 +8,55 @@ import ida_hexrays
 import ida_name
 import idaapi
 
+from forge.api.domain import current_database as _current_domain_database
+from forge.api.domain import sdk_fallback as _sdk_fallback
+from forge.api.domain import try_domain_method as _try_domain_method
 from forge.api.hexrays import ctype, get_member_name
 from forge.util.logging import log_debug
+
+
+def _domain_name_or_short_name(ea: int, capability: str, label: str) -> str:
+
+    handled, name = _try_domain_method(
+        _current_domain_database(required=False),
+        "names",
+        "get_at",
+        ea,
+        capability=capability,
+        unavailable_reason=f"ida-domain database/name lookup unavailable for {label}",
+        failure_reason=f"ida-domain {label} name lookup failed",
+        exceptions=(Exception,),
+    )
+    if handled:
+        return name or ""
+    return ida_name.get_short_name(ea)
+
+
+def _global_object_name(ea: int) -> str:
+    return _domain_name_or_short_name(ea, "names.global_object", "global object")
+
+
+def _allocator_target_name(ea: int) -> str:
+    return _domain_name_or_short_name(ea, "names.allocator", "allocator")
+
+
+def _scan_root_function_name(ea: int) -> str:
+
+    handled, function = _try_domain_method(
+        _current_domain_database(required=False),
+        "functions",
+        "get_at",
+        ea,
+        capability="functions.scan_root_name",
+        unavailable_reason="ida-domain scan-root function lookup unavailable on this build/session",
+        failure_reason="ida-domain scan-root function lookup failed",
+        exceptions=(Exception,),
+    )
+    if handled and function is not None:
+        name = getattr(function, "name", None)
+        if name:
+            return name
+    return getattr(ida_funcs, "get_func_name", lambda value: f"sub_{value:x}")(ea)
 
 TYPE_IGNORED_TOKENS = {"const", "volatile", "struct", "class", "union", "&"}
 
@@ -415,7 +462,7 @@ class ScanObject:
             result.name = get_member_name(t, cexpr.m)
         elif cexpr.op == ctype.obj:
             result = GlobalVariableObject(cexpr.obj_ea)
-            result.name = ida_name.get_short_name(cexpr.obj_ea)
+            result.name = _global_object_name(cexpr.obj_ea)
         else:
             return None
 
@@ -426,7 +473,7 @@ class ScanObject:
             result.set_scan_root(
                 cfunc.entry_ea,
                 expression_ea=result.ea,
-                function_name=getattr(ida_funcs, "get_func_name", lambda ea: f"sub_{ea:x}")(cfunc.entry_ea),
+                function_name=_scan_root_function_name(cfunc.entry_ea),
             )
 
         return result
@@ -647,7 +694,7 @@ class CallArgumentObject(ScanObject):
         result.tinfo = ida_hexrays.cfunc_type(cfunc)
         result.set_scan_root(
             cfunc.entry_ea,
-            function_name=getattr(ida_funcs, "get_func_name", lambda ea: f"sub_{ea:x}")(cfunc.entry_ea),
+            function_name=_scan_root_function_name(cfunc.entry_ea),
         )
         return result
 
@@ -674,9 +721,7 @@ class ReturnedObject(ScanObject):
         log_debug(f"Creating ReturnedObject {self.__func_ea}")
 
     def is_target(self, cexpr: ida_hexrays.cexpr_t) -> bool:
-        """
-        Checks if expression is a call and its object address is the same as the function address
-        """
+        """Check whether expression calls this function."""
         if cexpr.op != ctype.call or not hasattr(cexpr, "x") or cexpr.x is None:
             return False
         return getattr(cexpr.x, "obj_ea", idaapi.BADADDR) == self.__func_ea
@@ -796,8 +841,7 @@ class MemoryAllocationObject(ScanObject):
         call_expr = MemoryAllocationObject._unwrap_call_expression(cexpr)
         if call_expr is None:
             return None
-
-        raw_func_name = ida_name.get_short_name(
+        raw_func_name = _allocator_target_name(
             getattr(call_expr.x, "obj_ea", idaapi.BADADDR)
         )
         allocator_name = MemoryAllocationObject._normalize_allocator_name(raw_func_name)
@@ -813,7 +857,7 @@ class MemoryAllocationObject(ScanObject):
         result.set_scan_root(
             cfunc.entry_ea,
             expression_ea=result.ea,
-            function_name=getattr(ida_funcs, "get_func_name", lambda ea: f"sub_{ea:x}")(cfunc.entry_ea),
+            function_name=_scan_root_function_name(cfunc.entry_ea),
         )
         return result
 

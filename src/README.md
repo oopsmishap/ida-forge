@@ -19,5 +19,7 @@ Package layout:
   (`forge_api.help()` lists every call; the catalog it writes is the same
   one the structure-builder form reads).
 
-Development: `python -m pytest -q` (suite stubs the `ida_*` modules) and
-`python -m ruff check src tests` must stay green.
+Development: `python -m compileall -q src tests scripts` (the CI compile
+gate runs before Ruff/pytest; note `scripts/*` is gitignored except
+`r3_gap_probe.py`), `python -m pytest -q` (suite stubs the `ida_*` modules)
+and `python -m ruff check src tests` must stay green.

@@ -175,11 +175,13 @@ class Types:
         return Type("func_t", dummy_func, dummy_func, dummy_func, dummy_func, 0)
 
     def _load_types(self) -> None:
-        """
-        Load all the types into the type cache.
-        :return: None
-        """
+        """Seed the canonical primitive-type cache used by Forge.
 
+        The bootstrap set intentionally covers scalar integer, floating-point,
+        boolean, character, ``void``, and pointer-width-dependent ``size_t``
+        types. Additional aliases belong in the cache population policy rather
+        than being inferred opportunistically during type lookup.
+        """
         # https://www.hex-rays.com/products/ida/support/sdkdoc/typeinf_8hpp.html
 
         self._add_type_to_cache("void", ida_typeinf.BT_VOID, False)
@@ -198,7 +200,6 @@ class Types:
         self._add_type_to_cache("f32", ida_typeinf.BTF_FLOAT)
         self._add_type_to_cache("f64", ida_typeinf.BTF_DOUBLE)
         self._add_type_to_cache("size_t", self._size_t_enum(self._type_width))
-        # TODO: add any more types that are needed
 
     @staticmethod
     def _size_t_enum(width: int) -> int:
@@ -217,7 +218,14 @@ class Types:
         """
         if entry.save and entry.typedef_name:
             resolved = ida_typeinf.tinfo_t()
-            if resolved.get_named_type(self._idati, entry.typedef_name):
+            # Resolve against the LIVE til, not the handle captured at
+            # singleton construction: the Types singleton persists across
+            # databases in one IDA process (PLUGIN_MULTI re-inits per
+            # database but module state survives), and a captured idati
+            # would silently resolve typedefs against a stale type table
+            # (fork's types.refresh() intent, adapted to the descriptor
+            # cache — no live tinfo_t is cached here).
+            if resolved.get_named_type(ida_typeinf.get_idati(), entry.typedef_name):
                 return resolved
 
         return ida_typeinf.tinfo_t(entry.type_enum)
@@ -343,11 +351,12 @@ class Types:
 
         return work_type
 
-    def get_ptr_tinfo(self):
-        """Return a fresh ``void *``-like pointer tinfo for the pointer width."""
+    def get_ptr_tinfo(self) -> ida_typeinf.tinfo_t:
+        """Return a fresh pointer ``tinfo_t`` matching the current width."""
         return ida_typeinf.tinfo_t(self.get_ptr_type().ptr)
 
-    def get_ptr_type(self):
+    def get_ptr_type(self) -> Type:
+        """Return the canonical unsigned integer type matching pointer width."""
         if self.width == 8:
             return self._get_type("u64")
         if self.width == 4:
@@ -357,7 +366,13 @@ class Types:
         raise UnsupportedArchitectureError(self.width)
 
     @staticmethod
-    def _get_ptr_width():
+    def _get_ptr_width() -> int:
+        """Return IDA's pointer width in bytes.
+
+        Forge supports IDA's 64-bit, 32-bit, and 16-bit modes as widths 8, 4,
+        and 2 respectively. Any other architecture state is rejected explicitly
+        with :class:`UnsupportedArchitectureError`.
+        """
         if ida_ida.inf_is_64bit():
             width = 8
         elif ida_ida.inf_is_32bit_exactly():
@@ -368,10 +383,12 @@ class Types:
             raise UnsupportedArchitectureError(None)
         return width
 
-    def __getitem__(self, item):
+    def __getitem__(self, item: str) -> Type:
+        """Return a fresh canonical type and its standard variations."""
         return self._get_type(item)
 
-    def __contains__(self, item):
+    def __contains__(self, item: str) -> bool:
+        """Return whether ``item`` names a cached canonical type."""
         return item in self._type_cache
 
 
@@ -397,12 +414,11 @@ def create_type(name: str, declaration: str) -> bool:
     return True
 
 
-def import_type(name):
-    """
-    Imports a type from a library into the IDA database.
+def import_type(name: str) -> int:
+    """Import ``name`` and return its ordinal, or ``-1`` on failure.
 
-    :param str name: The name of the type to import.
-    :return int: The ordinal number of the imported type.
+    The implementation prefers the current IDA type-library APIs and falls
+    back to the compatible IDA Python import path when necessary.
     """
     # IDA 9.4 moved ``import_type`` off the module (now ``til.import_type(tinfo)``
     # or ``idc.import_type(idati, name)``); older builds keep the module call.

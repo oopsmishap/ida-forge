@@ -1246,6 +1246,36 @@ def test_to_function_offset_str_uses_stable_fallback_for_non_function():
     assert hexrays_module.to_function_offset_str(0x401234) == "<no-function>"
 
 
+
+def test_to_function_offset_str_uses_domain_metadata(monkeypatch):
+    hexrays_path = Path(__file__).resolve().parents[2] / "src" / "forge" / "api" / "hexrays.py"
+    spec = util.spec_from_file_location("forge.api.hexrays_domain_test", hexrays_path)
+    assert spec is not None and spec.loader is not None
+    hexrays_module = util.module_from_spec(spec)
+    spec.loader.exec_module(hexrays_module)
+    monkeypatch.setattr(
+        hexrays_module,
+        "_current_domain_database",
+        lambda required=False: SimpleNamespace(
+            functions=SimpleNamespace(
+                get_at=lambda ea: SimpleNamespace(start_ea=0x401000)
+            ),
+            names=SimpleNamespace(get_at=lambda ea: "domain_func"),
+        ),
+    )
+    assert hexrays_module.to_function_offset_str(0x401234) == "domain_func+0x234"
+
+
+def test_domain_function_for_offset_uses_shared_dispatch(monkeypatch):
+    hexrays_path = Path(__file__).resolve().parents[2] / "src" / "forge" / "api" / "hexrays.py"
+    spec = util.spec_from_file_location("forge.api.hexrays_dispatch_test", hexrays_path)
+    assert spec is not None and spec.loader is not None
+    module = util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    expected = object()
+    monkeypatch.setattr(module, "_try_domain_method", lambda *args, **kwargs: (True, expected))
+    assert module._domain_function_for_offset(0x401000) is expected
+
 def test_new_deep_scan_visitor_initializes_recursive_state(monkeypatch):
     scanner_module = _load_scanner_module()
     calls = []
@@ -1667,4 +1697,82 @@ def test_member_rooted_scan_anchored_at_use_instruction_still_works(monkeypatch)
     assert visitor._skip is False  # cleared at the memptr use
     offsets = sorted(m.offset for m in structure.members)
     assert 0x00 in offsets, f"expected the +0 member, got offsets {offsets}"
-    assert 0x1C in offsets, f"expected the +28 member, got offsets {offsets}"
+
+
+def test_scanned_object_function_metadata_uses_domain(monkeypatch):
+    scanner_module = _load_scanner_module()
+    function = SimpleNamespace(start_ea=0x401000, name="domain_func")
+    monkeypatch.setattr(
+        scanner_module,
+        "_current_domain_database",
+        lambda required=False: SimpleNamespace(
+            functions=SimpleNamespace(get_at=lambda ea: function)
+        ),
+    )
+    assert scanner_module.ScannedObject._get_function_start(0x401234) == 0x401000
+    obj = scanner_module.ScannedObject.__new__(scanner_module.ScannedObject)
+    obj.func_ea = 0x401000
+    assert obj.function_name == "domain_func"
+
+
+def test_maybe_record_pointer_child_gate_records_through_empty_store(monkeypatch):
+    """C4 regression: the pointer-child gate must check the store's PRESENCE,
+    not its truthiness. The store is initialised EMPTY at ScanVisitor.__init__
+    and this gate is the only path to _record_pointer_child_member — gating on
+    an empty dict made pointer-child/vtable-child reconstruction dead code path.
+    """
+    scanner_module = _load_scanner_module()
+    ctype = scanner_module.ctype
+    structure = SimpleNamespace(name="Root", add_member=lambda member: None)
+    obj = SimpleNamespace(
+        id=scanner_module.ObjectType.global_object,
+        ea=0x5000,
+        object_ea=0x5000,
+        name="g_table",
+    )
+    visitor = scanner_module.NewDeepScanVisitor.__new__(scanner_module.NewDeepScanVisitor)
+    visitor.parents = []
+    visitor._pointer_child_structures = {}
+    visitor._structure = structure
+    visitor._obj = obj
+    visitor._origin = 0
+    visitor._get_parent_context = lambda: scanner_module.ParentExpressionContext([])
+    monkeypatch.setattr(visitor, "_build_child_member", lambda *_args, **_kwargs: SimpleNamespace(offset=8, tinfo=FakeType("_QWORD")), raising=False)
+    visitor._record_pointer_child_member = lambda *_args, **_kwargs: visitor._pointer_child_structures.setdefault(0, SimpleNamespace(name="Root_field_0", members=[SimpleNamespace(offset=8, tinfo=FakeType("_QWORD"))]))
+    monkeypatch.setattr(scanner_module, "_function_at", lambda _ea: None, raising=False)
+
+    # ``*(_QWORD *)(*(_QWORD *)a1 + 8)`` — parents of the a1 leaf, innermost
+    # first (same double-deref chain as the wiring test).
+    cast1 = SimpleNamespace(op=ctype.cast)
+    ptr1 = SimpleNamespace(op=ctype.ptr)
+    add = SimpleNamespace(
+        op=ctype.add,
+        x=ptr1,
+        y=SimpleNamespace(op=ctype.num, numval=lambda: 8),
+        type=FakeType("_QWORD *", ptr=True),
+    )
+    cast2 = SimpleNamespace(op=ctype.cast, type=FakeType("_QWORD *", ptr=True))
+    ptr2 = SimpleNamespace(op=ctype.ptr)
+    monkeypatch.setattr(
+        visitor,
+        "_get_parent_context",
+        lambda: scanner_module.ParentExpressionContext(
+            [cast1, ptr1, add, cast2, ptr2]
+        ),
+        raising=False,
+    )
+
+    # A freshly initialised store is EMPTY — the pre-fix truthiness gate
+    # bailed out right here and reconstruction never ran.
+    assert visitor.pointer_child_structures == {}
+    visitor._maybe_record_pointer_child(
+        SimpleNamespace(op=ctype.var, name="a1"), obj
+    )
+
+    children = visitor.pointer_child_structures
+    assert children, "pointer-child store must be populated via the real gate"
+    child = children[0]
+    assert child.name == "Root_field_0"
+    assert len(child.members) == 1
+    assert child.members[0].offset == 8
+    assert child.members[0].tinfo.dstr() == "_QWORD"

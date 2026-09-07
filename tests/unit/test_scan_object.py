@@ -721,3 +721,60 @@ def test_memory_allocation_create_ignores_cast_without_inner_call(monkeypatch):
     monkeypatch.setattr(ScanObject, "get_expression_address", staticmethod(lambda _cfunc, expr: expr.ea))
     bad_cast = FakeExpr(ctype.cast, x=None)
     assert MemoryAllocationObject.create(FakeCfunc([]), bad_cast) is None
+
+
+def test_global_object_name_uses_domain_names(monkeypatch):
+    from forge.api import scan_object
+
+    monkeypatch.setattr(
+        scan_object,
+        "_current_domain_database",
+        lambda required=False: SimpleNamespace(
+            names=SimpleNamespace(get_at=lambda ea: "domain_global")
+        ),
+    )
+    assert scan_object._global_object_name(0x401000) == "domain_global"
+
+
+def test_allocator_name_uses_domain_names(monkeypatch):
+    from forge.api import scan_object
+
+    monkeypatch.setattr(
+        scan_object,
+        "_current_domain_database",
+        lambda required=False: SimpleNamespace(
+            names=SimpleNamespace(get_at=lambda ea: "malloc")
+        ),
+    )
+    assert scan_object._allocator_target_name(0x401000) == "malloc"
+
+
+def test_scan_root_function_name_uses_domain_function(monkeypatch):
+    from forge.api import scan_object
+
+    monkeypatch.setattr(
+        scan_object,
+        "_current_domain_database",
+        lambda required=False: SimpleNamespace(
+            functions=SimpleNamespace(
+                get_at=lambda ea: SimpleNamespace(name="domain_root")
+            )
+        ),
+    )
+    assert scan_object._scan_root_function_name(0x401000) == "domain_root"
+
+
+def test_call_argument_root_name_uses_domain_function(monkeypatch):
+    from forge.api import scan_object
+
+    monkeypatch.setattr(
+        scan_object,
+        "_current_domain_database",
+        lambda required=False: SimpleNamespace(
+            functions=SimpleNamespace(
+                get_at=lambda ea: SimpleNamespace(name="domain_call_root")
+            )
+        ),
+    )
+    assert scan_object._scan_root_function_name(0x401000) == "domain_call_root"
+

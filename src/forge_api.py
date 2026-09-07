@@ -24,6 +24,8 @@ import contextlib
 import importlib
 import importlib.util
 import inspect
+import copy
+import dataclasses
 import json
 import re
 import sys
@@ -45,9 +47,13 @@ __all__ = [
     "create_structure",
     "create_type",
     "create_typedef",
+    "database_session",
     "decompile",
     "decompile_many",
     "deep_scan",
+    "discover_global_slots",
+    "domain_status",
+    "functions",
     "duplicate_structure",
     "export_store",
     "finalize",
@@ -55,6 +61,7 @@ __all__ = [
     "function_info",
     "get_member",
     "get_structure",
+    "grouped",
     "guess_allocation",
     "help",
     "import_store",
@@ -63,13 +70,17 @@ __all__ = [
     "inverse_if",
     "is_type",
     "link_child",
+    "name_cpp_evidence",
     "name_members_from_printf",
     "named_types",
     "nudge_members",
+    "plan_structure",
     "push_all",
     "push_type",
     "reapply",
     "recover",
+    "recover_abi_structure",
+    "recover_pointer_flow",
     "refresh_types",
     "remove_members",
     "remove_structure",
@@ -96,6 +107,8 @@ __all__ = [
     "to_hex",
     "to_usercall",
     "to_vtable",
+    "transaction",
+    "synthesize_cpp",
     "type_of",
     "undo_type",
     "vtable_entries",
@@ -118,6 +131,41 @@ def _ida_available() -> bool:
         return True
     return importlib.util.find_spec("ida_hexrays") is not None
 
+def _sdk_fallback(capability: str, reason: str):
+    """Record an unavoidable SDK fallback through the Domain diagnostics store."""
+    from forge.api.domain import sdk_fallback
+    return sdk_fallback(capability, reason)
+
+def _current_domain_database(*, required: bool = True):
+    """Return the active Domain database using the facade's compatibility helper."""
+    database = _domain_database_or_none()
+    if database is None and required:
+        raise ForgeApiError("ida-domain database session unavailable")
+    return database
+
+
+def _try_domain_method(
+    database, namespace: str, method: str, *args, capability: str, unavailable_reason: str,
+    failure_reason: str, **kwargs,
+):
+    """Call an optional Domain operation and record fallback evidence on failure."""
+    handler = getattr(database, namespace, None) if database is not None else None
+    operation = getattr(handler, method, None)
+    if not callable(operation):
+        _sdk_fallback(capability, unavailable_reason)
+        return False, None
+    try:
+        return True, operation(*args, **kwargs)
+    except Exception:
+        _sdk_fallback(capability, failure_reason)
+        return False, None
+
+
+def _domain_decompile_result(database, ea: int):
+    """Map a Domain decompile object to forge's stable result shape."""
+    from forge.api.domain import decompile_result
+    return decompile_result(database, ea)
+
 
 def _require_ida() -> None:
     """Raise unless a real (or stubbed) IDA Hex-Rays module is importable."""
@@ -126,22 +174,32 @@ def _require_ida() -> None:
             "forge_api.<function> requires an IDA Pro session with Hex-Rays"
         )
 
+def _validate_ea(ea: int, *, allow_zero: bool = True) -> int:
+    """Validate an address before formatting or crossing the IDA boundary."""
+    if isinstance(ea, bool) or not isinstance(ea, int):
+        raise ForgeApiError(f"ea must be an int, got {ea!r}")
+    if ea < 0 or (not allow_zero and ea == 0):
+        raise ForgeApiError(f"ea must be a non-negative address, got {ea!r}")
+    return ea
+
+
+def _validate_declaration(declaration: str) -> str:
+    """Reject non-string/empty C declarations before parser or IDA calls."""
+    if not isinstance(declaration, str) or not declaration.strip():
+        raise ForgeApiError(f"declaration must be a non-empty string, got {declaration!r}")
+    return declaration.strip()
+
 
 # --------------------------------------------------------------------------- #
 # self-describing catalog
-# --------------------------------------------------------------------------- #
 _API: dict[str, dict] = {}
 
-
-def api(*, group: str, returns: str, example: str):
+def api(*, group: str, returns: str, example: str, side_effects: str = "unknown"):
     def decorate(fn):
         params = []
         for name, param in inspect.signature(fn).parameters.items():
             annotation = param.annotation
-            if annotation is inspect.Parameter.empty:
-                type_hint = ""
-            else:
-                type_hint = getattr(annotation, "__name__", str(annotation))
+            type_hint = "" if annotation is inspect.Parameter.empty else getattr(annotation, "__name__", str(annotation))
             params.append(
                 {
                     "name": name,
@@ -156,6 +214,13 @@ def api(*, group: str, returns: str, example: str):
             "params": params,
             "returns": returns,
             "example": example,
+            "kind": "operation",
+            "error_contract": {
+                "raises": ["ForgeApiError"],
+                "returns": "{ok: false, error: string, code: string}",
+                "recoverable": "{ok: false, error: string, code: string}",
+            },
+            "side_effects": side_effects,
         }
         return fn
 
@@ -176,6 +241,8 @@ class _State:
     def __init__(self):
         self.structures = catalog
         self.templated = None
+        # Re-entrancy guard for _refresh_type_references (see that helper).
+        self.refreshing_references = False
 
     @property
     def current(self) -> str | None:
@@ -188,6 +255,473 @@ class _State:
 
 _state = _State()
 _structures = _state.structures
+@contextlib.contextmanager
+@api(
+    group="meta",
+    returns="context manager",
+    example='with forge_api.transaction("layout batch"): ...',
+    side_effects="catalog mutation; one persistence commit",
+)
+def transaction(label: str = "forge_api transaction"):
+    """Group catalog mutations with rollback on exception and one commit."""
+    with catalog.transaction(label) as store:
+        yield store
+
+
+@contextlib.contextmanager
+@api(
+    group="meta",
+    returns="context manager",
+    example='with forge_api.database_session("fixture.i64"): ...',
+    side_effects="open and close IDA Domain database",
+)
+def database_session(path, *, save_on_close: bool = False, options=None):
+    """Open an IDA Domain database and deterministically close its session."""
+    from forge.api.domain import database_session as _database_session
+
+    with _database_session(path, save_on_close=save_on_close, options=options) as database:
+        yield database
+
+def _domain_database_or_none():
+    """Return the active Domain database, or ``None`` outside an IDA session."""
+    try:
+        from forge.api.domain import current_database
+        return current_database(required=False)
+    except (ImportError, AttributeError, RuntimeError, TypeError, ValueError, OSError):
+        return None
+
+
+@api(
+    group="meta",
+    returns="dict",
+    example="forge_api.domain_status()",
+    side_effects="diagnostic read",
+)
+def domain_status(*, clear_fallbacks: bool = False) -> dict:
+    """Return detached Domain capability and SDK-fallback diagnostics."""
+    from forge.api import domain
+
+    snapshot = domain.capability_snapshot()
+    records = list(domain.fallback_records())
+    fallback_rows = [
+        {"capability": record.capability, "reason": record.reason}
+        for record in records
+    ]
+    summary: dict[str, list[dict]] = {}
+    counts: dict[str, int] = {}
+    for row in fallback_rows:
+        component = row["capability"].split(".", 1)[0]
+        summary.setdefault(component, []).append(dict(row))
+        counts[component] = counts.get(component, 0) + 1
+    removed = len(fallback_rows) if clear_fallbacks else 0
+    if clear_fallbacks:
+        domain.clear_fallback_records()
+    return {
+        **snapshot,
+        "available": snapshot["ida_domain"]["available"],
+        "preferred": "ida-domain",
+        "fallbacks": fallback_rows,
+        "fallback_summary": summary,
+        "fallback_counts": counts,
+        "fallback_clear_requested": clear_fallbacks,
+        "fallbacks_cleared": removed,
+    }
+
+
+@api(
+    group="meta",
+    returns="dict",
+    example='groups = forge_api.grouped(group="structures")',
+)
+def grouped(*, group: str | None = None, include_meta: bool = False) -> dict:
+    """Return detached API metadata grouped for maintainable clients."""
+    entries = help()["functions"]
+    selected = {
+        name: entry
+        for name, entry in entries.items()
+        if (group is None or entry["group"] == group)
+        and (include_meta or entry["group"] != "meta")
+    }
+    groups: dict[str, dict] = {}
+    for name, entry in selected.items():
+        groups.setdefault(entry["group"], {})[name] = copy.deepcopy(entry)
+    return {"module": __name__, "version": __version__, "groups": groups}
+
+@api(
+    group="decompile",
+    returns="list[dict]",
+    example="forge_api.functions()",
+    side_effects="database enumeration read",
+)
+def functions() -> list[dict]:
+    """List valid functions through Domain, with explicit SDK fallback."""
+    _require_ida()
+    database = _domain_database_or_none()
+    rows = None
+    if database is not None:
+        handler = getattr(database, "functions", None)
+        getter = getattr(handler, "get_all", None)
+        if callable(getter):
+            try:
+                rows = getter()
+            except Exception:
+                rows = None
+    if rows is None:
+        _sdk_fallback("functions.enumeration", "ida-domain function enumeration unavailable")
+        import ida_funcs
+        rows = []
+        for ea in ida_funcs.Functions():
+            function = ida_funcs.get_func(ea)
+            if function is not None:
+                rows.append(
+                    type("FunctionRow", (), {
+                        "name": ida_funcs.get_func_name(ea),
+                        "start_ea": function.start_ea,
+                        "end_ea": function.end_ea,
+                    })()
+                )
+    result = []
+    for row in rows:
+        start = getattr(row, "start_ea", None)
+        end = getattr(row, "end_ea", None)
+        if isinstance(start, bool) or isinstance(end, bool):
+            continue
+        if not isinstance(start, int) or not isinstance(end, int) or end < start:
+            continue
+        result.append({"name": getattr(row, "name", None), "start_ea": start, "end_ea": end})
+    return sorted(result, key=lambda item: item["start_ea"])
+
+@api(
+    group="recovery",
+    returns="dict",
+    example="forge_api.recover_pointer_flow(ea, types)",
+    side_effects="IDA local-variable type mutation",
+)
+def recover_pointer_flow(ea: int, types: dict) -> dict:
+    """Apply recovered pointer types and report whether application verified."""
+    result = set_lvar_types(ea, types, scope="all", replace=True)
+    if result.get("ok"):
+        return {"ok": True, "updated": result.get("updated", []), "ea": ea, "verified": True}
+    return {"ok": False, "error": result.get("error", "type application failed"), "ea": ea, "verified": False}
+
+
+@api(
+    group="recovery",
+    returns="dict",
+    example="forge_api.recover_abi_structure(name, members, abi=metadata)",
+    side_effects="headless structure mutation",
+)
+def recover_abi_structure(name: str, members: list[dict], *, abi: dict | None = None) -> dict:
+    """Create or replace a structure from detached C++ ABI evidence.
+
+    ABI rebuild with site preservation, entirely IN PLACE: the previous
+    Structure object (if any) keeps its identity — its committed-type
+    state (``created_type_name``), provenance, and the inbound parent
+    links other structures hold against it are never destroyed, so the
+    no-delete guard on committed structures is honored. Only the member
+    rows are replaced. Scan evidence recorded on a prior member survives
+    the rebuild — each prior member's ``scanned_variables``/child link
+    merges into the ABI member at the same offset
+    (:func:`forge.api.members.merge_member_evidence`), the prior
+    provenance is restored (a rebuild must not silently reset
+    ``kind="cpp_synthesis"``), child links whose parent member did not
+    survive the rebuild are dropped (with their reciprocal on the child),
+    the structure's reference-catalog rows are re-recorded from the new
+    ABI declarations (:meth:`TypeReferenceCatalog.rebuild`), the
+    persisted scan-site rows are recomputed, and the surviving evidence
+    is reported under ``preserved_sites``.
+    """
+    from forge.api.members import merge_member_evidence
+    from forge.api.provenance import references
+
+    previous = _structures.get(name)
+    prior_members: list = []
+    prior_provenance = None
+    if previous is not None:
+        # In-place rebuild: committed structures must never be deleted
+        # and recreated (remove_structure refuses them). Clearing the
+        # member rows keeps the committed IDB type and every inbound
+        # relationship intact; the caller re-commits afterwards with
+        # create_type(..., overwrite=True) if the layout changed.
+        target = previous
+        prior_members = list(target.members)
+        prior_provenance = target.clone_provenance()
+        target.clear_members()
+    else:
+        create_structure(name)
+        target = _resolve_structure(name)
+    _state.current = name
+    failed_members = []
+    for member in members:
+        added = add_member(
+            name,
+            int(member["offset"]),
+            str(member["type"]),
+            name=member.get("name"),
+        )
+        # M3: an ok:False add_member means the ABI member VANISHED from
+        # the rebuilt structure — surface it, never silently shrink.
+        if isinstance(added, dict) and added.get("ok") is False:
+            failed_members.append(
+                {
+                    "offset": member.get("offset"),
+                    "type": str(member.get("type", "")),
+                    "name": member.get("name"),
+                    "error": added.get("error"),
+                }
+            )
+    preserved = []
+    merged_offsets: set[int] = set()
+    for prior in prior_members:
+        current = target.get_member_by_offset(getattr(prior, "offset", None))
+        if current is None or current is prior:
+            continue
+        kept = merge_member_evidence(current, prior)
+        if kept is not current:
+            continue
+        preserved.append({"offset": current.offset, "member": current.name})
+        merged_offsets.add(current.offset)
+        child_name = getattr(current, "linked_child_structure_name", None)
+        if child_name and child_name in _structures and not any(
+            rel.child_structure_name == child_name
+            and rel.parent_member_offset == current.offset
+            for rel in target.child_relationships
+        ):
+            relationship = target.add_child_relationship(
+                child_structure_name=child_name,
+                parent_member_offset=current.offset,
+                parent_member_name=current.name,
+                relation_kind=getattr(current, "child_relation_kind", None) or "pointer",
+            )
+            _structures[child_name].add_parent_relationship(relationship)
+    for relationship in list(target.child_relationships):
+        if relationship.parent_member_offset in merged_offsets:
+            survivor = target.get_member_by_offset(relationship.parent_member_offset)
+            if survivor is not None:
+                relationship.parent_member_name = survivor.name
+            continue
+        # The prior evidence this link was created from did not survive
+        # the rebuild: drop the stale link and its reciprocal on the child
+        # (the recreate path dropped it with the old object).
+        target.child_relationships.remove(relationship)
+        child = _structures.get(relationship.child_structure_name)
+        if child is not None:
+            child.parent_relationships = [
+                rel
+                for rel in child.parent_relationships
+                if not (
+                    rel.parent_structure_name == name
+                    and rel.parent_member_offset == relationship.parent_member_offset
+                )
+            ]
+    target.abi_metadata = copy.deepcopy(abi or {})
+    if prior_provenance is not None:
+        target.provenance = prior_provenance
+    _refresh_scan_sites(target)
+    references.rebuild([target])
+    _mark_dirty()
+    payload = _to_structure_dict(target)
+    payload["abi_metadata"] = copy.deepcopy(target.abi_metadata)
+    payload["preserved_sites"] = preserved
+    if failed_members:
+        # M3: the rebuilt structure is smaller than the ABI evidence
+        # asked for — report every vanished member instead of ok:True.
+        payload["failed_members"] = failed_members
+        payload["ok"] = False
+        payload["error"] = (
+            f"{len(failed_members)} ABI member(s) could not be added: "
+            + "; ".join(
+                row.get("error") or "unknown error" for row in failed_members
+            )
+        )
+        return payload
+    # Success contract (same shape as the other facade verbs): synthesize_cpp
+    # branches on result["ok"] — without it the caller returned the raw
+    # payload as if the rebuild had failed.
+    payload["ok"] = True
+    return payload
+
+
+@api(
+    group="recovery",
+    returns="dict",
+    example="forge_api.synthesize_cpp(name, members, abi=metadata, roots=roots)",
+    side_effects="headless structure/provenance mutation",
+)
+def synthesize_cpp(
+    name: str,
+    members: list[dict],
+    *,
+    abi: dict | None = None,
+    roots: list[dict] | None = None,
+    commit: bool = True,
+) -> dict:
+    """Synthesize a C++ structure and persist detached root provenance."""
+    result = recover_abi_structure(name, members, abi=abi)
+    if not result.get("ok"):
+        return result
+    target = _resolve_structure(name)
+    root_rows = [copy.deepcopy(row) for row in (roots or [])]
+    first = root_rows[0] if root_rows else {}
+    target.set_provenance(
+        kind="cpp_synthesis",
+        root_object_ea=first.get("object_ea"),
+        root_function_ea=first.get("function_ea"),
+        has_multiple_roots=len(root_rows) > 1,
+    )
+    # Roots: the persisted provenance model has no roots field — the
+    # detached GLOBAL_EA rows below are the durable record, and the full
+    # root list rides on the returned payload.
+    # 根对象是该类型的应用位点：记录 GLOBAL_EA 行，create_type 提交后的
+    # 引用刷新（_refresh_type_references）会依据这些行把类型重新应用到根上。
+    from forge.api.provenance import references
+
+    for row in root_rows:
+        if row.get("object_ea") is not None:
+            references.record_global_ea(int(row["object_ea"]), name, detail="cpp_synthesis root")
+    if commit:
+        commit_result = create_type(name)
+        if isinstance(commit_result, dict) and not commit_result.get("ok", True):
+            return commit_result
+    _mark_dirty()
+    try:
+        payload = _to_structure_dict(target)
+    except AttributeError:
+        provenance = getattr(target, "provenance", {})
+        if hasattr(provenance, "__dict__"):
+            provenance = copy.deepcopy(provenance.__dict__)
+        else:
+            provenance = copy.deepcopy(provenance)
+        payload = {"name": name, "provenance": provenance}
+    provenance_payload = payload.get("provenance")
+    if isinstance(provenance_payload, dict):
+        provenance_payload["roots"] = copy.deepcopy(root_rows)
+    payload.update({"ok": True, "structure": name})
+    return payload
+
+
+@api(
+    group="recovery",
+    returns="dict",
+    example="forge_api.name_cpp_evidence(name)",
+    side_effects="IDA name mutation",
+)
+def name_cpp_evidence(name: str) -> dict:
+    """Name vtable slots and the primary vptr from persisted ABI evidence."""
+    target = _resolve_structure(name)
+    renamed = []
+    for member in target.members:
+        if hasattr(member, "vtable_name"):
+            old_name = getattr(member, "name", "")
+            member.name = "vptr"
+            renamed.append({"offset": member.offset, "name": "vptr"})
+    for table in target.abi_metadata.get("vtables", []):
+        for slot in table.get("slots", []):
+            if slot.get("ea") is not None and slot.get("name"):
+                rename_ea(slot["ea"], slot["name"])
+    _mark_dirty()
+    return {"ok": True, "structure": name, "renamed": renamed}
+
+
+@api(
+    group="recovery",
+    returns="dict",
+    example="forge_api.discover_global_slots(target_ea)",
+    side_effects="IDA memory read",
+)
+def discover_global_slots(target_ea: int, *, span: int = 0x1000) -> dict:
+    """Find writable global pointer slots that point at a target address."""
+    _require_ida()
+    import ida_bytes
+    import ida_segment
+
+    if span <= 0:
+        return {"ok": False, "error": "span must be positive"}
+    candidates = []
+    width = 8
+    for index in range(ida_segment.get_segm_qty()):
+        segment = ida_segment.getnseg(index)
+        if not getattr(segment, "perm", 0) & getattr(ida_segment, "SEGPERM_WRITE", 2):
+            continue
+        start = int(segment.start_ea)
+        end = min(int(segment.end_ea), start + span)
+        for slot_ea in range(start, end, width):
+            if ida_bytes.get_qword(slot_ea) == target_ea:
+                candidates.append({"slot_ea": slot_ea, "target_ea": target_ea, "span": span})
+    return {"ok": True, "target_ea": target_ea, "candidates": candidates}
+
+
+
+
+@api(
+    group="structures",
+    returns="dict",
+    example='plan = forge_api.plan_structure("Recovered", [{"offset": 0, "type": "u32"}])',
+    side_effects="unknown",
+)
+def plan_structure(
+    name: str,
+    members: list[dict] | None = None,
+    *,
+    pack: int | None = 1,
+) -> dict:
+    """Build a detached structure plan without mutating catalog or IDB."""
+    try:
+        _validate_pack(pack)
+        from forge.api.members import Member, parse_user_tinfo
+        from forge.api.structure import Structure
+
+        target = Structure(name)
+        target.pack = pack
+        seen_offsets: set[int] = set()
+        planned: list[dict] = []
+        for spec in members or []:
+            if not isinstance(spec, dict):
+                raise ForgeApiError("member spec must be a dict")
+            offset = int(spec["offset"])
+            if offset < 0:
+                raise ForgeApiError(f"member offset must be non-negative: {offset}")
+            if offset in seen_offsets:
+                raise ForgeApiError(f"duplicate member offset: 0x{offset:x}")
+            seen_offsets.add(offset)
+            declaration = str(spec["type"])
+            tinfo = parse_user_tinfo(declaration)
+            if tinfo is None:
+                raise ForgeApiError(f"could not parse type {declaration!r}")
+            member_name = spec.get("name")
+            if member_name is not None:
+                _validate_member_name(member_name)
+            member = Member(offset, tinfo, None, int(spec.get("origin", 0)))
+            member.decl_src = declaration
+            if member_name is not None:
+                member.name = member_name
+            member.comment = spec.get("comment", "")
+            member.is_array = bool(spec.get("is_array", False))
+            if not spec.get("enabled", True):
+                member.set_enabled(False)
+            target.add_member(member)
+            planned.append(_to_member_dict(member))
+        target.refresh_collisions()
+        declaration_preview = None
+        warning = None
+        try:
+            built = target.build_cdecl()
+            declaration_preview = built[1] if built else None
+        except Exception as exc:
+            warning = f"declaration preview unavailable: {exc}"
+        result = {
+            "ok": True,
+            "name": name,
+            "pack": pack,
+            "members": planned,
+            "collisions": list(target.collisions),
+            "declaration": declaration_preview,
+        }
+        if warning:
+            result["warning"] = warning
+        return result
+    except (ForgeApiError, KeyError, TypeError, ValueError) as exc:
+        return {"ok": False, "error": str(exc), "code": "invalid_input"}
 
 
 def _allocation_root_prior_type(ea: int, var_name: str) -> str | None:
@@ -233,6 +767,201 @@ def _mark_dirty() -> None:
     from forge.api.store import catalog
 
     catalog._mark_dirty()
+
+
+def _declaration_named_types(declaration: str) -> list[str]:
+    """Named-type candidates in a prototype, minus the function's own name.
+
+    ``declaration_type_references`` counts every non-keyword identifier;
+    in a prototype the identifier directly preceding the parameter list's
+    ``(`` is the function name, never a referenced type, so it is stripped
+    first. Function-pointer parameters keep working — their declarator
+    names already sit behind pointer stars.
+    """
+    import re as _re
+
+    from forge.api.members import declaration_type_references
+
+    stripped = _re.sub(r"[A-Za-z_]\w*(?=\s*\()", " ", declaration)
+    return declaration_type_references(stripped)
+
+
+def _record_ea_reference_rows(ea: int, declaration: str) -> None:
+    """Record one GLOBAL_EA row per named type an applied declaration uses."""
+    from forge.api.provenance import references
+
+    for type_name in _declaration_named_types(declaration):
+        references.record_global_ea(ea, type_name, detail=declaration)
+
+
+def _record_lvar_reference_rows(ea: int, pairs, updated: list) -> None:
+    """Record one LVAR row per named type each successfully retyped local uses."""
+    from forge.api.provenance import references
+
+    ok_by_name = {row["name"]: row.get("ok") for row in updated}
+    for name, declaration in pairs:
+        if not ok_by_name.get(name):
+            continue
+        declaration = "void *" if declaration == "*" else declaration
+        for type_name in _declaration_named_types(declaration):
+            references.record_lvar(ea, name, type_name, detail=declaration)
+
+
+def _preserve_authored_members(target) -> list[dict]:
+    """Keep authored identity when a scan lands on an occupied offset (gap #8).
+
+    Deep scans append scan-built rows blindly, so a re-scan over a
+    structure with authored members (``decl_src``/human names from
+    ABI evidence, ``set_member``, ...) collides at the same offset.
+    ``members.merge_member_evidence`` merges the scan-built row's
+    evidence (``scanned_variables``, links) into the authored survivor
+    and the loser is dropped. Two authored members at one offset stay a
+    deliberate collision and are never touched.
+    """
+    from forge.api.members import is_authored_member
+
+    merged: list[dict] = []
+    groups: dict[int, list] = {}
+    for member in target.members:
+        groups.setdefault(member.offset, []).append(member)
+    for offset in sorted(groups):
+        group = groups[offset]
+        if len(group) < 2:
+            continue
+        survivor = group[0]
+        for other in group[1:]:
+            if is_authored_member(survivor) and is_authored_member(other):
+                continue
+            # Gap #8 merge goes through the catalog: merge_member_evidence
+            # keeps the authored identity fields, and the catalog itself
+            # drops (and persists) the loser — the facade can no longer
+            # forget the drop-the-loser step.
+            result = catalog.merge_member(target.name, other)
+            if not result.get("ok"):
+                continue
+            kept = result["merged"]
+            loser = result["dropped"]
+            target.refresh_collisions()
+            if loser is not None:
+                merged.append(
+                    {
+                        "offset": offset,
+                        "kept": kept.name,
+                        "merged": loser.name,
+                    }
+                )
+            survivor = kept
+    return merged
+
+
+def _refresh_type_references(name: str) -> dict:
+    """Refresh every recorded consumer of a (re-)committed type (gap #10).
+
+    After ``name`` re-lands in the IDB (fresh ordinal), dependent store
+    structures re-commit through :func:`push_type` in reference order and
+    recorded application sites (globals, locals, prototypes) re-apply
+    their stored declarations. Bounded to direct dependents; a nested
+    commit (``push_type`` -> ``create_type``) does not re-enter (the
+    ``_state.refreshing_references`` guard), so the cascade per commit is
+    exactly one level deep and every failure is reported, never fatal.
+    """
+    from forge.api.provenance import GLOBAL_EA, LVAR, PROTOTYPE, references
+
+    if getattr(_state, "refreshing_references", False):
+        return {"skipped": "reentrant"}
+    _state.refreshing_references = True
+    report: dict = {
+        "type": name,
+        "structures": [],
+        "globals": 0,
+        "lvars": 0,
+        "prototypes": 0,
+        "deferred": [],
+        "failed": [],
+    }
+    try:
+        rows = references.dependents_of(name)
+        owners = [
+            owner
+            for owner in sorted(references.owners_of(name))
+            if owner != name and owner in _structures
+        ]
+        ordered, deferred = references.resolve_commit_order(owners)
+        report["deferred"] = deferred
+        for owner in ordered:
+            try:
+                if push_type(owner):
+                    report["structures"].append(owner)
+                else:
+                    report["failed"].append({"structure": owner, "error": "type write failed"})
+            except Exception as exc:  # noqa: BLE001 — one bad owner must not abort
+                report["failed"].append({"structure": owner, "error": str(exc)})
+        for row in rows:
+            try:
+                if row.kind == GLOBAL_EA and row.ea is not None and row.detail:
+                    if apply_type(row.ea, row.detail).get("ok"):
+                        report["globals"] += 1
+                elif row.kind == LVAR and row.func_ea is not None and row.var and row.detail:
+                    if set_lvar_types(row.func_ea, {row.var: row.detail}, scope="all").get("ok"):
+                        report["lvars"] += 1
+                elif row.kind == PROTOTYPE and row.func_ea is not None and row.detail:
+                    if set_func_proto(row.func_ea, row.detail).get("ok"):
+                        report["prototypes"] += 1
+            except Exception as exc:  # noqa: BLE001 — recorded, never fatal
+                report["failed"].append({"site": repr(row.consumer_key()), "error": str(exc)})
+        return report
+    finally:
+        _state.refreshing_references = False
+
+
+def _refresh_references_after_rename(old: str, new: str) -> dict:
+    """Re-point stored references after a type re-file (rename).
+
+    Member declarations still naming ``old`` are rewritten to ``new``,
+    every catalog row (structure-member rows AND applied-site rows)
+    referencing ``old`` is re-pointed through a payload rewrite, and the
+    renamed structure re-commits so its committed members bind to the
+    new name. The re-commit triggers :func:`_refresh_type_references`
+    for the dependents via the ordinary ``create_type`` hook.
+    """
+    import re as _re
+
+    from forge.api.provenance import references
+
+    pattern = _re.compile(rf"\b{_re.escape(old)}\b")
+    for structure in list(_structures.values()):
+        for member in structure.members:
+            declaration = getattr(member, "decl_src", None)
+            if declaration and pattern.search(declaration):
+                member.decl_src = pattern.sub(new, declaration)
+    payload = references.to_payload()
+    rows = payload.get("references", [])
+    changed = 0
+    for row in rows:
+        if row.get("type_name") == old:
+            row["type_name"] = new
+            changed += 1
+        if row.get("owner") == old:
+            row["owner"] = new
+            changed += 1
+        if row.get("detail") and old in row["detail"]:
+            row["detail"] = pattern.sub(new, row["detail"])
+    if changed:
+        references.load_payload(payload)
+    report = {"repointed_rows": changed}
+    # Ordinal refresh gate (gap #10): rows now point at ``new`` — refresh
+    # every consumer so recorded sites (globals, locals, prototypes) and
+    # dependent structures re-bind to the new name. One level deep (guard).
+    report["references"] = _refresh_type_references(new)
+    if _ida_available() and new in _structures:
+        try:
+            report["recommitted"] = [new] if push_type(new) else []
+        except Exception as exc:  # noqa: BLE001 — rename must never break
+            from forge.util.logging import log_warning
+
+            log_warning(f"could not re-commit {new!r} after rename: {exc}")
+    _mark_dirty()
+    return report
 
 
 def _resolve_structure(structure_name: str | None = None, *, required: bool = True):
@@ -318,6 +1047,13 @@ def _to_member_dict(member) -> dict:
 
 
 def _to_structure_dict(structure) -> dict:
+    provenance = getattr(structure, "provenance", {})
+    if dataclasses.is_dataclass(provenance):
+        provenance = dataclasses.asdict(provenance)
+    elif isinstance(provenance, dict):
+        provenance = copy.deepcopy(provenance)
+    else:
+        provenance = {}
     return {
         "name": structure.name,
         "main_offset": structure.main_offset,
@@ -335,6 +1071,10 @@ def _to_structure_dict(structure) -> dict:
             }
             for rel in structure.child_relationships
         ],
+        "provenance": provenance,
+        "abi_metadata": copy.deepcopy(getattr(structure, "abi_metadata", {})),
+        "scan_sites": copy.deepcopy(getattr(structure, "scan_sites_rows", [])),
+        "last_applied": copy.deepcopy(getattr(structure, "last_apply_sites", [])),
     }
 
 
@@ -410,7 +1150,10 @@ def _ensure_placeholder_type(store_name: str) -> bool:
         f"struct {store_name} {{ unsigned char _placeholder; }};",
     ):
         try:
-            if ida_typeinf.idc_parse_types(placeholder_decl, 0):
+            # idc_parse_types returns an ERROR COUNT (0 == success), not a
+            # boolean — the old `if parse(...)` treated every failure as
+            # success and every success as failure (C5).
+            if ida_typeinf.idc_parse_types(placeholder_decl, 0) == 0:
                 return True
         except Exception as exc:  # noqa: BLE001 — version/format tolerance
             from forge.util.logging import log_debug
@@ -441,15 +1184,21 @@ def help(topic: str | None = None) -> dict:
         dict with ``module``, ``version`` and ``functions`` (name -> entry).
     """
     ordered = {
-        name: _API[name]
+        name: copy.deepcopy(_API[name])
         for name in sorted(_API, key=lambda n: (_API[n]["group"], n))
     }
     if topic is not None:
         entry = _API.get(topic)
         if entry is None:
             raise ForgeApiError(f"unknown topic {topic!r}")
-        ordered = {topic: entry}
-    return {"module": __name__, "version": __version__, "functions": ordered}
+        ordered = {topic: copy.deepcopy(entry)}
+    return {
+        "module": __name__,
+        "version": __version__,
+        "schema_version": 1,
+        "detached": True,
+        "functions": ordered,
+    }
 
 
 @api(
@@ -458,13 +1207,11 @@ def help(topic: str | None = None) -> dict:
     example='forge_api.to_hex(0x401000)',
 )
 def to_hex(ea: int) -> str:
-    """Format an address as a hex string for display or logging.
+    """Format a validated address as a hex string for display or logging.
 
     This function is pure and works outside IDA.
-
-    Returns:
-        str like ``"0x401000"``.
     """
+    _validate_ea(ea)
     try:
         from forge.api.hexrays import to_hex as _to_hex
     except (ImportError, ModuleNotFoundError):
@@ -653,18 +1400,26 @@ def callers_of(ea: int, kind: str = "code") -> list[int]:
     Returns:
         sorted list of function-start EAs.
     """
-    _require_ida()
+    database = _domain_database_or_none()
+    if database is not None:
+        method = "code_refs_to_ea" if kind == "code" else ("data_refs_to_ea" if kind == "data" else None)
+        if method is None:
+            return []
+        handled, sources = _try_domain_method(database, "xrefs", method, ea, capability="xrefs.callers_of", unavailable_reason="ida-domain xref lookup unavailable", failure_reason="ida-domain xref lookup failed")
+        if handled:
+            starts = []
+            functions = getattr(database, "functions", None)
+            getter = getattr(functions, "get_at", None)
+            for source in sources or []:
+                function = getter(source) if callable(getter) else None
+                starts.append(getattr(function, "start_ea", source))
+            return sorted(set(starts))
     import ida_funcs
     import ida_idaapi
     import ida_xref
-
-    if kind == "code":
-        get_first, get_next = ida_xref.get_first_cref_to, ida_xref.get_next_cref_to
-    elif kind == "data":
-        get_first, get_next = ida_xref.get_first_dref_to, ida_xref.get_next_dref_to
-    else:
+    get_first, get_next = (ida_xref.get_first_cref_to, ida_xref.get_next_cref_to) if kind == "code" else ((ida_xref.get_first_dref_to, ida_xref.get_next_dref_to) if kind == "data" else (None, None))
+    if get_first is None:
         return []
-
     starts = []
     seen = set()
     source = get_first(ea)
@@ -682,42 +1437,54 @@ def _import_slot_to_name(ea: int) -> str | None:
     IAT slots live in ``.idata``; addresses outside it fall back to the
     plain ``ida_name`` lookup (no name means None).
     """
+    database = _domain_database_or_none()
+    if database is not None:
+        names = getattr(database, "names", None)
+        name = getattr(names, "get_at", lambda _ea: None)(ea)
+        if name:
+            return name
+        imports_handler = getattr(database, "imports", None)
+        getter = getattr(imports_handler, "get_import_at", None)
+        if callable(getter):
+            row = getter(ea)
+            if row is not None and getattr(row, "name", None):
+                return row.name
+            ordinal_name = getattr(names, "get_at", lambda _ea: None)(ea)
+            if ordinal_name:
+                return ordinal_name
     try:
         import ida_name
-        import ida_segment
-
-        segment = ida_segment.getseg(ea)
-        if segment is not None and (
-            ida_segment.get_segm_name(segment) or ""
-        ).startswith(".idata"):
-            for row in imports():
-                if row["ea"] == ea:
-                    return row["name"] or None
-            return None
         return ida_name.get_name(ea) or None
-    except Exception:  # noqa: BLE001 — slot recon is best-effort
+    except Exception:
         return None
 
 
 def _import_slot_target_ea(ea: int) -> int | None:
-    """The imported function an IAT slot resolves to (E.23).
-
-    Reads the pointer stored AT the slot and returns its function start
-    when it lands inside a function; None when the slot has no import
-    name or does not point at a function.
-    """
+    """The imported function an IAT slot resolves to (E.23)."""
     if _import_slot_to_name(ea) is None:
         return None
+    database = _domain_database_or_none()
+    if database is not None:
+        bytes_api = getattr(database, "bytes", None)
+        db_info = getattr(database, "database", None)
+        pointer_size = getattr(db_info, "pointer_size", 8)
+        reader = getattr(bytes_api, "get_qword_at" if pointer_size == 8 else "get_dword_at", None)
+        if callable(reader):
+            try:
+                pointer = reader(ea)
+            except Exception as exc:  # noqa: BLE001
+                _sdk_fallback("bytes.import_slot_pointer", str(exc))
+                return 0
+            function = getattr(getattr(database, "functions", None), "get_at", lambda _ea: None)(pointer)
+            return getattr(function, "start_ea", pointer) if function is not None else pointer
     try:
         import ida_funcs
-
         from forge.api.hexrays import read_pointer
-
         pointer = read_pointer(ea)
         function = ida_funcs.get_func(pointer)
         if function is not None:
             return function.start_ea
-    except Exception:  # noqa: BLE001 — resolution is best-effort
+    except Exception:  # noqa: BLE001
         return None
     return None
 
@@ -730,13 +1497,14 @@ def _resolve_import_slot_callees(eas) -> list[int]:
     is not inside a function is replaced with the pointer stored at the
     slot when that lands in a function; unresolvable EAs are kept as-is.
     """
-    import ida_funcs
-
+    database = _domain_database_or_none()
     resolved = []
     for ea in eas:
-        if ida_funcs.get_func(ea) is not None:
-            resolved.append(ea)
-            continue
+        if database is not None:
+            handled, function = _try_domain_method(database, "functions", "get_at", ea, capability="functions.resolve_import_slots", unavailable_reason="ida-domain function lookup unavailable", failure_reason="ida-domain function lookup failed")
+            if handled:
+                resolved.append(getattr(function, "start_ea", ea) if function is not None else ( _import_slot_target_ea(ea) or ea))
+                continue
         target = _import_slot_target_ea(ea)
         resolved.append(target if target is not None else ea)
     return sorted(set(resolved))
@@ -781,22 +1549,27 @@ def function_info(ea: int) -> dict | None:
         dict or None.
     """
     _require_ida()
+    database = _domain_database_or_none()
+    if database is not None:
+        functions = getattr(database, "functions", None)
+        function = getattr(functions, "get_at", lambda _ea: None)(ea)
+        if function is not None:
+            start_ea = getattr(function, "start_ea", None)
+            end_ea = getattr(function, "end_ea", None)
+            if (isinstance(start_ea, bool) or isinstance(end_ea, bool) or not isinstance(start_ea, int) or not isinstance(end_ea, int) or end_ea < start_ea):
+                return None
+            name = getattr(functions, "get_name", lambda _fn: None)(function)
+            code_callers = sorted({value for value in callers_of(ea, "code") if isinstance(value, int) and not isinstance(value, bool)})
+            data_callers = sorted({value for value in callers_of(ea, "data") if isinstance(value, int) and not isinstance(value, bool)})
+            callees = sorted({value for value in callees_of(ea) if isinstance(value, int) and not isinstance(value, bool)})
+            return {"name": name, "start_ea": start_ea, "size": end_ea - start_ea, "prototype": signature(ea), "callers": code_callers, "callees": callees, "refs": sorted(set(code_callers) | set(data_callers))}
     import ida_funcs
-
     function = ida_funcs.get_func(ea)
     if function is None:
         return None
     code_callers = _resolve_import_slot_callees(callers_of(ea, "code"))
     data_callers = _resolve_import_slot_callees(callers_of(ea, "data"))
-    return {
-        "name": ida_funcs.get_func_name(ea),
-        "start_ea": function.start_ea,
-        "size": function.end_ea - function.start_ea,
-        "prototype": signature(ea),
-        "callers": code_callers,
-        "callees": callees_of(ea),
-        "refs": sorted(set(code_callers) | set(data_callers)),
-    }
+    return {"name": ida_funcs.get_func_name(ea), "start_ea": function.start_ea, "size": function.end_ea - function.start_ea, "prototype": signature(ea), "callers": code_callers, "callees": callees_of(ea), "refs": sorted(set(code_callers) | set(data_callers))}
 
 
 @api(
@@ -894,69 +1667,96 @@ def imports(pattern: str | None = None) -> list[dict]:
     returns="dict",
     example='r = forge_api.set_lvar_types(0x1400014F0, {"a1": "World *"}); r["updated"]',
 )
-def set_lvar_types(ea: int, types, *, scope: str = "arg") -> dict:
+def set_lvar_types(ea: int, types, *, scope: str = "arg", replace: bool = False) -> dict:
     """Commit C types onto the function's local variables headless.
 
     ``types`` maps each local name to a C declaration (``dict`` or list of
     ``(name, decl)`` tuples). ``"*"`` is shorthand for ``void *``. With the
     default ``scope="arg"`` only function arguments are retyped; pass
-    ``scope="all"`` to also retype plain locals. Each entry resolves
-    independently — a missing name or unparsable declaration reports
-    ``ok: False`` for that entry without aborting the rest. The result's
-    ``signature`` is the first pseudocode line of a fresh decompile, so the
-    caller sees the committed prototype immediately.
+    ``scope="all"`` to also retype plain locals. ``replace=True``
+    (``recover_pointer_flow``) states that existing lvar types must be
+    overwritten rather than merged; application is unconditional either
+    way, the flag keeps the forwarded contract explicit. Each entry
+    resolves independently — a missing name or unparsable declaration
+    reports ``ok: False`` for that entry without aborting the rest. The
+    result's ``signature`` is the first pseudocode line of a fresh
+    decompile, so the caller sees the committed prototype immediately.
+
 
     Returns:
         ``{"ok": bool, "updated": [{"name", "ok"}],
         "signature": str | None}``.
     """
     _require_ida()
+    database = _domain_database_or_none()
+    if database is not None:
+        pseudocode = getattr(database, "pseudocode", None)
+        function = getattr(pseudocode, "decompile", lambda _ea: None)(ea)
+        if function is not None:
+            variables = list(getattr(function, "local_variables", ()))
+            by_name = {variable.name: variable for variable in variables}
+            pairs = list(types.items()) if isinstance(types, dict) else list(types)
+            updated = []
+            any_ok = False
+            type_handler = getattr(database, "types", None)
+            parser = getattr(type_handler, "parse_one_declaration", None)
+            for name, declaration in pairs:
+                variable = by_name.get(name)
+                if variable is None or (scope == "arg" and not getattr(variable, "is_arg", False)):
+                    updated.append({"name": name, "ok": False})
+                    continue
+                declaration = "void *" if declaration == "*" else declaration
+                tinfo = parser(None, declaration) if callable(parser) else None
+                ok = bool(tinfo is not None and variable.set_type(tinfo) and function.save_local_variable_info(variable, save_type=True))
+                updated.append({"name": name, "ok": ok})
+                any_ok = any_ok or ok
+            signature = _domain_decompile_result(database, ea).get("pseudocode")
+            _record_lvar_reference_rows(ea, pairs, updated)
+            return {"ok": any_ok, "updated": updated, "signature": signature}
     from forge.api.hexrays import decompile as _decompile
-    from forge.api.hexrays import mark_cfunc_dirty as _mark_cfunc_dirty
     from forge.api.hexrays import set_lvar_type as _set_lvar_type
     from forge.api.members import parse_user_tinfo
-
+    import ida_hexrays
     cfunc = _decompile(ea)
     if cfunc is None:
         return {"ok": False, "error": f"could not decompile {hex(ea)}"}
     lvars = list(cfunc.get_lvars())
     by_name = {lvar.name: lvar for lvar in lvars}
-
     pairs = list(types.items()) if isinstance(types, dict) else list(types)
     updated = []
     any_ok = False
+    modify = getattr(ida_hexrays, "modify_user_lvar_info", None)
+    saved_cls = getattr(ida_hexrays, "lvar_saved_info_t", None)
+    locator_cls = getattr(ida_hexrays, "lvar_locator_t", None)
+    flags = getattr(ida_hexrays, "MLI_TYPE", 0x10)
     for name, declaration in pairs:
         lvar = by_name.get(name)
         if lvar is None or (scope == "arg" and not getattr(lvar, "is_arg_var", False)):
             updated.append({"name": name, "ok": False})
             continue
-        c_decl = "void *" if declaration == "*" else declaration
-        tinfo = parse_user_tinfo(c_decl)
-        if tinfo is None:
-            updated.append({"name": name, "ok": False})
-            continue
-        if _set_lvar_type(cfunc, lvar, tinfo):
-            updated.append({"name": name, "ok": True})
-            any_ok = True
-        else:
-            updated.append({"name": name, "ok": False})
-
-    signature = None
-    if any_ok:
-        _mark_cfunc_dirty(ea)
-        fresh = _decompile(ea)
-        if fresh is not None:
-            import ida_lines
-
-            for line in fresh.pseudocode:
-                text = getattr(line, "line", None)
-                rendered = (
-                    ida_lines.tag_remove(text) if isinstance(text, str) else str(line)
-                )
-                if rendered:
-                    signature = rendered
-                    break
-    return {"ok": any_ok, "updated": updated, "signature": signature}
+        tinfo = parse_user_tinfo("void *" if declaration == "*" else declaration)
+        ok = False
+        if tinfo is not None and callable(modify) and callable(saved_cls) and callable(locator_cls):
+            saved = saved_cls()
+            saved.ll = locator_cls(lvar.location, lvar.defea)
+            saved.type = tinfo
+            ok = bool(modify(ea, flags, saved))
+        if not ok and tinfo is not None:
+            ok = bool(_set_lvar_type(cfunc, lvar, tinfo))
+        updated.append({"name": name, "ok": ok})
+        any_ok = any_ok or ok
+    signature_text = None
+    pseudocode = getattr(cfunc, "pseudocode", None)
+    if pseudocode:
+        line = getattr(pseudocode[0], "line", None)
+        if line is not None:
+            try:
+                import ida_lines
+                signature_text = ida_lines.tag_remove(line)
+            except Exception:
+                signature_text = str(line)
+    _record_lvar_reference_rows(ea, pairs, updated)
+    return {"ok": any_ok, "updated": updated, "signature": signature_text}
 
 
 def _parse_function_decl(declaration: str):
@@ -967,29 +1767,20 @@ def _parse_function_decl(declaration: str):
     plus the ``None``-til form used by the member parser.
     """
     _require_ida()
+    database = _domain_database_or_none()
+    if database is not None:
+        parser = getattr(getattr(database, "types", None), "parse_one_declaration", None)
+        if callable(parser):
+            return parser(None, declaration)
     import ida_typeinf
-
     flags = ida_typeinf.PT_TYP | ida_typeinf.PT_SIL
     for til in (None, ida_typeinf.get_idati()):
         tinfo = ida_typeinf.tinfo_t()
         try:
             if ida_typeinf.parse_decl(tinfo, til, declaration, flags):
                 return tinfo
-        except Exception as exc:  # noqa: BLE001 — version/format tolerance
-            from forge.util.logging import log_debug
-
-            log_debug(f"parse_decl({til!r}) failed for {declaration!r}: {exc}")
+        except Exception:
             continue
-    try:
-        from forge.api.members import _parse_idc_decl_attempt
-
-        tinfo = _parse_idc_decl_attempt(declaration)
-        if tinfo is not None:
-            return tinfo
-    except Exception as exc:  # noqa: BLE001 — idc wrapper shape varies by version
-        from forge.util.logging import log_debug
-
-        log_debug(f"idc.parse_decl failed for {declaration!r}: {exc}")
     return None
 
 
@@ -1011,18 +1802,30 @@ def set_func_proto(ea: int, declaration: str) -> dict:
         ``{"ok": False, "error": str}``.
     """
     _require_ida()
-    import ida_typeinf
+    from forge.api.provenance import references
 
-    t = _parse_function_decl(declaration)
-    if t is None:
+    database = _domain_database_or_none()
+    if database is not None:
+        applier = getattr(getattr(database, "types", None), "apply_declaration_at", None)
+        if callable(applier):
+            try:
+                applied = applier(ea, declaration)
+            except Exception:
+                applied = False
+            if not applied:
+                return {"ok": False, "error": f"could not parse declaration {declaration!r}"}
+            for type_name in _declaration_named_types(declaration):
+                references.record_prototype(ea, type_name, detail=declaration)
+            return {"ok": True, "ea": ea, "prototype": signature(ea)}
+    import ida_typeinf
+    tinfo = _parse_function_decl(declaration)
+    if tinfo is None:
         return {"ok": False, "error": f"could not parse declaration {declaration!r}"}
     apply_tinfo = getattr(ida_typeinf, "apply_tinfo", None)
     if apply_tinfo is not None:
-        apply_tinfo(ea, t, ida_typeinf.TINFO_DEFINITE)
-    else:  # pragma: no cover — pre-7.x builds only
-        import ida_funcs
-
-        ida_funcs.set_ti(ea, t)
+        apply_tinfo(ea, tinfo, ida_typeinf.TINFO_DEFINITE)
+    for type_name in _declaration_named_types(declaration):
+        references.record_prototype(ea, type_name, detail=declaration)
     return {"ok": True, "ea": ea, "prototype": signature(ea)}
 
 
@@ -1042,22 +1845,25 @@ def rename_local(ea: int, name_or_index, new_name: str | None = None) -> bool:
         bool.
     """
     _require_ida()
-    import ida_hexrays
-
-    from forge.api.hexrays import decompile as _decompile
-
-    cfunc = _decompile(ea)
-    if cfunc is None:
-        return False
-    old_name = name_or_index
-    if isinstance(name_or_index, int):
-        lvars = list(cfunc.get_lvars())
-        if not 0 <= name_or_index < len(lvars):
+    database = _domain_database_or_none()
+    if database is not None:
+        function = getattr(getattr(database, "pseudocode", None), "decompile", lambda _ea: None)(ea)
+        variables = list(getattr(function, "local_variables", ())) if function is not None else []
+        old_name = variables[name_or_index].name if isinstance(name_or_index, int) and 0 <= name_or_index < len(variables) else name_or_index
+        variable = next((item for item in variables if item.name == old_name), None)
+        if variable is None or not new_name:
             return False
-        old_name = lvars[name_or_index].name
-    if not old_name:
-        return False
-    return bool(ida_hexrays.rename_lvar(ea, old_name, new_name))
+        variable.set_user_name(new_name)
+        return bool(function.save_local_variable_info(variable, save_name=True))
+    import ida_hexrays
+    if isinstance(name_or_index, int):
+        from forge.api.hexrays import decompile as _decompile
+        function = _decompile(ea)
+        variables = list(function.get_lvars()) if function is not None else []
+        if name_or_index < 0 or name_or_index >= len(variables):
+            return False
+        name_or_index = variables[name_or_index].name
+    return bool(ida_hexrays.rename_lvar(ea, name_or_index, new_name))
 
 
 @api(
@@ -1072,8 +1878,20 @@ def named_types() -> list[str]:
         sorted list of type names.
     """
     _require_ida()
+    database = _current_domain_database(required=False)
+    if database is not None:
+        handler = getattr(database, "types", None)
+        getter = getattr(handler, "get_all", None)
+        details = getattr(handler, "get_details", None)
+        if callable(getter) and callable(details):
+            names = []
+            for tinfo in getter():
+                row = details(tinfo)
+                name = getattr(row, "name", None)
+                if name:
+                    names.append(name)
+            return sorted(set(names))
     import ida_typeinf
-
     idati = ida_typeinf.get_idati()
     names = []
     for ordinal in range(ida_typeinf.get_ordinal_count(idati)):
@@ -1093,27 +1911,92 @@ def named_types() -> list[str]:
 def type_of(name: str) -> dict | None:
     """Describe an IDB named type: declaration string, size, kind, members.
 
-    For UDTs ``members`` lists each udt member's ``offset``/``size`` in bytes
-    (converted from IDA's bit units when bit-aligned; ``bit_offset`` always
-    carries the raw value) plus ``name`` and ``type``. Returns ``None`` when
-    ``name`` is not a known type.
+    For UDTs ``members`` lists each member's ``offset``/``size`` in BYTES
+    (the convention every other forge_api verb uses — both the ida-domain
+    and SDK paths report the value the IDB carries, with no bit-unit
+    conversion invented here) plus ``name`` and ``type``. Returns ``None``
+    when ``name`` is not a known type.
 
     Returns:
         dict or None.
     """
     _require_ida()
-    import ida_typeinf
+    if isinstance(name, int) and not isinstance(name, bool):
+        import ida_bytes
+        import ida_nalt
+        import ida_typeinf
 
+        address_tinfo = ida_typeinf.tinfo_t()
+        # 9.x: address tinfo lives on nalt/bytes helpers taking
+        # (tinfo_out, ea) — the old module-level get_tinfo(ea, tinfo) shape
+        # no longer exists and silently returned None for every EA (R2.6).
+        getter = getattr(ida_nalt, "get_tinfo", None) or getattr(
+            ida_bytes, "get_tinfo", None
+        )
+        if not callable(getter) or not getter(address_tinfo, name):
+            return None
+        return {
+            "name": name,
+            "type": getattr(address_tinfo, "dstr", lambda: "")(),
+            "size": getattr(address_tinfo, "get_size", lambda: 0)(),
+            "kind": "scalar",
+            "members": [],
+        }
+    database = _current_domain_database(required=False)
+    if database is not None:
+        handled, domain_tinfo = _try_domain_method(
+            database, "types", "get_by_name", name,
+            capability="types.get_by_name",
+            unavailable_reason="ida-domain named type lookup unavailable",
+            failure_reason="ida-domain named type lookup failed",
+        )
+        if handled:
+            if domain_tinfo is None:
+                return None
+            handled, details = _try_domain_method(
+                database, "types", "get_details", domain_tinfo,
+                capability="types.get_details",
+                unavailable_reason="ida-domain type details unavailable",
+                failure_reason="ida-domain type details failed",
+            )
+            if handled:
+                kind = "struct" if domain_tinfo.is_udt() else ("pointer" if domain_tinfo.is_ptr() else ("function" if domain_tinfo.is_func() else "scalar"))
+                members = []
+                if kind == "struct":
+                    handled, domain_members = _try_domain_method(
+                        database, "types", "get_udt_members", domain_tinfo,
+                        capability="types.get_udt_members",
+                        unavailable_reason="ida-domain UDT member lookup unavailable",
+                        failure_reason="ida-domain UDT member lookup failed",
+                    )
+                    if handled:
+                        members = [
+                            {
+                                "offset": member.offset,
+                                "size": member.size,
+                                "name": getattr(member, "name", ""),
+                                "type": member.type.dstr(),
+                            }
+                            for member in domain_members or []
+                        ]
+                type_text = getattr(details, "declaration", None) or domain_tinfo.dstr()
+                size = getattr(details, "size", None)
+                if size is None:
+                    size = getattr(domain_tinfo, "get_size", lambda: 0)()
+                return {"name": getattr(details, "name", name), "type": type_text, "size": size, "kind": kind, "members": members}
+    import ida_typeinf
     idati = ida_typeinf.get_idati()
     tinfo = ida_typeinf.tinfo_t()
     if not tinfo.get_named_type(idati, name):
         return None
-
-    if tinfo.is_udt():
+    is_udt = getattr(tinfo, "is_udt", lambda: False)
+    is_ptr = getattr(tinfo, "is_ptr", lambda: False)
+    is_func = getattr(tinfo, "is_func", lambda: False)
+    if callable(is_udt) and is_udt():
         kind = "struct"
-    elif tinfo.is_ptr():
+    elif callable(is_ptr) and is_ptr():
         kind = "pointer"
-    elif tinfo.is_func():
+    elif callable(is_func) and is_func():
         kind = "function"
     else:
         kind = "scalar"
@@ -1123,11 +2006,10 @@ def type_of(name: str) -> dict | None:
         udt_data = ida_typeinf.udt_type_data_t()
         if tinfo.get_udt_details(udt_data):
             for member in udt_data:
-                # udt members report offsets/sizes in BITS; convert to the
-                # byte units the rest of forge_api uses when bit-clean, and
-                # keep the raw bit value available.
-                offset_raw = getattr(member, "offset", 0)
-                size_raw = getattr(member, "size", 0)
+                # The UDT member rows are reported in the same byte units
+                # every other forge_api verb uses — no bit-unit conversion
+                # here (M1: the old //8 + invented bit_offset disagreed 8x
+                # with the ida-domain path).
                 member_type = None
                 try:
                     member_type = member.type.dstr()
@@ -1135,19 +2017,20 @@ def type_of(name: str) -> dict | None:
                     member_type = None
                 members.append(
                     {
-                        "offset": offset_raw // 8 if offset_raw % 8 == 0 else offset_raw,
-                        "size": size_raw // 8 if size_raw % 8 == 0 else size_raw,
-                        "bit_offset": offset_raw,
+                        "offset": getattr(member, "offset", 0),
+                        "size": getattr(member, "size", 0),
                         "name": getattr(member, "name", ""),
                         "type": member_type,
                     }
                 )
             members.sort(key=lambda m: m["offset"])
 
+    get_dstr = getattr(tinfo, "dstr", lambda: name)
+    get_size = getattr(tinfo, "get_size", lambda: 0)
     return {
         "name": name,
-        "type": tinfo.dstr(),
-        "size": tinfo.get_size(),
+        "type": get_dstr(),
+        "size": get_size(),
         "kind": kind,
         "members": members,
     }
@@ -1168,8 +2051,12 @@ def is_type(name: str) -> bool:
         bool.
     """
     _require_ida()
+    database = _current_domain_database(required=False)
+    if database is not None:
+        handled, domain_type = _try_domain_method(database, "types", "get_by_name", name, capability="types.is_type", unavailable_reason="ida-domain named type lookup unavailable", failure_reason="ida-domain named type lookup failed")
+        if handled:
+            return domain_type is not None
     import ida_typeinf
-
     tinfo = ida_typeinf.tinfo_t()
     return bool(tinfo.get_named_type(ida_typeinf.get_idati(), name))
 
@@ -1207,10 +2094,42 @@ def apply_type(
         ``{"ok": False, "error": str}``.
     """
     _require_ida()
+    database = _domain_database_or_none()
+    if database is not None:
+        types_api = getattr(database, "types", None)
+        parser = getattr(types_api, "parse_one_declaration", None)
+        applier = getattr(types_api, "apply_at", None)
+        if callable(parser) and callable(applier):
+            tinfo = parser(None, declaration)
+            if tinfo is None:
+                return {"ok": False, "error": f"could not parse declaration {declaration!r}"}
+            try:
+                applied = bool(applier(tinfo, ea))
+            except Exception:
+                applied = False
+            if not applied:
+                return {"ok": False, "error": f"could not apply type at {hex(ea)}"}
+            # R2.5 (recovery eval 2026-08-30): domain ``apply_at`` can report
+            # success while idalib's deferred analysis drops the item type —
+            # verify the tinfo actually landed before trusting it; otherwise
+            # fall through to the definitive ida_* path below.
+            if applied:
+                try:
+                    import ida_typeinf as _ti
+                    import ida_nalt as _na
+
+                    landed = _ti.tinfo_t()
+                    if _na.get_tinfo(landed, ea):
+                        display = getattr(tinfo, "dstr", lambda: declaration)()
+                        _record_ea_reference_rows(ea, declaration)
+                        return {"ok": True, "ea": ea, "type": display}
+                except Exception:  # noqa: BLE001 — verification is best-effort;
+                    pass  # fall through to the definitive ida_* path
     import re as _re
 
-    import ida_bytes
     import ida_name
+    import ida_bytes
+
     import ida_typeinf
 
     from forge.api.members import parse_user_tinfo
@@ -1271,6 +2190,7 @@ def apply_type(
                     # instead of lying about the item.
                     ida_typeinf.apply_tinfo(ea, tinfo, ida_typeinf.TINFO_DEFINITE)
                     if ida_bytes.get_item_size(ea) != size:
+                        _record_ea_reference_rows(ea, declaration)
                         return {
                             "ok": True,
                             "ea": ea,
@@ -1291,6 +2211,7 @@ def apply_type(
                     )
 
     ida_typeinf.apply_tinfo(ea, tinfo, ida_typeinf.TINFO_DEFINITE)
+    _record_ea_reference_rows(ea, declaration)
     return {"ok": True, "ea": ea, "type": tinfo.dstr()}
 
 
@@ -1659,6 +2580,12 @@ def set_member(
         member.invalidate_score()
     if enabled is not None and hasattr(member, "set_enabled"):
         member.set_enabled(bool(enabled))
+    if type is not None:
+        # 类型已变更：按新声明重建该结构的引用目录行（旧的类型引用行
+        # 随 rebuild 一并清除，dependents_of 查询保持新鲜）。
+        from forge.api.provenance import references
+
+        references.rebuild([target])
     target.refresh_collisions()
     result = _to_member_dict(member)
     result["collision"] = target.has_collision(target.members.index(member))
@@ -1836,6 +2763,12 @@ def rename_structure(old: str, new: str) -> bool:
         other.rename_relationship_references(old, new)
     if _state.current == old:
         _state.current = new
+    if structure.created_type_name == new:
+        # Type re-file (rename): re-point every stored reference (member
+        # declarations naming the old name, catalog rows) and refresh the
+        # consumers so prototypes and dependents re-bind to the new name
+        # (gap #10 rename path — payload rewrite then refresh).
+        _refresh_references_after_rename(old, new)
     return True
 
 
@@ -2066,17 +2999,22 @@ def import_store(path: str, *, merge: bool = False) -> dict:
     )
     imported = []
     skipped = []
-    for raw in raw_structures:
-        name = raw.get("name")
-        if not name:
-            continue
-        if not merge and name in _structures:
-            skipped.append(name)
-            continue
+    for position, raw in enumerate(raw_structures):
+        # m8: a corrupt export row (non-dict, missing keys) must degrade
+        # to a skipped row — never raise outside the per-row guard.
+        label = raw.get("name") if isinstance(raw, dict) else None
         try:
+            if not isinstance(raw, dict):
+                raise TypeError(f"row {position} is not an object")
+            name = raw.get("name")
+            if not name:
+                continue
+            if not merge and name in _structures:
+                skipped.append(name)
+                continue
             structure = catalog._deserialize(raw)
         except Exception:  # noqa: BLE001 — a corrupt entry must not abort the import
-            skipped.append(name)
+            skipped.append(label if label else f"<row {position}>")
             continue
         _structures[name] = structure
         imported.append(name)
@@ -2095,37 +3033,42 @@ def _mirror_store():
 
 _SYSTEM_TYPE_NAMES = frozenset(
     {
-        # IDA compiler-generated locals (not in the base til).
-        "C_SCOPE_TABLE",
-        "UNWIND_INFO_HDR",
-        "UNWIND_CODE",
-        "XMM_SAVE_AREA32",
-        "XSAVE_FORMAT",
-        "RUNTIME_FUNCTION",
-        "SCOPE_TABLE",
         "M128A",
         "LARGE_INTEGER",
         "ULARGE_INTEGER",
         "_FILETIME",
         "FILETIME",
         "_LARGE_INTEGER",
+        "UNWIND_INFO_HDR",
         "_ULARGE_INTEGER",
         "_M128A",
         "_XSAVE_FORMAT",
         "_SCOPE_TABLE",
         "SYSTEM_SERVICE_TABLE",
+        "C_SCOPE_TABLE",
+        "UNWIND_INFO_HDR",
         "OBJECT_DIRECTORY_INFORMATION",
     }
 )
 
 
 def _idb_udt_snapshot(name: str) -> tuple[str | None, list]:
-    """The IDB named UDT's member rows as ``(hash, rows)``; ``(None, [])``
-    when ``name`` is not a known UDT."""
+    """Return a stable hash and detached UDT member rows."""
     import hashlib as _hashlib
-
+    database = _current_domain_database(required=False)
+    if database is not None:
+        handler = getattr(database, "types", None)
+        get_by_name = getattr(handler, "get_by_name", None)
+        get_details = getattr(handler, "get_details", None)
+        get_members = getattr(handler, "get_udt_members", None)
+        if callable(get_by_name) and callable(get_details) and callable(get_members):
+            tinfo = get_by_name(name)
+            details = get_details(tinfo) if tinfo is not None else None
+            if tinfo is None or not getattr(tinfo, "is_udt", lambda: False)() or details is None:
+                return None, []
+            rows = [(member.offset, getattr(member, "name", ""), member.type.dstr()) for member in get_members(tinfo)]
+            return _hashlib.sha1(repr(sorted(rows)).encode("utf-8")).hexdigest(), rows
     import ida_typeinf
-
     idati = ida_typeinf.get_idati()
     tinfo = ida_typeinf.tinfo_t()
     if not tinfo.get_named_type(idati, name) or not tinfo.is_udt():
@@ -2133,16 +3076,41 @@ def _idb_udt_snapshot(name: str) -> tuple[str | None, list]:
     udt = ida_typeinf.udt_type_data_t()
     if not tinfo.get_udt_details(udt):
         return None, []
+    rows = [(member.offset, getattr(member, "name", ""), member.type.dstr()) for member in udt]
+    return _hashlib.sha1(repr(sorted(rows)).encode("utf-8")).hexdigest(), rows
+
+def _domain_named_udts() -> list[tuple[str, object]]:
+    """Enumerate named Domain UDTs as ``(name, tinfo)`` rows."""
+    database = _current_domain_database(required=False)
+    handler = getattr(database, "types", None) if database is not None else None
+    getter = getattr(handler, "get_all", None)
+    details = getattr(handler, "get_details", None)
+    if not callable(getter) or not callable(details):
+        return []
     rows = []
-    for member in udt:
-        member_type = None
-        try:
-            member_type = member.type.dstr()
-        except Exception:  # noqa: BLE001 — degraded udt handles
-            member_type = ""
-        rows.append((member.offset, getattr(member, "name", ""), member_type))
-    digest = _hashlib.sha1(repr(sorted(rows)).encode("utf-8")).hexdigest()  # noqa: S324 — change-detection digest, not security
-    return digest, rows
+    for tinfo in getter():
+        if getattr(tinfo, "is_udt", lambda: False)():
+            name = getattr(details(tinfo), "name", None)
+            if name:
+                rows.append((name, tinfo))
+    return sorted(rows, key=lambda row: row[0])
+
+
+def _domain_base_type_names(base_til) -> set[str]:
+    """Return names enumerated from Domain's base-library type handler."""
+    database = _current_domain_database(required=False)
+    handler = getattr(database, "types", None) if database is not None else None
+    getter = getattr(handler, "get_all", None)
+    details = getattr(handler, "get_details", None)
+    if not callable(getter) or not callable(details):
+        return set()
+    return {
+        getattr(details(tinfo), "name", "")
+        for tinfo in getter(library=base_til)
+        if getattr(details(tinfo), "name", None)
+    }
+
+
 
 
 @api(
@@ -2178,6 +3146,8 @@ def import_types(pattern: str | None = None) -> dict:
     imported = []
     skipped = {}
     seen = set()
+    import_failures = []
+    failed_members = []
     for ordinal in range(ida_typeinf.get_ordinal_count(idati)):
         name = ida_typeinf.get_numbered_type_name(idati, ordinal)
         if not name or name in seen:
@@ -2205,10 +3175,11 @@ def import_types(pattern: str | None = None) -> dict:
         if name in catalog:
             skipped[name] = "already in store"
             continue
+        failed_members = []
+        imported_structure = Structure(name)
+        imported_structure.provenance.kind = "imported"
+        catalog[name] = imported_structure
 
-        structure = Structure(name)
-        structure.set_provenance(kind="imported")
-        catalog[name] = structure
         udt = ida_typeinf.udt_type_data_t()
         if tinfo.get_udt_details(udt):
             for member in sorted(udt, key=lambda m: getattr(m, "offset", 0)):
@@ -2217,14 +3188,27 @@ def import_types(pattern: str | None = None) -> dict:
                     member_type = member.type.dstr()
                 except Exception:  # noqa: BLE001 — degraded udt handles
                     member_type = "u64"
-                add_member(
+                added = add_member(
                     name,
                     getattr(member, "offset", 0),
                     member_type or "u64",
                     name=getattr(member, "name", "") or None,
                 )
+                # M3: a member that fails to add must not vanish silently.
+                if isinstance(added, dict) and added.get("ok") is False:
+                    failed_members.append(
+                        {
+                            "structure": name,
+                            "offset": getattr(member, "offset", 0),
+                            "error": added.get("error"),
+                        }
+                    )
         imported.append(name)
+        if failed_members:
+            import_failures.extend(failed_members)
     result = {"imported": imported, "skipped": skipped}
+    if import_failures:
+        result["failed_members"] = import_failures
     if not imported and not skipped:
         # E20f: an empty import is a finding, not a bug — say so.
         result["note"] = "no foreign UDTs in the til"
@@ -2249,46 +3233,50 @@ def push_type(name: str) -> bool:
         bool.
     """
     import dataclasses as _dataclasses
-
     _require_ida()
     target = _resolve_structure(name, required=False)
     if target is None:
         return False
     _, idb_rows = _idb_udt_snapshot(name)
-    store_rows = [
-        (member.offset, getattr(member, "name", ""), _member_type_str(member) or "")
-        for member in target.members
-        if getattr(member, "enabled", True)
-    ]
-    if sorted(idb_rows) != sorted(store_rows):
-        # E17: snapshot before the rewrite so push_type's commit is
-        # reversible with the facade snapshot (create_type records its
-        # own identical snapshot; this one guarantees the contract even
-        # if the commit path changes).
-        _snapshot_type_before_commit(name)
-        result = create_type(name, overwrite=True)
-        if not result.get("ok", False):
+    store_rows = [(member.offset, getattr(member, "name", ""), _member_type_str(member)) for member in target.members]
+    fresh_write = False
+    if sorted(store_rows) != sorted(idb_rows):
+        # Ordinal refresh gate (gap #10): the push path refreshes ONCE, at
+        # the end of this call — engage the guard so the create_type hook
+        # defers, and restore the caller's guard state exactly (a cascade
+        # caller may already hold it).
+        saved_guard = _state.refreshing_references
+        _state.refreshing_references = True
+        try:
+            result = create_type(name, overwrite=True)
+        finally:
+            _state.refreshing_references = saved_guard
+        if isinstance(result, dict) and not result.get("ok", True):
             return False
-    # Baseline is the IDB-side digest: refresh_types() compares against the
-    # same snapshot shape, so an unchanged IDB is a no-op and only real
-    # IDB edits surface as updates.
+        fresh_write = True
+    if _current_domain_database(required=False) is None:
+        _sdk_fallback("types.ordinal", "ida-domain type ordinal lookup unavailable")
     baseline_hash, _ = _idb_udt_snapshot(name)
     try:
         import ida_typeinf
-
-        ordinal = ida_typeinf.get_type_ordinal(ida_typeinf.get_idati(), name)
+        ordinal_getter = getattr(ida_typeinf, "get_type_ordinal", None)
+        if not callable(ordinal_getter):
+            raise AttributeError("IDA SDK ordinal lookup unavailable")
+        ordinal = ordinal_getter(ida_typeinf.get_idati(), name)
         provenance = target.provenance
         if not isinstance(provenance, dict):
             provenance = _dataclasses.asdict(provenance)
-        _mirror_store()[name] = {
-            "ordinal": ordinal,
-            "hash": baseline_hash,
-            "provenance": provenance,
-        }
-    except Exception as exc:  # noqa: BLE001 — mirror is a cache, never fatal
+        _mirror_store()[name] = {"ordinal": ordinal, "hash": baseline_hash, "provenance": provenance}
+    except Exception as exc:  # noqa: BLE001
+        _sdk_fallback("types.ordinal", "ida-domain type ordinal lookup unavailable")
         from forge.util.logging import log_warning
-
         log_warning(f"could not update TypeMirror baseline for {name}: {exc}")
+    if fresh_write:
+        # Fresh write re-landed the type with a new ordinal: refresh every
+        # recorded consumer (dependents first, then globals/locals/
+        # prototypes). In a cascade this call is reentrant-guarded and
+        # skipped, so the cascade stays exactly one level deep.
+        _refresh_type_references(name)
     return True
 
 
@@ -2306,18 +3294,16 @@ def push_all() -> dict:
     _require_ida()
     pushed = []
     failed = {}
-    for name in list(catalog):
+    for name in sorted(catalog):
         try:
             if push_type(name):
                 pushed.append(name)
             elif name in _structures:
-                # E20a: surface the REAL commit error — only unknown
-                # names keep the generic string.
                 result = create_type(name, overwrite=True)
                 failed[name] = str(result.get("error") or "type write failed")
             else:
                 failed[name] = "unknown structure"
-        except Exception as exc:  # noqa: BLE001 — one bad type must not stop the rest
+        except Exception as exc:  # noqa: BLE001
             failed[name] = str(exc)
     return {"pushed": pushed, "failed": failed}
 
@@ -2358,7 +3344,7 @@ def refresh_types(*, include_names: bool = False) -> dict:
         from forge.util.logging import log_warning
 
         log_warning(f"could not read TypeMirror baseline: {exc}")
-    for name, entry in baseline.items():
+    for name, entry in sorted(baseline.items()):
         idb_hash, idb_rows = _idb_udt_snapshot(name)
         if idb_hash is None or idb_hash == entry.get("hash"):
             unchanged.append(name)
@@ -2401,7 +3387,6 @@ def refresh_types(*, include_names: bool = False) -> dict:
         updated.append(name)
     _mark_dirty()
     return {"updated": updated, "unchanged": unchanged, "renamed": renamed}
-    return {"updated": updated, "unchanged": unchanged}
 
 
 # --------------------------------------------------------------------------- #
@@ -2482,35 +3467,14 @@ def _root_retype_target(obj, root_type: str | None) -> str | None:
 
 
 def _apply_root_retype(cfunc, obj, target_decl: str):
-    """Retype the scan root lvar when the type actually changes.
-
-    Returns a freshly decompiled cfunc when a retype was committed, else
-    None. Persists via ``set_lvar_type`` (``MLI_TYPE``), then marks the
-    function dirty so the visitor rescans with the retyped root.
-    """
+    """Retype the scan root through the public local-type facade."""
     from forge.api.hexrays import decompile as _decompile
-    from forge.api.hexrays import mark_cfunc_dirty as _mark_dirty
-    from forge.api.hexrays import set_lvar_type
-    from forge.api.members import parse_user_tinfo
-
-    lvar = getattr(obj, "lvar", None)
-    if lvar is None:
+    entry_ea = getattr(cfunc, "entry_ea", None) or 0
+    name = getattr(obj, "name", None) or getattr(getattr(obj, "lvar", None), "name", None)
+    result = set_lvar_types(entry_ea, {name: target_decl}, scope="all")
+    if not result.get("ok"):
         return None
-    try:
-        current = lvar.type()
-        if current is not None and current.dstr() == target_decl:
-            return None
-    except Exception as exc:  # noqa: BLE001 — unqueryable lvar type: retype anyway
-        from forge.util.logging import log_debug
-
-        log_debug(f"Could not read current lvar type for retype: {exc}")
-    tinfo = parse_user_tinfo(target_decl)
-    if tinfo is None:
-        return None
-    if not set_lvar_type(cfunc, lvar, tinfo):
-        return None
-    _mark_dirty(getattr(cfunc, "entry_ea", None) or 0)
-    return _decompile(getattr(cfunc, "entry_ea", None) or 0)
+    return _decompile(entry_ea)
 
 
 def _root_prior_type(obj) -> str | None:
@@ -2525,6 +3489,30 @@ def _root_prior_type(obj) -> str | None:
         return current.dstr()
     except Exception:  # noqa: BLE001 — unqueryable lvar type: nothing to restore
         return None
+
+
+def _root_lvar_type_is(obj, expected_decl: str) -> bool:
+    """True when the root lvar's current type already matches ``expected_decl``.
+
+    Qualifier/spacing-insensitive (IDA decorates the same pointer type
+    differently across hexrays runs), pointer-depth aware.
+    """
+    from forge.api.scan_object import _type_identity_key
+
+    lvar = getattr(obj, "lvar", None)
+    if lvar is None:
+        return False
+    try:
+        current = lvar.type()
+    except Exception:  # noqa: BLE001 — unqueryable lvar: assume mismatch
+        return False
+    if current is None:
+        return False
+    try:
+        current_decl = current.dstr()
+    except Exception:  # noqa: BLE001 — broken tinfo: assume mismatch
+        return False
+    return _type_identity_key(current_decl) == _type_identity_key(expected_decl)
 
 
 def _restore_root_type(cfunc, obj, prior_decl: str) -> None:
@@ -2588,12 +3576,14 @@ def _resolve_scan_root(
     return None
 
 
+
+
 def _scan_result(target) -> dict:
     return {
+        "ok": True,
         "structure": target.name,
-        "members": [_to_member_dict(member) for member in target.members],
+        "members": [copy.deepcopy(_to_member_dict(member)) for member in target.members],
     }
-
 
 def _refresh_scan_sites(target) -> None:
     """Recompute the structure's persisted scan-site rows (R3.6).
@@ -2626,9 +3616,9 @@ def deep_scan(
     structure: str | None = None,
     root_type: str | None = None,
     clear_first: bool = False,
+    subobject: dict | None = None,
 ) -> dict:
     """Recover the structure's members by deep-scanning a decompiled function.
-
     Decompiles the function containing ``ea`` and runs the same
     ``NewDeepScanVisitor`` the GUI uses over the chosen root variable (default:
     the first argument; override with ``var_name``/``var_index``/``item_ea``).
@@ -2646,16 +3636,45 @@ def deep_scan(
     pointer arithmetic produces ``memptr`` shapes — the fully-populated
     member set without caller-side retyping.
 
+    ``subobject`` roots the scan at a nested subobject instead of the whole
+    parent object: ``{"base_offset": 0x1B60, "var_name": "a1"}`` matches the
+    subobject expression itself (``parent->m(0x1B60)`` or
+    ``(child_t *)(parent + 0x1B60)``), so members land in child coordinates
+    — parent base + 0x1B60 + 0x08 records child offset 0x08, never 0x1B68.
+    Optional keys: ``var_index``/``item_ea`` (parent criteria, at most one
+    of the three) and ``parent_type`` (required parent type-name match).
+    See :mod:`forge.api.scan_subobject`. ``root_type`` is rejected with
+    ``subobject`` — retyping the parent lvar to the CHILD type would break
+    the base-offset addressing, and the automatic integral-scalar →
+    ``void *`` retype is suppressed in subobject mode. When ``parent_type``
+    IS supplied, the parent root is TEMPORARILY retyped to ``parent_type *``
+    (never the child type) so hexrays materializes the matchable subobject
+    expressions, and the original lvar type is restored on every path after
+    the scan.
+
     Returns:
-        ``{"structure": name, "members": [member dicts]}`` or an ok:False dict.
+        ``{"structure": name, "members": [member dicts], "preserved":
+        [same-offset merges]}`` (plus ``"subobject": base_offset`` when
+        rooted at a subobject) or an ok:False dict.
     """
     _require_ida()
+    descriptor = None
+    if subobject is not None:
+        from forge.api.scan_subobject import SubobjectRoot
+
+        try:
+            descriptor = SubobjectRoot.from_dict(subobject)
+        except (TypeError, ValueError) as exc:
+            return {"ok": False, "error": f"invalid subobject root: {exc}"}
+        if root_type is not None:
+            return {"ok": False, "error": "root_type is not supported with subobject"}
+        var_name = descriptor.var_name
+        var_index = descriptor.var_index
+        item_ea = descriptor.item_ea
     from forge.api.hexrays import decompile as _decompile
     from forge.api.scanner import NewDeepScanVisitor
 
     target = _target_scan_structure(structure)
-    if clear_first:
-        target.clear_members()
     cfunc = _decompile(ea)
     if cfunc is None:
         return {"ok": False, "error": f"could not decompile {hex(ea)}"}
@@ -2663,23 +3682,65 @@ def deep_scan(
     if obj is None:
         return {"ok": False, "error": "could not resolve a scan root (default: first argument)"}
     prior_type = _root_prior_type(obj)
-    root_decl = _root_retype_target(obj, root_type)
+    retype_applied = False
+    subobject_retype = None
+    if descriptor is not None:
+        # Subobject mode suppresses the automatic integral->``void *`` retype:
+        # the scan roots at the subobject expression INSIDE the parent object,
+        # so retyping the parent lvar to the CHILD type would break the
+        # base-offset addressing. An explicit ``root_type`` is already rejected
+        # with ``subobject`` above.
+        #
+        # With ``parent_type`` the opposite retype is REQUIRED: hexrays only
+        # materializes the subobject member accesses (``parent->m(0x1B60)``)
+        # the SubobjectScanObject matches when the parent lvar carries the
+        # parent structure pointer type — an integral/untyped root produces
+        # no matchable expression and the scan lands zero members. Temporarily
+        # retype the PARENT root to ``parent_type *`` (never the child type)
+        # and restore the original lvar type on every path after the scan.
+        if descriptor.parent_type is not None:
+            wanted = f"{descriptor.parent_type} *"
+            if not _root_lvar_type_is(obj, wanted):
+                subobject_retype = wanted
+        root_decl = subobject_retype
+    else:
+        root_decl = _root_retype_target(obj, root_type)
     if root_decl is not None:
-        refreshed = _apply_root_retype(cfunc, obj, root_decl)
-        if refreshed is not None:
+        original_cfunc, original_obj = cfunc, obj
+        try:
+            refreshed = _apply_root_retype(cfunc, obj, root_decl)
+        except Exception as exc:  # noqa: BLE001 — restore, then report
+            _restore_root_type(cfunc, obj, prior_type)
+            return {"ok": False, "error": f"root lvar retype failed: {exc}"}
+        if refreshed is None:
+            if root_type is not None or subobject_retype is not None:
+                return {
+                    "ok": False,
+                    "error": f"root lvar retype to {root_decl!r} failed",
+                }
+            # The auto-retype is best-effort sugar: scan the un-retyped root.
+        else:
             cfunc = refreshed
             obj = _resolve_scan_root(
                 cfunc, var_name=var_name, var_index=var_index, item_ea=item_ea
             )
             if obj is None:
-                # Recovery-eval gap #3 (2026-08-13): a retype that cannot be
-                # scanned must not be left on the lvar — restore the prior
-                # type so a failed scan is invisible to the analyst.
-                _restore_root_type(refreshed, prior_type)
-                return {
-                    "ok": False,
-                    "error": "could not resolve a scan root after retype",
-                }
+                # Re-resolution lost the retyped lvar: undo the retype on the
+                # PRE-retype object — its lvar identity (entry_ea, location,
+                # defea) still addresses the IDB's user-lvar entry — and
+                # report a structured error instead of raising.
+                _restore_root_type(original_cfunc, original_obj, prior_type)
+                return {"ok": False, "error": "could not resolve a scan root after retype"}
+            retype_applied = True
+    if descriptor is not None:
+        from forge.api.scan_subobject import SubobjectScanObject
+
+        obj = SubobjectScanObject(obj, descriptor)
+    # M4: clear ONLY when the scan is actually about to run — a
+    # decompile/root-resolution/retype failure must not return ok:False
+    # with the target's members already destroyed.
+    if clear_first:
+        target.clear_members()
     pre_count = len(target.members)
     visitor = NewDeepScanVisitor(
         cfunc,
@@ -2689,15 +3750,29 @@ def deep_scan(
         recurse_calls=recurse_calls,
         max_depth=max_depth,
     )
-    visitor.process()
-    if prior_type and pre_count == 0 and len(target.members) == 0:
-        # The retype produced no evidence at all — undo it so the lvar is
-        # not silently re-typed by a failed scan (gap #3).
-        _restore_root_type(cfunc, obj, prior_type)
+    if subobject_retype is not None:
+        # The parent retype is temporary: restore the original lvar type on
+        # EVERY path — success included — so a subobject scan never leaves
+        # the parent re-typed.
+        try:
+            visitor.process()
+        finally:
+            _restore_root_type(cfunc, obj, prior_type)
+    else:
+        visitor.process()
+        if retype_applied and prior_type and pre_count == 0 and len(target.members) == 0:
+            # The retype produced no evidence at all — undo it so the lvar is
+            # not silently re-typed by a failed scan (gap #3).
+            _restore_root_type(cfunc, obj, prior_type)
+    preserved = _preserve_authored_members(target)
     _refresh_scan_sites(target)
     _mark_dirty()
-    return _scan_result(target)
-
+    result = _scan_result(target)
+    if preserved:
+        result["preserved"] = preserved
+    if descriptor is not None:
+        result["subobject"] = descriptor.base_offset
+    return result
 
 @api(
     group="build",
@@ -2865,13 +3940,10 @@ def shallow_scan(
     Returns:
         dict (see :func:`deep_scan`).
     """
-    _require_ida()
     from forge.api.hexrays import decompile as _decompile
     from forge.api.scanner import NewShallowScanVisitor
 
     target = _target_scan_structure(structure)
-    if clear_first:
-        target.clear_members()
     cfunc = _decompile(ea)
     if cfunc is None:
         return {"ok": False, "error": f"could not decompile {hex(ea)}"}
@@ -2881,18 +3953,38 @@ def shallow_scan(
     prior_type = _root_prior_type(obj)
     root_decl = _root_retype_target(obj, root_type)
     if root_decl is not None:
-        refreshed = _apply_root_retype(cfunc, obj, root_decl)
-        if refreshed is not None:
+        original_cfunc, original_obj = cfunc, obj
+        try:
+            refreshed = _apply_root_retype(cfunc, obj, root_decl)
+        except Exception as exc:  # noqa: BLE001 — restore, then report
+            _restore_root_type(cfunc, obj, prior_type)
+            return {"ok": False, "error": f"root lvar retype failed: {exc}"}
+        if refreshed is None:
+            if root_type is not None:
+                return {
+                    "ok": False,
+                    "error": f"root lvar retype to {root_decl!r} failed",
+                }
+            # The auto-retype is best-effort sugar: scan the un-retyped root.
+        else:
             cfunc = refreshed
             obj = _resolve_scan_root(
                 cfunc, var_name=var_name, var_index=var_index, item_ea=item_ea
             )
             if obj is None:
-                _restore_root_type(refreshed, prior_type)
+                # Undo the retype on the PRE-retype object — its lvar
+                # identity still addresses the IDB's user-lvar entry — and
+                # report a structured error instead of raising.
+                _restore_root_type(original_cfunc, original_obj, prior_type)
                 return {
                     "ok": False,
                     "error": "could not resolve a scan root after retype",
                 }
+    # M4: clear ONLY when the scan is actually about to run (same contract
+    # as deep_scan) — a decompile/root-resolution/retype failure must not
+    # return ok:False with the target's members already destroyed.
+    if clear_first:
+        target.clear_members()
     pre_count = len(target.members)
     visitor = NewShallowScanVisitor(cfunc, target.main_offset, obj, target)
     visitor.process()
@@ -2949,39 +4041,53 @@ def scan_global(ea: int, *, max_depth: int | None = None, span: int | None = Non
     _state.current = struct_name
 
     scanned = 0
+    failed_functions = []
     for func_ea in xrefs:
-        cfunc = _decompile(func_ea)
-        if cfunc is None:
+        # m10: one bad function (decompile crash, visitor exception) must
+        # not abort the whole global scan — mirror decompile_many's
+        # per-row containment.
+        try:
+            cfunc = _decompile(func_ea)
+            if cfunc is None:
+                continue
+            obj = GlobalVariableObject(ea)
+            obj.name = short_name
+            NewDeepScanVisitor(
+                cfunc,
+                target.main_offset,
+                obj,
+                target,
+                recurse_calls=True,
+                max_depth=max_depth,
+            ).process()
+        except Exception as exc:  # noqa: BLE001 — one bad EA must not stop the rest
+            from forge.util.logging import log_warning
+
+            log_warning(f"global scan of {hex(func_ea)} failed: {exc}")
+            failed_functions.append(func_ea)
             continue
-        obj = GlobalVariableObject(ea)
-        obj.name = short_name
-        NewDeepScanVisitor(
-            cfunc,
-            target.main_offset,
-            obj,
-            target,
-            recurse_calls=True,
-            max_depth=max_depth,
-        ).process()
         scanned += 1
 
-    _add_named_sub_heads(
+    sub_head_failures = _add_named_sub_heads(
         target,
         ea,
         span if span is not None else ida_bytes.get_item_size(ea),
         scanned_funcs=set(xrefs),
     )
-
     _refresh_scan_sites(target)
-    _mark_dirty()
-
-    return {
+    result = {
+        "ok": True,
         "structure": struct_name,
         "functions_scanned": scanned,
         "members": _collapse_stride_runs(
             [_to_member_dict(member) for member in target.members]
         ),
     }
+    if failed_functions:
+        result["failed_functions"] = failed_functions
+    if sub_head_failures:
+        result["failed_members"] = sub_head_failures
+    return result
 
 
 def _collapse_stride_runs(members: list[dict]) -> list[dict]:
@@ -2995,6 +4101,7 @@ def _collapse_stride_runs(members: list[dict]) -> list[dict]:
     (single members, gaps, mixed types) is preserved as-is. Operates on
     the JSON member dicts produced by the scan verbs.
     """
+    members = copy.deepcopy(members)
     from forge.api.members import _build_array_tinfo
 
     enabled = [member for member in members if member.get("enabled", True)]
@@ -3084,13 +4191,48 @@ def _add_named_sub_heads(target, ea: int, span: int, scanned_funcs: set | None =
     head AT ``ea + span`` is data-referenced from one of ``scanned_funcs``
     (an address at the boundary feeding the scan), the end extends by that
     item's size so the boundary member is not lost.
+    Returns:
+        list of failed sub-head member rows (M3) — empty when every
+        synthesized member landed.
     """
+    def _record(sub_target, offset, size_type, head_name, failures):
+        added = add_member(sub_target.name, offset, size_type, name=_head_name_without_address(head_name))
+        # M3: a failed sub-head member must be reported, not dropped.
+        if isinstance(added, dict) and added.get("ok") is False:
+            failures.append(
+                {
+                    "offset": offset,
+                    "name": _head_name_without_address(head_name),
+                    "error": added.get("error"),
+                }
+            )
+
+    failures: list[dict] = []
+    sizes = {1: "u8", 2: "u16", 4: "u32", 8: "u64"}
+    database = _domain_database_or_none()
+    if database is not None:
+        bytes_api = getattr(database, "bytes", None)
+        names_api = getattr(database, "names", None)
+        if bytes_api is not None and names_api is not None:
+            end = ea + span
+            head = ea
+            while True:
+                head = bytes_api.get_next_head(head, end)
+                if head in (None, -1) or head >= end:
+                    break
+                name = names_api.get_at(head)
+                if not name:
+                    continue
+                item_size = bytes_api.get_data_size_at(head)
+                size_type = sizes.get(item_size, f"u8[{item_size}]")
+                if target.get_member_by_offset(head - ea) is None:
+                    _record(target, head - ea, size_type, name, failures)
+            return failures
     import ida_bytes
     import ida_funcs
     import ida_idaapi
     import ida_name
     import ida_xref
-
     sizes = {1: "u8", 2: "u16", 4: "u32", 8: "u64"}
     end = ea + span
     if scanned_funcs:
@@ -3098,10 +4240,7 @@ def _add_named_sub_heads(target, ea: int, span: int, scanned_funcs: set | None =
         reference = ida_xref.get_first_dref_to(tail)
         if reference not in (ida_idaapi.BADADDR, None):
             source_function = ida_funcs.get_func(reference)
-            if (
-                source_function is not None
-                and source_function.start_ea in scanned_funcs
-            ):
+            if source_function is not None and source_function.start_ea in scanned_funcs:
                 tail_item_size = ida_bytes.get_item_size(tail)
                 if tail_item_size and tail_item_size > 0:
                     end = tail + tail_item_size
@@ -3116,12 +4255,8 @@ def _add_named_sub_heads(target, ea: int, span: int, scanned_funcs: set | None =
         item_size = ida_bytes.get_item_size(head)
         size_type = sizes.get(item_size, f"u8[{item_size}]")
         if target.get_member_by_offset(head - ea) is None:
-            add_member(
-                target.name,
-                head - ea,
-                size_type,
-                name=_head_name_without_address(name),
-            )
+            _record(target, head - ea, size_type, name, failures)
+    return failures
 
 
 @api(
@@ -3263,17 +4398,16 @@ def scan_sites(name: str | None = None) -> list:
     commit then reports ``applied_sites: []``.
 
     Each row is ``{"func_ea", "var", "ea", "type", "member_offset"}``.
-
     Returns:
         list of site dicts.
     """
+
     target = _resolve_structure(name)
     persisted = getattr(target, "scan_sites_rows", None) or []
     if persisted:
-        return list(persisted)
+        return copy.deepcopy(list(persisted))
     from forge.api.store import _live_scan_site_rows
-
-    return _live_scan_site_rows(target)
+    return copy.deepcopy(_live_scan_site_rows(target))
 
 
 def _validate_member_name(name: str) -> None:
@@ -3415,6 +4549,18 @@ def _is_forge_placeholder_type(name: str) -> bool:
     not treat them as an existing type, or the default scan→commit flow
     breaks on every self-referencing struct.
     """
+    database = _domain_database_or_none()
+    if database is not None:
+        types_api = getattr(database, "types", None)
+        getter = getattr(types_api, "get_by_name", None)
+        members_getter = getattr(types_api, "get_udt_members", None)
+        if callable(getter) and callable(members_getter):
+            tinfo = getter(name)
+            is_udt = getattr(tinfo, "is_udt", None)
+            if tinfo is None or not callable(is_udt) or not is_udt():
+                return False
+            members = list(members_getter(tinfo) or ())
+            return len(members) == 1 and getattr(members[0], "name", "") == "_placeholder"
     import ida_typeinf
 
     tinfo = ida_typeinf.tinfo_t()
@@ -3439,7 +4585,11 @@ def create_type(name: str | None = None, *, overwrite: bool = False) -> dict:
     :meth:`Structure.set_cdecl` and applies the pointer type to every variable
     the scans recorded (the "apply globally" step). ``overwrite=True`` replaces
     an existing type without asking; ``overwrite=False`` aborts if the type
-    exists. Never shows a dialog.
+    exists. Never shows a dialog. The post-commit reference refresh is
+    change-gated like :func:`push_type`: only a commit that actually
+    changed the IDB type re-applies recorded sites; an unchanged re-commit
+    reports ``references: {"skipped": "unchanged"}`` so manual applied-site
+    changes survive.
 
     Returns:
         ``{"ok": True, "type_name": str, "declaration": str}`` or
@@ -3472,8 +4622,30 @@ def create_type(name: str | None = None, *, overwrite: bool = False) -> dict:
         # destroy the existing type (the DB would end up with no type at all).
         return {"ok": False, "error": "declaration could not be parsed for overwrite"}
 
+    # Gap #9 pack-readiness gate: refuse to pack when an enabled member's
+    # authored declaration would silently degrade to a placeholder — the
+    # caller gets a structured unresolved-types error instead of a
+    # silently degraded type.
+    readiness = catalog.pack_readiness(target.name)
+    if not readiness.ok:
+        report = readiness.to_dict()
+        return {
+            "ok": False,
+            "error": report.get("error") or "pack readiness gate refused the pack",
+            "code": "unresolved_references",
+            "unresolved_types": report.get("unresolved_types", []),
+            "blocked_members": report.get("blocked", []),
+        }
     # E17: record the pre-commit declaration so undo_type can restore it.
     _snapshot_type_before_commit(target.name, cdecl)
+    # Ordinal refresh gate (gap #10, change-gated like push_type): snapshot
+    # the IDB's UDT rows BEFORE the write so the post-commit refresh only
+    # fires when the commit actually changed the type. An unqueryable IDB
+    # degrades to the conservative always-refresh behavior.
+    try:
+        _, prior_idb_rows = _idb_udt_snapshot(target.name)
+    except Exception:  # noqa: BLE001 — unqueryable IDB: refresh conservatively
+        prior_idb_rows = None
     created = target.set_cdecl(cdecl, target.main_offset, overwrite=overwrite)
     if created is None:
         if overwrite is True:
@@ -3487,6 +4659,26 @@ def create_type(name: str | None = None, *, overwrite: bool = False) -> dict:
     # payload (survives drops; the eval can check the DB outcome).
     _refresh_scan_sites(target)
     _mark_dirty()
+    # Ordinal refresh gate (gap #10): only a commit that CHANGED the IDB
+    # type re-landed it with a fresh ordinal, so dependent store structures
+    # re-commit and recorded application sites re-apply through the
+    # ordinary hook. One level deep: nested commits re-enter the
+    # refreshing_references guard and are skipped. An unchanged re-commit
+    # must NOT re-apply recorded sites — that would clobber manual
+    # applied-site changes made between commits.
+    try:
+        _, current_idb_rows = _idb_udt_snapshot(target.name)
+    except Exception:  # noqa: BLE001 — unqueryable IDB: refresh conservatively
+        current_idb_rows = None
+    if (
+        prior_idb_rows is None
+        or current_idb_rows is None
+        or not prior_idb_rows
+        or sorted(prior_idb_rows) != sorted(current_idb_rows)
+    ):
+        references_report = _refresh_type_references(target.name)
+    else:
+        references_report = {"skipped": "unchanged"}
     return {
         "ok": True,
         "type_name": target.created_type_name,
@@ -3497,6 +4689,8 @@ def create_type(name: str | None = None, *, overwrite: bool = False) -> dict:
         # Empty when no scans were recorded into THIS structure — re-scan
         # (deep_scan with structure=<name>) before committing.
         "applied_sites": list(getattr(target, "last_apply_sites", [])),
+        # Gap #10: what the refresh gate did after this commit.
+        "references": references_report,
     }
 
 
@@ -3533,6 +4727,19 @@ def commit_declaration(
                 f"declaration names {declared!r}, not the store "
                 f"structure {target.name!r}"
             ),
+        }
+    # Gap #9 pack-readiness gate (same contract as create_type): surface
+    # unresolved member references as a structured error instead of
+    # committing a silently degraded type.
+    readiness = catalog.pack_readiness(target.name)
+    if not readiness.ok:
+        report = readiness.to_dict()
+        return {
+            "ok": False,
+            "error": report.get("error") or "pack readiness gate refused the commit",
+            "code": "unresolved_references",
+            "unresolved_types": report.get("unresolved_types", []),
+            "blocked_members": report.get("blocked", []),
         }
     _snapshot_type_before_commit(target.name, declaration)
     created = target.set_cdecl(declaration, target.main_offset, overwrite=overwrite)
@@ -3597,6 +4804,22 @@ def create_typedef(name: str, declaration: str) -> dict:
         declaration does not parse.
     """
     _require_ida()
+    database = _domain_database_or_none()
+    if database is not None:
+        _validate_member_name(name)
+        types_api = getattr(database, "types", None)
+        parser = getattr(types_api, "parse_one_declaration", None)
+        if callable(parser):
+            try:
+                parsed = parser(None, declaration, name)
+            except Exception:
+                parsed = None
+            if parsed is not None:
+                return {"ok": True, "type": name}
+            return {
+                "ok": False,
+                "error": f"could not parse typedef declaration {declaration!r}",
+            }
     from forge.api.members import parse_user_tinfo
 
     _validate_member_name(name)
@@ -3650,6 +4873,39 @@ def rename_member(name: str, offset: int, new_name: str) -> dict:
         IDB write fails.
     """
     _require_ida()
+    database = _domain_database_or_none()
+    if database is not None:
+        _validate_member_name(new_name)
+        types_api = getattr(database, "types", None)
+        getter = getattr(types_api, "get_by_name", None)
+        members_getter = getattr(types_api, "get_udt_members", None)
+        if callable(getter) and callable(members_getter):
+            tinfo = getter(name)
+            if tinfo is None:
+                return {"ok": False, "error": f"no type {name}"}
+            members = list(members_getter(tinfo) or ())
+            member = next((item for item in members if getattr(item, "offset", None) == offset), None)
+            if member is None:
+                return {"ok": False, "error": f"no member at offset {hex(offset)}"}
+            previous = getattr(member, "name", "")
+            if previous == new_name:
+                return {"ok": True, "type": name, "offset": offset, "from": previous, "to": new_name}
+            # M2: the real ida-domain member row is a plain dataclass with
+            # NO rename-persistence mechanism — mutating the detached row
+            # cannot reach the IDB. When no persistence exists (or the
+            # write reports failure), fall through to the definitive SDK
+            # rename path and record the fallback.
+            setter = getattr(member, "set_name", None)
+            if callable(setter):
+                try:
+                    if setter(new_name):
+                        return {"ok": True, "type": name, "offset": offset, "from": previous, "to": new_name}
+                except Exception:  # noqa: BLE001 — try the SDK path instead
+                    pass
+            _sdk_fallback(
+                "types.rename_member",
+                "ida-domain member rename persistence unavailable",
+            )
     _validate_member_name(new_name)
 
     import ida_typeinf
@@ -4101,6 +5357,10 @@ def _printf_call_expressions(cfunc) -> list:
     same: format literal + varargs).
     """
     import ida_funcs
+    database = _domain_database_or_none()
+    domain_functions = getattr(database, "functions", None) if database is not None else None
+    domain_get_at = getattr(domain_functions, "get_at", None)
+    domain_get_name = getattr(domain_functions, "get_name", None)
 
     import_name_by_ea = {row["ea"]: row["name"] or "" for row in imports()}
     printf_suffixes = ("printf", "sprintf", "snprintf", "vsnprintf")
@@ -4108,6 +5368,11 @@ def _printf_call_expressions(cfunc) -> list:
     for call in _iter_ctree_calls(cfunc):
         callee_ea = getattr(getattr(call, "x", None), "obj_ea", None)
         name = import_name_by_ea.get(callee_ea) or ""
+        if not name and callee_ea not in (None, -1) and callable(domain_get_at) and callable(domain_get_name):
+            try:
+                name = domain_get_name(domain_get_at(callee_ea)) or ""
+            except Exception:  # noqa: BLE001
+                name = ""
         if not name and callee_ea not in (None, -1):
             try:
                 name = ida_funcs.get_func_name(callee_ea) or ""
@@ -4185,16 +5450,15 @@ def name_members_from_printf(structure: str, ea: int) -> dict:
             "error": "no printf-family call found in the function",
         }
 
+    database = _domain_database_or_none()
+    bytes_api = getattr(database, "bytes", None) if database is not None else None
     import ida_bytes
-
     renamed = []
     for call in calls:
         args = list(getattr(call, "a", []) or [])
         if not args:
             continue
         format_arg = args[0]
-        # live 9.4: the format literal arrives as cast(const char *) of
-        # the obj node — peel the wrapper chain (and refs).
         format_expr = format_arg
         for _ in range(4):
             op = getattr(format_expr, "op", None)
@@ -4205,20 +5469,18 @@ def name_members_from_printf(structure: str, ea: int) -> dict:
                 format_expr = inner
                 continue
             break
-        format_ea = (
-            getattr(format_expr, "obj_ea", None)
-            if getattr(format_expr, "op", None) in (_ctype.obj, _ctype.str)
-            else None
-        )
+        format_ea = getattr(format_expr, "obj_ea", None) if getattr(format_expr, "op", None) in (_ctype.obj, _ctype.str) else None
         if format_ea is None:
-            # some builds expose the literal address under .obj
             format_ea = getattr(format_expr, "obj", None)
         if format_ea in (None, -1):
             continue
-        try:
-            format_bytes = ida_bytes.get_strlit_contents(format_ea, -1, 0)
-        except TypeError:  # pragma: no cover — 2-arg form on some builds
-            format_bytes = ida_bytes.get_strlit_contents(format_ea, -1)
+        if bytes_api is not None and hasattr(bytes_api, "get_cstring_at"):
+            format_bytes = bytes_api.get_cstring_at(format_ea)
+        else:
+            try:
+                format_bytes = ida_bytes.get_strlit_contents(format_ea, -1, 0)
+            except TypeError:
+                format_bytes = ida_bytes.get_strlit_contents(format_ea, -1)
         if format_bytes is None:
             continue
 
@@ -4282,6 +5544,13 @@ def rename_ea(ea: int, name: str) -> dict:
         ``{"ok": False, "error": str}``.
     """
     _require_ida()
+    database = _domain_database_or_none()
+    names_api = getattr(database, "names", None) if database is not None else None
+    domain_set_name = getattr(names_api, "set_name", None)
+    if callable(domain_set_name):
+        if domain_set_name(ea, name, 1):
+            return {"ok": True, "ea": ea, "name": name}
+        return {"ok": False, "error": f"could not set name {name!r} at {hex(ea)}"}
     import ida_name
 
     sno_check = getattr(ida_name, "SN_NOCHECK", 0)
@@ -4761,19 +6030,17 @@ def _merge_member_rows(base: list[dict], extra: list[dict]) -> list[dict]:
     """
     merged: dict[int, dict] = {}
     for row in base:
-        merged.setdefault(row.get("offset"), row)
+        merged.setdefault(row.get("offset"), copy.deepcopy(row))
     for row in extra:
         offset = row.get("offset")
         existing = merged.get(offset)
         if existing is None:
-            merged[offset] = row
+            merged[offset] = copy.deepcopy(row)
             continue
         rank_new = row.get("score")
         rank_old = existing.get("score")
-        if (rank_new if rank_new is not None else 0) >= (
-            rank_old if rank_old is not None else 0
-        ):
-            merged[offset] = row
+        if (rank_new if rank_new is not None else 0) >= (rank_old if rank_old is not None else 0):
+            merged[offset] = copy.deepcopy(row)
     return list(merged.values())
 
 
@@ -4885,7 +6152,7 @@ def scan_from_allocation(
 
     return {
         "ok": True,
-        "allocation": allocation,
+        "allocation": copy.deepcopy(allocation),
         "structure": struct_name,
         "members": _collapse_stride_runs(members),
     }

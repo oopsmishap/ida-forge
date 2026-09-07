@@ -5,7 +5,7 @@ import itertools
 import re
 from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager, suppress
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 
 import ida_kernwin
 import ida_typeinf
@@ -17,6 +17,8 @@ except ImportError:
     ida_undo = None  # type: ignore[assignment]
 
 import forge.api.types as forge_types
+from forge.api.domain import current_database as _current_domain_database
+from forge.api.domain import try_domain_method as _try_domain_method
 from forge.api.hexrays import create_udt_padding_member
 from forge.api.members import (
     AbstractMember,
@@ -79,10 +81,12 @@ def _apply_lvar_pointer_type(func_ea: int, var: str, structure_name: str) -> boo
         lvi = ida_hexrays.lvar_saved_info_t()
         lvi.ll = ida_hexrays.lvar_locator_t(lvar.location, lvar.defea)
         lvi.type = tinfo
-        ida_hexrays.modify_user_lvar_info(
+        modified = ida_hexrays.modify_user_lvar_info(
             cfunc.entry_ea, ida_hexrays.MLI_TYPE, lvi
         )
-        return True
+        # F9 (2026-09 review): a failed retype must not be recorded as an
+        # applied site — return the API's verdict, not an unconditional True.
+        return bool(modified)
     except Exception:  # noqa: BLE001 — row-based apply is best-effort
         return False
 
@@ -137,9 +141,15 @@ class StructureProvenance:
     root_object_name: str | None = None
     root_object_ea: int | None = None
     root_function_ea: int | None = None
+    # Argument index of the root call-argument observation (aggregate
+    # identity: (root_function_ea, root_argument_index) identifies a
+    # reconstructed aggregate across scans).
+    root_argument_index: int | None = None
     source_member_offset: int | None = None
+    # Address of the root vtable (hierarchy identity: ("vtable", ea, -1)).
+    root_vtable_ea: int | None = None
     has_multiple_roots: bool = False
-
+    roots: list[dict] = field(default_factory=list)
 
 @dataclass
 class StructureRelationship:
@@ -155,6 +165,9 @@ class Structure:
         self.name = name
         self.main_offset = 0
         self.members: list[AbstractMember] = []
+        # Largest safely-known byte extent of the layout (hierarchy commit
+        # grows children to the widest evidence before linking).
+        self.conservative_extent: int = 0
         self.collisions: list[bool] = []
         self.is_auto_named: bool = False
         self.created_type_name: str | None = None
@@ -164,12 +177,13 @@ class Structure:
         # R3.5: sites the last commit applied the pointer type to
         # (populated by _apply_scanned_variable_types).
         self.last_apply_sites: list[dict] = []
-        # R3.6: persisted scan-evidence rows (netnode-backed via the
-        # catalog payload); survives worker drops and store rebuilds.
         self.scan_sites_rows: list[dict] = []
         self.provenance: StructureProvenance = StructureProvenance()
         self.parent_relationships: list[StructureRelationship] = []
         self.child_relationships: list[StructureRelationship] = []
+        # Binary C++ ABI evidence (vtable/RTTI/base-subobject metadata).
+        # Kept detached from IDA tinfo handles so it survives catalog reload.
+        self.abi_metadata: dict = {}
 
     def add_member(self, member: AbstractMember) -> None:
         """Insert a member while keeping the structure ordered by offset/type."""
@@ -189,7 +203,9 @@ class Structure:
         root_object_name: str | None = None,
         root_object_ea: int | None = None,
         root_function_ea: int | None = None,
+        root_argument_index: int | None = None,
         source_member_offset: int | None = None,
+        root_vtable_ea: int | None = None,
         has_multiple_roots: bool = False,
     ) -> None:
         self.provenance = StructureProvenance(
@@ -197,7 +213,9 @@ class Structure:
             root_object_name=root_object_name,
             root_object_ea=root_object_ea,
             root_function_ea=root_function_ea,
+            root_argument_index=root_argument_index,
             source_member_offset=source_member_offset,
+            root_vtable_ea=root_vtable_ea,
             has_multiple_roots=has_multiple_roots,
         )
 
@@ -350,6 +368,8 @@ class Structure:
             parts.append(self.provenance.root_object_name)
         if self.provenance.source_member_offset is not None:
             parts.append(f"member @ 0x{self.provenance.source_member_offset:X}")
+        if self.provenance.root_argument_index is not None:
+            parts.append(f"argument {self.provenance.root_argument_index + 1}")
         if self.provenance.has_multiple_roots:
             parts.append("multiple roots")
         return " | ".join(parts)
@@ -567,13 +587,17 @@ class Structure:
             return 0
 
         member = self.members[index]
-        if member.effective_size() <= 0:
+        # F10 (2026-09 review): use the same duck-typed pack-size helper as
+        # refresh_collisions/build_cdecl so collision flags and pack math
+        # agree (and duck-typed members without effective_size() work).
+        pack_size = _member_pack_size(member)
+        if pack_size <= 0:
             return 0
 
         span = self.members[next_enabled].offset - member.offset
-        if span <= member.effective_size():
+        if span <= pack_size:
             return 0
-        return span // member.effective_size()
+        return span // pack_size
 
     def clear_members(self) -> None:
         self.members.clear()
@@ -790,16 +814,18 @@ class Structure:
                 )
 
             if member.is_array:
-                array_size = self.calculate_array_size(index)
+                explicit_count = getattr(member, "array_count", None)
+                array_size = explicit_count or self.calculate_array_size(index)
                 if array_size > 1:
                     udt_data.push_back(member.get_udt_member(array_size, offset=origin))
-                    # R2.1: use the pack-resolved size for the stride too,
-                    # or a placeholder-poisoned member mis-sizes the array.
-                    current_offset = member.offset + member.effective_size() * array_size
+                    # F10: duck-typed pack size, consistent with the scalar path.
+                    current_offset = (
+                        member.offset + _member_pack_size(member) * array_size
+                    )
                     continue
 
             udt_data.push_back(member.get_udt_member(offset=origin))
-            current_offset = member.offset + member.effective_size()
+            current_offset = member.offset + _member_pack_size(member)
 
         final_tinfo.create_udt(udt_data, ida_typeinf.BTF_STRUCT)
         cdecl = ida_typeinf.print_tinfo(
@@ -875,8 +901,24 @@ class Structure:
         ``parse_decl`` returns the declared name on success and ``None`` on
         failure (``PT_SIL`` keeps IDA quiet about malformed edits).
         """
-        if not cdecl:
-            return False
+        domain_db = _current_domain_database(required=False)
+        handled, parsed = _try_domain_method(
+            domain_db,
+            "types",
+            "parse_one_declaration",
+            None,
+            cdecl,
+            capability="types.declaration_validation",
+            unavailable_reason=(
+                "ida-domain declaration validator unavailable on this build/session"
+            ),
+            failure_reason="ida-domain declaration validation rejected the declaration",
+        )
+        if handled:
+            # F8 (2026-09 review): an available validator that returns None
+            # is an AUTHORITATIVE rejection — never fall through to the SDK
+            # retry, which could accept what the domain validator refused.
+            return parsed is not None
         try:
             out_tif = ida_typeinf.tinfo_t()
             parsed_name = ida_typeinf.parse_decl(
@@ -891,6 +933,20 @@ class Structure:
 
     @staticmethod
     def _load_named_type(name: str) -> ida_typeinf.tinfo_t | None:
+        domain_db = _current_domain_database(required=False)
+        handled, domain_tinfo = _try_domain_method(
+            domain_db,
+            "types",
+            "get_by_name",
+            name,
+            capability="types.named_type_reload",
+            unavailable_reason=(
+                "ida-domain named type lookup unavailable on this build/session"
+            ),
+            failure_reason="ida-domain named type reload failed on this build/session",
+        )
+        if handled:
+            return domain_tinfo
         tinfo = ida_typeinf.tinfo_t()
         if tinfo.get_named_type(ida_typeinf.get_idati(), name):
             return tinfo

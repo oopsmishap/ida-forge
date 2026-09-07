@@ -5,6 +5,7 @@ import os
 import pathlib
 
 import ida_hexrays
+import ida_ida
 import ida_idaapi
 import ida_typeinf
 
@@ -13,7 +14,7 @@ try:  # stdlib tomllib on Python 3.11+ (IDA 9.x ships 3.12) — E7, 2026-08-13
 except ImportError:  # Python 3.9/3.10 falls back to the optional `toml` package
     tomllib = None
 
-from forge.util.logging import log_debug, log_error
+from forge.util.logging import log_debug, log_error, log_warning
 
 from .config import config
 
@@ -21,6 +22,25 @@ from .config import config
 _BADORD = getattr(ida_idaapi, "BADORD", getattr(ida_typeinf, "BADORD", -1))
 
 # from forge.util.cxx_to_c_name import demangled_name_to_c_str, maybe implement this in later
+
+
+def _get_compiler_id() -> int:
+    """Return the IDB compiler id across IDA 9 API shapes.
+
+    Newer builds expose ``ida_ida.inf_get_cc_id()``; older ones keep the
+    value inside ``idaapi.get_inf_structure().cc.id``. Falls back to 0 when
+    neither is available so MSVC-only layouts are hidden rather than
+    misapplied.
+    """
+    getter = getattr(ida_ida, "inf_get_cc_id", None)
+    if callable(getter):
+        return int(getter())
+    try:
+        inf = ida_idaapi.get_inf_structure()
+        cc = getattr(inf, "cc", None)
+        return int(getattr(cc, "id", 0))
+    except Exception:  # noqa: BLE001 — compiler unknown, hide MSVC layouts
+        return 0
 
 
 class TemplatedTypes:
@@ -144,12 +164,36 @@ class TemplatedTypes:
         # Read via stdlib tomllib, falling back to the optional package.
         if tomllib is not None:
             with open(self.file_path, "rb") as f:
-                types_dict = tomllib.load(f)
+                loaded_types = tomllib.load(f)
         else:
             import toml
 
             with open(self.file_path, encoding="utf-8") as f:
-                types_dict = toml.loads(f.read())
+                loaded_types = toml.loads(f.read())
+
+        # MSVC std::* layouts are only valid on MSVC-built IDBs; hide them
+        # when the compiler is GNU/unknown so a wrong layout is never applied.
+        compiler_mask = getattr(ida_typeinf, "COMP_MASK", 0)
+        msvc_id = getattr(ida_typeinf, "COMP_MS", None)
+        is_msvc = (
+            msvc_id is not None
+            and (_get_compiler_id() & compiler_mask) == msvc_id
+        )
+        hidden_msvc = False
+        types_dict = {}
+        for name, template_type in loaded_types.items():
+            compiler = template_type.get("compiler", "any")
+            if compiler == "msvc" and not is_msvc:
+                hidden_msvc = True
+                continue
+            types_dict[name] = template_type
+
+        if hidden_msvc:
+            log_warning(
+                "MSVC templated type layouts are hidden because the IDB "
+                "compiler is GNU or unknown"
+            )
+
         self._types_dict = types_dict
         self.keys = list(types_dict.keys())
         return True

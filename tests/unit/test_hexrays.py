@@ -288,3 +288,27 @@ def test_decompile_delegates_to_real_function(monkeypatch):
 
     assert calls["decompile"] == [0x1400014F0]
     assert result is not None
+
+
+def test_is_imported_matches_cached_absolute_import_ea(monkeypatch):
+    """Cache coordinate fix: ``cache.imported_ea`` stores absolute EAs, so
+    with image_base != 0 a cached import EA matches the normalized lookup
+    (the old RVA cache never matched the absolute membership test)."""
+    from forge.api import cache as cache_module
+    from forge.api import domain as domain_module
+
+    hexrays_module = _load_hexrays_module()
+    domain_module.clear_fallback_records()
+    cache_module.imported_ea.clear()
+    monkeypatch.setattr(hexrays_module, "_current_domain_database", lambda required=False: None)
+    monkeypatch.setattr(hexrays_module.ida_segment, "getseg", lambda _ea: None, raising=False)
+    monkeypatch.setattr(
+        hexrays_module.ida_nalt, "get_imagebase", lambda: 0x140000000, raising=False
+    )
+    try:
+        cache_module.imported_ea.add(0x140001010)
+        assert hexrays_module.is_imported(0x140001010) is True
+        assert hexrays_module.is_imported(0x140002020) is False
+    finally:
+        cache_module.imported_ea.clear()
+        domain_module.clear_fallback_records()

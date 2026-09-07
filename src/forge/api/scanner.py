@@ -1,6 +1,11 @@
 from __future__ import annotations
 
+from contextlib import suppress
 from dataclasses import dataclass
+from typing import TYPE_CHECKING, Callable
+
+if TYPE_CHECKING:
+    from forge.api.structure import Structure
 
 import ida_bytes
 import ida_funcs
@@ -8,6 +13,8 @@ import ida_hexrays
 import ida_typeinf
 import idaapi
 
+from forge.api.domain import current_database as _current_domain_database
+from forge.api.domain import try_domain_method as _try_domain_method
 from forge.api.hexrays import (
     ctype,
     ctype_to_str,
@@ -24,8 +31,32 @@ from forge.api.types import types
 from forge.api.visitor import (
     DownwardsObjectVisitor,
     ObjectVisitor,
+    RecursiveCallFrame,
     RecursiveDownwardsObjectVisitor,
 )
+
+
+def _function_at(ea: int):
+    handled, function = _try_domain_method(
+        _current_domain_database(required=False),
+        "functions",
+        "get_at",
+        ea,
+        capability="functions.scanner",
+        unavailable_reason="ida-domain scanner function lookup unavailable on this build/session",
+        failure_reason="ida-domain scanner function lookup failed",
+        exceptions=(Exception,),
+    )
+    if handled:
+        return function
+    return ida_funcs.get_func(ea)
+
+
+def _function_name(ea: int) -> str:
+    function = _function_at(ea)
+    if function is not None and hasattr(function, "name"):
+        return function.name or ""
+    return ida_funcs.get_func_name(ea)
 from forge.util.logging import log_debug, log_warning
 
 
@@ -76,7 +107,7 @@ class ScannedObject:
 
     @staticmethod
     def _get_function_start(ea: int) -> int:
-        func = ida_funcs.get_func(ea)
+        func = _function_at(ea)
         return func.start_ea if func is not None else idaapi.BADADDR
 
     def apply_type(self, tinfo: ida_typeinf.tinfo_t) -> None:
@@ -111,15 +142,11 @@ class ScannedObject:
                 setattr(result, attr, value)
         return result
 
-
-
-
-
     @property
     def function_name(self) -> str:
         if self.func_ea == idaapi.BADADDR:
             return "<unknown>"
-        return ida_funcs.get_func_name(self.func_ea)
+        return _function_name(self.func_ea)
 
     def to_list(self) -> list[str]:
         """Return a row suitable for an IDA chooser widget."""
@@ -374,6 +401,7 @@ class ScanVisitor(ObjectVisitor):
         obj: ScanObject,
         structure,
         recurse_calls: bool | None = None,
+        member_sink: Callable[[object, RecursiveCallFrame], None] | None = None,
     ):
         if recurse_calls is None:
             DownwardsObjectVisitor.__init__(self, cfunc, obj, None, True)
@@ -383,6 +411,11 @@ class ScanVisitor(ObjectVisitor):
         self._origin = origin
         self._callee_base_offset = 0
         self._structure = structure
+        self._member_sink = member_sink
+        # Pointee members discovered through a pointer FIELD dereference,
+        # grouped into a child structure keyed by that field's offset (e.g. a
+        # vtable / function-pointer table reached through field_0).
+        self._pointer_child_structures: dict[int, Structure] = {}
 
 
 
@@ -505,7 +538,12 @@ class ScanVisitor(ObjectVisitor):
         from forge.api.members import VoidMember
         if member and not isinstance(member, VoidMember):
             log_debug(f"\tCreating member {member}")
-            self._structure.add_member(member)
+            self._emit_member(member)
+        # A dereference through a pointer FIELD of the scanned object means
+        # the observed member belongs to the field's pointee — collect it in
+        # a child structure (keyed by the field offset) alongside the normal
+        # extraction, which stays untouched (R3.14 suppression included).
+        self._maybe_record_pointer_child(cexpr, obj)
 
     def _get_member(
         self,
@@ -612,6 +650,374 @@ class ScanVisitor(ObjectVisitor):
 
         from forge.api.members import Member
         return Member(offset, tinfo, scan_obj, self._origin)
+
+    def _emit_member(self, member) -> None:
+        member_sink = getattr(self, "_member_sink", None)
+        if member_sink is None:
+            self._structure.add_member(member)
+            return
+        member_sink(member, self._current_frame)
+
+    @property
+    def pointer_child_structures(self) -> dict[int, Structure]:
+        """Reconstructed child structures keyed by the pointer field offset
+        that reaches them (e.g. a vtable / function-pointer table behind
+        field_0)."""
+        return self._pointer_child_structures
+
+    def _record_pointer_child_member(self, field_offset: int, member) -> None:
+        """Record a member observed through a pointer field's pointee.
+
+        Members are grouped by the pointer field they came from and collected
+        in their own Structure so the normal dedup/collision/scoring logic
+        applies. The caller resolves a globally-unique name (and provenance)
+        when it integrates and links these children.
+        """
+        from forge.api.members import VoidMember
+        from forge.api.structure import Structure
+
+        if member is None or isinstance(member, VoidMember):
+            return
+        store = getattr(self, "_pointer_child_structures", None)
+        if store is None:
+            return
+        child = store.get(field_offset)
+        if child is None:
+            parent_name = getattr(self._structure, "name", "struct")
+            child = Structure(f"{parent_name}_field_{field_offset:x}")
+            store[field_offset] = child
+        child.add_member(member)
+
+    def _pointer_child_field_access(self, cexpr):
+        """Detect a member access that dereferences a pointer FIELD of the
+        scanned object.
+
+        Read innermost-out, the parent chain of the matched object reference
+        looks like ``*(*(TYPE *)<obj + field_offset> + pointee_offset)``: a
+        pointer value loaded from a field of the scanned object and then
+        dereferenced again. The member observed on the far side belongs to a
+        child structure keyed by that field's offset, not to the scanned
+        structure itself.
+
+        Returns ``(field_offset, pointee_offset, element_tinfo, access_expr)``
+        or ``None`` when the chain is a plain member access, carries dynamic
+        (non-numeric) addressing, or never dereferences twice. Offsets are
+        BYTES, matching the rest of this scanner.
+        """
+        context = self._get_parent_context()
+        field_offset: int | None = None
+        offset = 0
+        pending_cast_tinfo = None
+        deref_count = 0
+        index = 0
+        while True:
+            node = context.expr_at(index)
+            op = context.op_at(index)
+            if node is None:
+                return None
+            if op == ctype.cast:
+                pending_cast_tinfo = getattr(node, "type", None)
+                index += 1
+                continue
+            if op in (ctype.add, ctype.sub):
+                left = getattr(node, "x", None)
+                right = getattr(node, "y", None)
+                if getattr(right, "op", None) == ctype.num:
+                    number = right.numval()
+                    negative = op == ctype.sub
+                elif getattr(left, "op", None) == ctype.num:
+                    number = left.numval()
+                    negative = op == ctype.sub
+                else:
+                    return None  # dynamic addressing is not recordable
+                delta = number * self._add_pointee_scale(node)
+                offset += -delta if negative else delta
+                index += 1
+                continue
+            if op == getattr(ctype, "memptr", None):
+                # `x->m` — the dereference itself carries the member offset.
+                offset += int(getattr(node, "m", 0) or 0)
+                deref_count += 1
+                element_tinfo = getattr(node, "type", None)
+            elif op == ctype.idx:
+                index_expr = getattr(node, "y", None)
+                if getattr(index_expr, "op", None) != ctype.num:
+                    return None
+                node_type = getattr(node, "type", None)
+                get_size = getattr(node_type, "get_ptrarr_objsize", None)
+                element_size = 1
+                if callable(get_size):
+                    try:
+                        element_size = int(get_size()) or 1
+                    except Exception:  # noqa: BLE001 — broken tinfo wrapper
+                        element_size = 1
+                offset += index_expr.numval() * element_size
+                deref_count += 1
+                element_tinfo = self._access_element_tinfo(
+                    pending_cast_tinfo or node_type
+                )
+            elif op == ctype.ptr:
+                deref_count += 1
+                element_tinfo = self._access_element_tinfo(
+                    pending_cast_tinfo or getattr(node, "type", None)
+                )
+            else:
+                # The chain left the member-access pattern without a second
+                # dereference: this is an ordinary member of the scan object.
+                return None
+            if deref_count == 1:
+                field_offset = offset
+                offset = 0
+                pending_cast_tinfo = None
+                index += 1
+                continue
+            return (field_offset, offset, element_tinfo, node)
+
+    def _maybe_record_pointer_child(self, cexpr, obj) -> None:
+        # The store is initialised EMPTY at ScanVisitor.__init__ and this is
+        # the only path to its writer — gate on presence, not truthiness, or
+        # pointer-child/vtable-child reconstruction is dead code.
+        if getattr(self, "_pointer_child_structures", None) is None:
+            return
+        observation = self._pointer_child_field_access(cexpr)
+        if observation is None:
+            return
+        field_offset, pointee_offset, element_tinfo, access_expr = observation
+        self._record_pointer_child_member(
+            field_offset + getattr(self, "_callee_base_offset", 0),
+            self._build_child_member(
+                pointee_offset, element_tinfo, access_expr, obj
+            ),
+        )
+
+    def _build_child_member(self, offset, tinfo, cexpr, obj):
+        """Build a member of a pointer-linked child structure (child-local
+        base).
+
+        A function-pointer slot is specialized so its first parameter is the
+        owning object (``<structure> *``) ONLY when there is dataflow evidence
+        that this loaded entry is actually invoked with the tracked owner as
+        argument 0 (the vtable/callback pattern). Otherwise the decompiler
+        cast signature is preserved, so ordinary ``(*)(int)`` tables are not
+        corrupted.
+        """
+        from forge.api.members import Member
+
+        if offset is None or offset < 0 or tinfo is None:
+            return None
+        if self._tinfo_predicate(tinfo, "is_funcptr") and (
+            self._callback_invoked_with_owner(cexpr, obj)
+        ):
+            tinfo = self._specialize_child_callback_tinfo(tinfo)
+        expr_ea = find_expr_address(cexpr, self.parents)
+        # Child members carry their own (non-applicable) scan target: the
+        # child's pointer type is what gets applied to the parent field, not
+        # these.
+        scan_obj = ScannedObject.create(obj, expr_ea, self._origin, False)
+        return Member(offset, tinfo, scan_obj, 0)
+
+    @staticmethod
+    def _tinfo_predicate(tinfo, name: str) -> bool:
+        predicate = getattr(tinfo, name, None)
+        if not callable(predicate):
+            return False
+        try:
+            return bool(predicate())
+        except Exception:  # noqa: BLE001 — corrupt tinfo wrappers happen
+            return False
+
+    @classmethod
+    def _access_element_tinfo(cls, tinfo):
+        if tinfo is None:
+            return None
+        if cls._tinfo_predicate(tinfo, "is_ptr"):
+            try:
+                pointed = tinfo.get_pointed_object()
+            except Exception:  # noqa: BLE001 — corrupt tinfo wrapper
+                pointed = None
+            return pointed or tinfo
+        if cls._tinfo_predicate(tinfo, "is_array"):
+            try:
+                element = tinfo.get_array_element()
+            except Exception:  # noqa: BLE001 — corrupt tinfo wrapper
+                element = None
+            return element or tinfo
+        return tinfo
+
+    def _structure_pointer_tinfo(self):
+        """A (possibly forward-referenced) pointer to the structure being
+        scanned."""
+        name = getattr(self._structure, "name", None)
+        if not name:
+            return None
+        pointer_tinfo = ida_typeinf.tinfo_t()
+        try:
+            parsed = ida_typeinf.parse_decl(
+                pointer_tinfo, ida_typeinf.get_idati(), f"struct {name} *x;", 0
+            )
+        except Exception:  # noqa: BLE001 — missing til/type system in tests
+            return None
+        return pointer_tinfo if parsed else None
+
+    def _specialize_child_callback_tinfo(self, tinfo):
+        """Retype a function pointer's first parameter to the owning object."""
+        pointed = getattr(tinfo, "get_pointed_object", lambda: None)()
+        if pointed is None:
+            return tinfo
+        func_data = ida_typeinf.func_type_data_t()
+        if not pointed.get_func_details(func_data) or len(func_data) == 0:
+            return tinfo
+        owner_ptr = self._structure_pointer_tinfo()
+        if owner_ptr is None:
+            return tinfo
+        func_data[0].type = owner_ptr
+        new_func = ida_typeinf.tinfo_t()
+        if not new_func.create_func(func_data):
+            return tinfo
+        specialized = ida_typeinf.tinfo_t()
+        if not specialized.create_ptr(new_func):
+            return tinfo
+        return specialized
+
+    @staticmethod
+    def _expr_obj_id(expr):
+        value = getattr(expr, "obj_id", None)
+        if callable(value):
+            try:
+                value = value()
+            except Exception:  # noqa: BLE001 — identity probes are best-effort
+                return None
+        return value
+
+    def _expr_contains(self, root, target) -> bool:
+        if root is None or target is None:
+            return False
+        target_id = self._expr_obj_id(target)
+        for expression in self._walk_expression_tree(root):
+            if expression is target:
+                return True
+            if target_id is not None and self._expr_obj_id(expression) == target_id:
+                return True
+        return False
+
+    def _call_arg0_references_owner(self, call_expr, obj) -> bool:
+        args = getattr(call_expr, "a", None)
+        if not args:
+            return False
+        try:
+            first = args[0]
+        except (IndexError, TypeError):
+            return False
+        if first is None:
+            return False
+        if hasattr(self, "_expression_references_object"):
+            return self._expression_references_object(first)
+        return self._matches_object(obj, first)
+
+    def _callback_invoked_with_owner(self, load_expr, obj) -> bool:
+        """True when the value loaded at ``load_expr`` is invoked as a function
+        with the tracked owner ``obj`` as its first argument.
+
+        Handles both the inline form ``(*(field + n))(owner, ...)`` and the
+        assigned-then-called form ``v = *(field + n); ...; v(owner, ...)``.
+        Expressions are visited in pre-order, so the assignment precedes its
+        later call use.
+        """
+        call_op = getattr(ctype, "call", None)
+        asg_op = getattr(ctype, "asg", None)
+        var_op = getattr(ctype, "var", None)
+        if call_op is None:
+            return False
+
+        def target_var_idx(expr):
+            return getattr(getattr(expr, "v", None), "idx", None)
+
+        for statements in self._collect_linear_expression_statements():
+            ordered = [
+                expression
+                for _flag, expressions in statements
+                for expression in expressions
+            ]
+            aliased_to_load: set[int] = set()
+            for expression in ordered:
+                op = getattr(expression, "op", None)
+                if op == call_op:
+                    callee = getattr(expression, "x", None)
+                    if self._call_arg0_references_owner(expression, obj) and (
+                        self._expr_contains(callee, load_expr)
+                        or (
+                            getattr(callee, "op", None) == var_op
+                            and target_var_idx(callee) in aliased_to_load
+                        )
+                    ):
+                        return True
+                elif op == asg_op and getattr(
+                    getattr(expression, "x", None), "op", None
+                ) == var_op:
+                    assigned_idx = target_var_idx(getattr(expression, "x", None))
+                    if self._expr_contains(
+                        getattr(expression, "y", None), load_expr
+                    ):
+                        aliased_to_load.add(assigned_idx)
+                    else:
+                        aliased_to_load.discard(assigned_idx)
+        return False
+
+    def _collect_linear_expression_statements(self):
+        cfunc = getattr(self, "_cfunc", None)
+        body = getattr(cfunc, "body", None)
+        statements = getattr(body, "cblock", None)
+        expression_op = getattr(ida_hexrays, "cit_expr", None)
+        if statements is None or expression_op is None:
+            return []
+
+        class ExpressionCollector(ida_hexrays.ctree_visitor_t):
+            def __init__(self):
+                super().__init__(ida_hexrays.CV_FAST)
+                self.expressions = []
+
+            def visit_expr(self, expression):
+                self.expressions.append(expression)
+                return 0
+
+        collected_statements = []
+        try:
+            for statement in statements:
+                collector = ExpressionCollector()
+                collector.apply_to(statement, None)
+                collected_statements.append(
+                    (
+                        getattr(statement, "op", None) == expression_op,
+                        collector.expressions,
+                    )
+                )
+        except Exception:  # noqa: BLE001 — dataflow probing is best-effort
+            return []
+        return [collected_statements]
+
+    @staticmethod
+    def _walk_expression_tree(root):
+        pending = [root]
+        visited = set()
+        while pending:
+            expression = pending.pop()
+            if expression is None or id(expression) in visited:
+                continue
+            visited.add(id(expression))
+            yield expression
+            arguments = getattr(expression, "a", None)
+            if arguments is not None:
+                with suppress(TypeError):
+                    pending.extend(reversed(list(arguments)))
+            pending.extend(
+                expression
+                for expression in (
+                    getattr(expression, "z", None),
+                    getattr(expression, "y", None),
+                    getattr(expression, "x", None),
+                )
+                if expression is not None
+            )
 
     def _extract_member_from_ptr(self, cexpr: ida_hexrays.cexpr_t, obj: ScanObject):
         """Extract a member from a pointer expression."""
@@ -1102,7 +1508,15 @@ class NewDeepScanVisitor(ScanVisitor, RecursiveDownwardsObjectVisitor):
         recurse_calls: bool = False,
         max_depth: int | None = None,
         skip_until_object: bool = True,
+        member_sink: Callable[[object, RecursiveCallFrame], None] | None = None,
     ):
-        super().__init__(cfunc, origin, obj, structure, recurse_calls=recurse_calls)
+        super().__init__(
+            cfunc,
+            origin,
+            obj,
+            structure,
+            recurse_calls=recurse_calls,
+            member_sink=member_sink,
+        )
         self._max_depth = max_depth
         self._skip = skip_until_object and self._skip

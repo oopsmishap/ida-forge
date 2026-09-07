@@ -653,11 +653,14 @@ def test_set_cdecl_overwrite_deletes_and_recreates_when_declaration_valid(monkey
 
 
 def test_set_cdecl_overwrite_prefers_ordinal_delete_over_name_delete(monkeypatch):
-    """Regression (R10): the overwrite branch must delete by ordinal
-    (``get_type_ordinal`` -> ``del_numbered_type``), not ``del_named_type``
-    which is a silent no-op on IDA 9.4. The two delete calls land in order
-    before the recreate, and the name-delete fallback only runs when the
-    ordinal delete left the type resolvable."""
+    """Regression (R10): when the in-place update path fails, the fallback
+    path must delete by ordinal (``get_type_ordinal`` ->
+    ``del_numbered_type``), not ``del_named_type`` which is a silent no-op
+    on IDA 9.4. The two delete calls land in order before the recreate, and
+    the name-delete fallback only runs when the ordinal delete left the
+    type resolvable. ``update_named_type`` is patched to return False
+    explicitly so the test exercises the delete+recreate fallback path even
+    on stubs that do carry ``update_named_type``."""
     structure_module = import_module("forge.api.structure")
     calls = []
 
@@ -666,6 +669,12 @@ def test_set_cdecl_overwrite_prefers_ordinal_delete_over_name_delete(monkeypatch
         return calls.count("create_type") == 2  # probe fails, recreate succeeds
 
     state = {"exists": True}
+    monkeypatch.setattr(
+        structure_module.ida_typeinf,
+        "update_named_type",
+        lambda *_a, **_k: False,  # in-place update fails -> fallback path
+        raising=False,
+    )
     monkeypatch.setattr(
         structure_module.idaapi,
         "get_type_ordinal",
@@ -715,14 +724,24 @@ def test_set_cdecl_overwrite_prefers_ordinal_delete_over_name_delete(monkeypatch
 
 
 def test_set_cdecl_overwrite_reports_failed_delete_instead_of_silently_keeping(monkeypatch):
-    """Regression (R10): when the type STILL resolves after both delete
-    attempts, the overwrite must fail loudly (log + None) — never report a
-    bogus "recreated" state over a stale type."""
+    """Regression (R10): when the in-place update path fails and the type
+    STILL resolves after both fallback-path delete attempts (ordinal
+    delete, then name delete), the overwrite must fail loudly (log + None)
+    — never report a bogus "recreated" state over a stale type.
+    ``update_named_type`` is patched to return False explicitly so the test
+    exercises the delete+recreate fallback path even on stubs that do
+    carry ``update_named_type``."""
     structure_module = import_module("forge.api.structure")
     logged = []
     monkeypatch.setattr(
         structure_module, "log_error",
         lambda message, *args, **kwargs: logged.append(message),
+    )
+    monkeypatch.setattr(
+        structure_module.ida_typeinf,
+        "update_named_type",
+        lambda *_a, **_k: False,  # in-place update fails -> fallback path
+        raising=False,
     )
 
     def create_type(name, decl):
@@ -793,6 +812,75 @@ def test_declaration_parses_accepts_clean_declaration(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+
+
+def test_declaration_parses_prefers_domain(monkeypatch):
+    structure_module = import_module("forge.api.structure")
+    calls = []
+
+    class Types:
+        def parse_one_declaration(self, library, declaration):
+            calls.append((library, declaration))
+            return object()
+
+    monkeypatch.setattr(
+        structure_module,
+        "_current_domain_database",
+        lambda required=False: SimpleNamespace(types=Types()),
+    )
+    assert structure_module.Structure._declaration_parses("struct X { int x; };") is True
+    assert calls == [(None, "struct X { int x; };")]
+
+
+def test_load_named_type_prefers_domain(monkeypatch):
+    structure_module = import_module("forge.api.structure")
+    domain_tinfo = object()
+
+    class Types:
+        def get_by_name(self, name):
+            return domain_tinfo if name == "X" else None
+
+    monkeypatch.setattr(
+        structure_module,
+        "_current_domain_database",
+        lambda required=False: SimpleNamespace(types=Types()),
+    )
+    assert structure_module.Structure._load_named_type("X") is domain_tinfo
+    assert structure_module.Structure._load_named_type("Missing") is None
+
+
+def test_try_domain_method_distinguishes_none_from_fallback(monkeypatch):
+    from forge.api import domain as domain_module
+
+    domain_module.clear_fallback_records()
+
+    class Types:
+        def get_value(self):
+            return None
+
+    handled, value = domain_module.try_domain_method(
+        SimpleNamespace(types=Types()),
+        "types",
+        "get_value",
+        capability="test.none",
+        unavailable_reason="unavailable",
+        failure_reason="failed",
+    )
+    assert handled is True
+    assert value is None
+    assert domain_module.fallback_records() == ()
+
+    handled, value = domain_module.try_domain_method(
+        None,
+        "types",
+        "get_value",
+        capability="test.missing",
+        unavailable_reason="unavailable",
+        failure_reason="failed",
+    )
+    assert handled is False
+    assert value is None
+    assert domain_module.fallback_records()[-1].capability == "test.missing"
 # Tier 4: auto_resolve dry-run + undo snapshot
 # ---------------------------------------------------------------------------
 

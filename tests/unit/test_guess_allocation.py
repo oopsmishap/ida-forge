@@ -20,23 +20,6 @@ hexrays_api = import_module("forge.api.hexrays")
 if not hasattr(hexrays_api, "find_expr_address"):
     hexrays_api.find_expr_address = lambda *_args, **_kwargs: 0
 
-visitor_api = import_module("forge.api.visitor")
-
-
-class _DummyRecursiveUpwardsObjectVisitor:
-    def __init__(self, cfunc, obj, data=None, skip_until_object=False, visited=None):
-        self._cfunc = cfunc
-        self.parents = []
-        self._skip = skip_until_object
-        self._init_obj = obj
-
-    def parent_expr(self):
-        return None
-
-    def get_line(self):
-        return ""
-
-visitor_api.RecursiveUpwardsObjectVisitor = _DummyRecursiveUpwardsObjectVisitor
 
 from forge.api.scan_object import ObjectType
 
@@ -344,6 +327,83 @@ def test_guess_allocation_callee_alias_chain_two_hops(monkeypatch, _real_hexrays
         [0x401300, "row", "row = chain_node_new(...)", "HEAP", 40, 0x402000]
     ]
 
+
+
+def test_guess_allocation_callee_cast_return_ignores_unrelated_var_moves(monkeypatch, _real_hexrays):
+    """Regression (review 2026-09-07): `return (T *)b;` surfaces a cast node
+    with v=None/ea=0, so the alias hop must reduce it to the var under the
+    cast and refuse to match when neither an lvar index nor a nonzero EA is
+    available. Unconstrained matching let the FIRST `x = <single var>` move
+    (`tmp = a`) win regardless of variable, attributing a's allocator
+    assignment to b's return."""
+    import ida_funcs
+
+    cfunc = SimpleNamespace(
+        entry_ea=0x401000,
+        body=SimpleNamespace(find_parent_of=lambda expr: None),
+    )
+    obj = SimpleNamespace(id=ObjectType.local_variable, ea=0x5000, name="row")
+
+    visitor = guess_allocation_module.GuessAllocationVisitor(cfunc, obj)
+    monkeypatch.setattr(
+        guess_allocation_module,
+        "ctype",
+        SimpleNamespace(asg=1, ref=2, ret=3, call=5, var=4, cast=6),
+    )
+    monkeypatch.setattr(
+        visitor,
+        "parent_expr",
+        lambda: SimpleNamespace(op=1, y=SimpleNamespace(op=5, x=SimpleNamespace(obj_ea=0x402000))),
+    )
+    monkeypatch.setattr(visitor, "get_line", lambda: "row = helper(...)")
+
+    def _fake_create(_cfunc, _expr):
+        called_for = getattr(getattr(_expr, "x", None), "obj_ea", None)
+        if called_for == 0x6000:  # only a's calloc is a real allocator
+            return SimpleNamespace(ea=0x401300, size=40)
+        return None
+
+    monkeypatch.setattr(
+        guess_allocation_module.MemoryAllocationObject, "create", _fake_create
+    )
+    monkeypatch.setattr(
+        ida_funcs, "get_func", lambda ea: SimpleNamespace(start_ea=0x402000), raising=False
+    )
+    tmp = SimpleNamespace(idx=7)
+    a = SimpleNamespace(idx=5)
+    b = SimpleNamespace(idx=9)
+    monkeypatch.setattr(
+        _real_hexrays,
+        "decompile",
+        lambda ea: SimpleNamespace(
+            treeitems=[
+                # unrelated var move: `tmp = a;` — must NOT match the return
+                SimpleNamespace(
+                    to_specific_type=None,
+                    op=1,
+                    x=SimpleNamespace(ea=0x404010, v=tmp),
+                    y=SimpleNamespace(op=4, v=a),
+                ),
+                # `a = calloc(...);` — a's own allocator assignment
+                SimpleNamespace(
+                    to_specific_type=None,
+                    op=1,
+                    x=SimpleNamespace(ea=0x404020, v=a),
+                    y=SimpleNamespace(op=5, x=SimpleNamespace(obj_ea=0x6000)),
+                ),
+                # `return (T *)b;` — cast node carries no v/ea identity
+                SimpleNamespace(
+                    to_specific_type=None,
+                    op=3,
+                    x=SimpleNamespace(op=6, v=None, ea=0, x=SimpleNamespace(op=4, v=b)),
+                ),
+            ]
+        ),
+    )
+
+    visitor._manipulate(SimpleNamespace(), obj)
+
+    assert visitor._data == []
 
 def test_guess_allocation_callee_pointer_return_fallback_row(monkeypatch, _real_hexrays):
     """E.22: the helper's return is pointer-typed but the allocation is not

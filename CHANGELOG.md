@@ -2,6 +2,177 @@
 
 All notable changes are tracked here. Format: date — change set (branch/commit).
 
+## 2026-09-07 — fork-gap remediation and persistence hardening
+
+Completed the remaining compatible fixes from the fork review:
+
+- hardened catalog persistence transactions, rollback snapshots, corrupt-load recovery, member flags, linked-member rows, and identity-safe merges;
+- blocked unmaterialized linked members during pack readiness and preserved authored members over vtable scan evidence;
+- fixed pointer-child scanning gates, R3.12 conflicting-size propagation, scan-tree cleanup, and allocation-helper alias handling;
+- routed hexrays/type-cache operations through Domain-first paths with explicit SDK fallback evidence;
+- repaired GUI subscription/transaction lifecycle, in-place local-type replacement, Qt fallback imports, and documentation/CI drift;
+- added focused regressions covering these behavioral contracts.
+
+Verification: full unit suite passes (1285 tests).
+## 2026-09-07 — daax-fork port: hierarchy engine, compiler-gated templates, context-aware field creation
+
+Ported the applicable fixes from the daax fork snapshot (`.agent/from_daax`,
+root-layout hybrid: API/feature code mostly ours-earlier, a small newer
+fix set). Skipped fork content that is ours-superset (plugin lifecycle,
+feature isolation, versions policy, swap_if/convert_to_usercall shapes,
+storage/scanner wholesale copies) and the earlier daax batches already in
+main history.
+
+- **Hierarchy reconstruction engine** (new
+  `src/forge/features/structure_builder/hierarchy.py`, ~1280 lines,
+  logic-identical port): `StructureHierarchySession` classifies recursive
+  call frames by vtable identity (`automatic_hierarchy`, keyed on
+  `root_vtable_ea`) or aggregate identity (`automatic_aggregate`, keyed on
+  `root_function_ea` + `root_argument_index`), places frame observations at
+  source-relative offsets, and commits merged, uniquely-named structures.
+  Engine ports adapted to current conventions: udt offsets/sizes in BYTES
+  (no bit helpers), descriptor-cache types.
+- **Frame-aware deep scan** (`visitor.py`/`scanner.py`): `RecursiveCallFrame`
+  dataclass + frame tree/alias bookkeeping (`call_frames`, `frame_aliases`,
+  `canonical_frame_id`, `_has_active_ancestor`), `member_sink` routing via
+  `_emit_member` (sink -> session observation, else `structure.add_member`),
+  and pointer-child collection (`pointer_child_structures`,
+  `_record_pointer_child_member`, vtable callback specialization) keyed by
+  the pointer-field offset. Current R3.10–R3.14 guards, O2 varargs guard,
+  deferred-retry and `MAX_RESCANS` behavior preserved; `&a1->field`-shaped
+  call arguments are now unplaceable (fork behavior).
+- **Child-scan wiring** (`child_scan.py`/`actions.py`/`form.py`):
+  `HierarchyScanRequest` (cfunc, obj, `source_base`), `_run_deep_hierarchy_scan`
+  (session over working structures + pointer-child merge + commit),
+  `_link_pointer_children` (unique `struct_field_*` names, pointer links,
+  child_scan provenance), child structures stored child-local
+  (`main_offset 0`, origin carried by `plan.source_base`), and
+  `_make_unique_structure_name`/`_register_structure_models` on the form
+  (shared catalog).
+- **Provenance/persistence**: `StructureProvenance` gains `root_vtable_ea`
+  and `root_argument_index` (store round-trips both automatically via
+  asdict + field filter — proven by test); `Structure` gains
+  `conservative_extent`; `LinkedStructureMember` added to `members.py`
+  (byte convention, unmaterialized-tinfo raises loudly).
+- **Templated-types compiler gating**: MSVC-only `std::*` layouts hidden
+  when the IDB compiler is GNU/unknown (warning notice);
+  `templated_types.toml` annotated `compiler = "msvc"/"any"`; Rust
+  `alloc_*` and deque size fields moved to portable `size_t`.
+- **Create-field context math**: `_offset_delta_from_context` (parent-chain
+  byte deltas through casts/`&`/`+N`/`field[idx]`), `_guess_type_from_context`
+  (cast/pointee unwrap; pre-resolved tinfo bypasses the declaration parse
+  for function-pointer fields), alignment-aware `_default_type_for_offset`,
+  and gap-consuming `apply_new_field` (overlapping autogen gap/placeholder
+  members consumed for oversized fields; user-named overlaps refused with
+  a conflict message; no-room case reported). `create_field` facade verb
+  unchanged.
+- **Stale-til fix** (`types.py`): `_load_base_tinfo` resolves committed
+  typedefs against the LIVE `get_idati()` instead of the handle captured at
+  singleton construction (the Types singleton persists across databases
+  under PLUGIN_MULTI) — the fork `types.refresh()` intent adapted to the
+  descriptor cache (no live `tinfo_t` is cached).
+- **Intentionally not ported**: menu-reload deferral (ours already defers
+  via `execute_ui_requests` in `forge_plugmod_t.reload`), feature-manager
+  purge-tree behavior (ours has failure isolation), fork `versions.py`
+  floor, and the fork's scanner/visitor wholesale shape.
+- Tests: `tests/unit/test_structure_builder_hierarchy.py` (engine: identity
+  classification, aggregate identity, duplicate merge, flat-root
+  observations, source_base rebasing), `tests/unit/test_hierarchy_wiring.py`
+  (frame tree/aliases, member_sink routing, pointer-child grouping, wiring
+  contracts), store `root_vtable_ea`/`root_argument_index` round-trip,
+  templated-types gating (hidden/included), apply_new_field layout (gap
+  consumption / user-conflict / padding). Contract-pinning tests updated to
+  the frame API and child-local main_offset model; the undecompilable-
+  function fallback test was removed (fork skip semantics replaced it).
+  Full unit suite: 1285 passed. Ruff clean on ported files (one pre-existing
+  E402 in `scanner.py` remains).
+
+## 2026-09-03 — complete fresh recovery rescored after subobject-rooted-scan fix
+
+Subobject parent-type temporary-retype fix landed (call shape unchanged, `parent_type *` only,
+restored on all paths; focused 36/36; full unit suite 1265 passed). A complete fresh live
+recovery was then re-run against a byte-identical scratch `complex_fixture.exe` copy under the
+current tree (real ida-domain 0.5.1 via `ida-codemode exec`/idalib; cold open ~2 s, 113
+functions). The earlier incomplete direct run (4/31 = 12.9%, only `fixture_World` committed) is
+not final. This pass finished the Phase-4 reconstruction: all 36 header-derived store structures
+committed with exact ABI sizes via `recover_abi_structure` + `create_type(overwrite=True)` in
+dependency order; `g_scene_name` applied at 0x140007E28; all 9 scorer prototypes set
+(class-typed world params parse); 7 renames + 3 pointer-flow targets verified; genuine world
+scans recorded 7 scan sites on `fixture_World`. Save → cold reopen →
+`scripts/score_cpp_recovery.py` (contract v3) → exact `{"passed": 31, "total": 31,
+"score": 100.0}` (full JSON in `.scratch_live_recovery_final_score.json`).
+Canonical `complex_fixture.exe.i64` untouched (read-only opens only; byte size 962366;
+still scores 31/31); verified fresh artifact preserved at `.scratch_live_run_recovery.exe.i64`.
+Exact run record: `docs/forge_api_recovery_eval_output.md`.
+
+## 2026-09-03 — Domain active-session reuse + member-UDT live regression
+
+Runtime + regression hardening on the recovery eval's idalib member-commit
+path (unit-verified; the 31/31 reopen scorer was not re-run this pass — see
+`docs/forge_api_recovery_eval_output.md`).
+
+- **Safe Domain active-session reuse** (`forge.api.domain`): repeated
+  `database()`/`current_database()` calls inside an explicitly opened
+  library session now return the same handled wrapper instead of asking
+  the SDK's `Database.open()` for a fresh hooked wrapper on every lookup.
+  The cache lives in a mutable holder (no `global` rebinds) and is keyed
+  by the exact `ida_domain` module object that produced the handle, so a
+  replaced/removed module can never serve a stale external handle. The
+  cache is populated exclusively by an explicit forge open
+  (`open_database`/`database_session`); a failed open invalidates any
+  prior handle and a `database_session` close drops it (no stale-handle
+  leakage). Path-less (GUI-mode) opens are never cached, so an
+  out-of-band DB switch stays accurate. New `clear_active_database()`.
+  Tests: `tests/unit/test_domain_active_session.py` (7).
+- **Member non-array UDT regression (live-only)**:
+  `scripts/domain_member_udt_commit_smoke.py` exercises the exact
+  non-array `Member.get_udt_member(array_size=0)` → `create_udt(BTF_STRUCT)`
+  assembly the pack core uses and exits nonzero if any committed struct is
+  size-1 (the recovery-eval gap #2 "empty UDT" symptom). Unit tests cannot
+  load a real `ida_typeinf` (all `ida_*` stubbed), so this is a dedicated
+  live smoke runnable inside an activated idalib worker;
+  structural harness in `tests/unit/test_domain_member_udt_commit_smoke.py`.
+  **Live-observed (2026-09-03, `ida-codemode exec` on the fresh cold
+  `complex_fixture.exe`):** 4 non-array members (`u8`/`u16`/`u32`/`u64`)
+  committed through the real `ida_typeinf.create_udt(BTF_STRUCT)` path to a
+  24-byte UDT; smoke exit 0 with `{"committed_size": 24, "member_count": 4,
+  "non_array": true, "ok": true, "size_is_one": false}` — the non-array
+  member-type assignment regression holds against real idalib.
+- **Hygiene (owned files)**: removed four redundant mid-function
+  `from forge.api.domain import try_domain_method` re-imports in
+  `members.py` (module-level `_try_domain_method` already imported); fixed
+  an undefined `VariableObject` reference in
+  `VirtualTable.scan_virtual_function` (reachable via the structure-builder
+  scan path; now imported lazily from `forge.api.scan_object`, matching the
+  codebase convention). Ruff F-clean on `domain.py`/`members.py`.
+
+### Live re-verification (post-remediation, cold idalib worker — 2026-09-03)
+
+Exact observed live outputs recorded this pass (see
+`docs/forge_api_recovery_eval_output.md` for the full dated supplement); the
+2026-08-30/31 documented contract score (31/31) and weighted figure (≈ 67.7%)
+are preserved as the old scores and re-measured below only where stated.
+
+- **Member-UDT commit smoke re-run live**: `scripts/domain_member_udt_commit_smoke.py`
+  against a fresh cold `pure_c_struct_fixture.exe` copy exited 0 with
+  `{"committed_size": 24, "member_count": 4, "non_array": true, "ok": true,
+  "size_is_one": false}` — matches the bullet above (independent reproduce).
+- **Reopen of the canonical documented artifact**: a byte-identical copy of
+  `tests/fixtures/build/Release/complex_fixture.exe.i64` reopened cold under the
+  current code scored **31/31 = 100.0%** (`scripts/score_cpp_recovery.py`,
+  contract v3) — the full layout/global/prototype/member/ABI/vtable/scan-site
+  and pointer-flow set round-trips through the current save/reopen unchanged.
+- **Fresh scan-driven cold recovery**: a byte-copy of `complex_fixture.exe`
+  recovered from binary evidence only (no ground-truth authoring) produced a
+  World scan of 329 members and a LeaderboardEntry subobject scan at 0xD20 that
+  matched but yielded 0 embedded members (subobject policy: integral parent
+  roots are not auto-retyped in subobject mode), so the 22 embedded-record gap
+  (eval gap #1) is **empirically still open** after this remediation — the
+  scan-driven reopened store scores **4/31 = 12.9%** (g_scene_name global,
+  `0x140002750` prototype_fragment + pointer_flow, `fixture_World` scan_sites only).
+  This is expected and not code-level regression; the 31/31 figure requires the
+  documented Phase-4 ground-truth reconstruction of the 30-type catalog.
+
 ## 2026-08-15 — R3.10 scan-pollution + None-tinfo void guards
 
 User report (GUI pack on the fixture): "Void type is forbidden here"

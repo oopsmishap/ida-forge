@@ -18,6 +18,7 @@
 ["std::string"]
 base_name = "std_string"
 types = []
+compiler = "msvc"
 struct = """
 #pragma pack(push, 1)
 union std_string_union
@@ -38,6 +39,7 @@ struct std_string
 ["std::wstring"]
 base_name = "std_wstring"
 types = []
+compiler = "msvc"
 struct = """
 #pragma pack(push, 1)
 union std_wstring_union
@@ -58,6 +60,7 @@ struct std_wstring
 ["std::vector<T>"]
 base_name = "std_vector_{1}"
 types = ["T"]
+compiler = "msvc"
 struct = """
 struct std_vector_{1}
 {{
@@ -70,6 +73,7 @@ struct std_vector_{1}
 ["std::list<T>"]
 base_name = "std_list_{1}"
 types = ["T"]
+compiler = "msvc"
 struct = """
 struct std_list_node_{1};
 struct std_list_node_{1}
@@ -89,20 +93,22 @@ struct std_list_{1}
 ["std::deque<T>"]
 base_name = "std_deque_{1}"
 types = ["T"]
+compiler = "msvc"
 struct = """
 struct std_deque_{1}
 {{
     void *_Myproxy;
     {0} **_Map;
     size_t _Mapsize;
-    _QWORD _Myoff;
-    _QWORD _Mysize;
+    size_t _Myoff;
+    size_t _Mysize;
 }};
 """
 
 ["std::set<T>"]
 base_name = "std_set_{1}"
 types = ["T"]
+compiler = "msvc"
 struct = """
 struct _Tree_node_{1};
 struct _Tree_node_{1}
@@ -131,6 +137,7 @@ struct __cppobj std_set_{1}_iterator_pairib
 ["std::map<K,V>"]
 base_name = "std_map_{1}_{3}"
 types = ["K", "V"]
+compiler = "msvc"
 struct = """
 struct {1}_{3}_keyvalue_t
 {{
@@ -165,39 +172,42 @@ struct __cppobj std_map_{1}_{3}_iterator_pairib
 ["alloc::raw_vec::RawVec<T>"]
 base_name = "alloc_raw_vec_{1}"
 types = ["T"]
+compiler = "any"
 struct = """
 struct alloc_raw_vec_{1}
 {{
     {0} *pointer;
-    __int64 cap;
+    size_t cap;
 }};
 """
 
 ["alloc::vec::Vec<T>"]
 base_name = "alloc_vec_{1}"
 types = ["T"]
+compiler = "any"
 struct = """
 struct alloc_vec_{1}
 {{
     alloc_raw_vec_{1} buf;
-    unsigned __int64 len;
+    size_t len;
 }};
 """
 
 ["alloc::string::String<T>"]
 base_name = "alloc_string"
 types = []
+compiler = "any"
 struct = """
 struct alloc_raw_vec_u8
 {{
     u8 *pointer;
-    __int64 cap;
+    size_t cap;
 }};
 
 struct alloc_vec_u8
 {{
     alloc_raw_vec_u8 buf;
-    unsigned __int64 len;
+    size_t len;
 }};
 
 struct alloc_string

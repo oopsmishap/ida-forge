@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import inspect
 import json
 from types import SimpleNamespace
 
@@ -10,6 +11,4832 @@ import pytest
 import forge.api.members as members_mod
 import forge_api
 
+
+def test_help_catalog_covers_public_exports_and_metadata():
+    payload = forge_api.help()
+    catalog = payload["functions"]
+    assert isinstance(catalog, dict)
+    public_names = [name for name in forge_api.__all__ if callable(getattr(forge_api, name, None))]
+    assert set(public_names) <= set(catalog)
+    required = {"group", "doc", "signature", "params", "returns", "example"}
+    for name in public_names:
+        entry = catalog[name]
+        assert required <= set(entry)
+        assert entry["signature"] == str(inspect.signature(getattr(forge_api, name)))
+        assert isinstance(entry["params"], list)
+        assert entry["returns"]
+
+
+def test_help_metadata_exposes_error_contract_and_side_effects():
+    entry = forge_api.help("plan_structure")["functions"]["plan_structure"]
+    assert entry["kind"] == "operation"
+    assert entry["error_contract"]["raises"] == ["ForgeApiError"]
+    assert "returns" in entry["error_contract"]
+    assert entry["side_effects"] == "unknown"
+
+def test_help_returns_detached_metadata():
+    payload = forge_api.help("create_structure")
+    payload["functions"]["create_structure"]["params"].clear()
+    assert forge_api.help("create_structure")["functions"]["create_structure"]["params"]
+
+def test_to_hex_rejects_invalid_ea_values():
+    with pytest.raises(forge_api.ForgeApiError, match="ea must be an int"):
+        forge_api.to_hex(True)
+    with pytest.raises(forge_api.ForgeApiError, match="non-negative"):
+        forge_api.to_hex(-1)
+    assert forge_api.to_hex(0x401000) == "0x401000"
+
+
+def test_grouped_api_returns_detached_groups_and_filters_meta():
+    payload = forge_api.grouped(group="structures")
+    assert set(payload) == {"module", "version", "groups"}
+    assert set(payload["groups"]) == {"structures"}
+    assert "create_structure" in payload["groups"]["structures"]
+    payload["groups"]["structures"]["create_structure"]["params"].clear()
+    assert forge_api.help("create_structure")["functions"]["create_structure"]["params"]
+
+
+def test_get_structure_exposes_detached_provenance_and_abi_metadata():
+    forge_api.create_structure("Evidence")
+    live = forge_api._resolve_structure("Evidence")
+    live.set_provenance(
+        kind="cpp_synthesis",
+        root_object_ea=0x401000,
+        has_multiple_roots=True,
+    )
+    live.abi_metadata = {"rtti_name": "Evidence", "vtables": [{"slots": []}]}
+    payload = forge_api.get_structure("Evidence")
+    assert payload["provenance"]["kind"] == "cpp_synthesis"
+    assert payload["provenance"]["root_object_ea"] == 0x401000
+    assert payload["abi_metadata"]["rtti_name"] == "Evidence"
+    payload["abi_metadata"]["vtables"].clear()
+    assert forge_api.get_structure("Evidence")["abi_metadata"]["vtables"]
+
+
+def test_public_transaction_rolls_back_catalog_changes(monkeypatch):
+    from forge.api.store import StructureCatalog
+
+    isolated = StructureCatalog()
+    monkeypatch.setattr(forge_api, "catalog", isolated)
+    monkeypatch.setattr(forge_api, "_structures", isolated)
+    with pytest.raises(RuntimeError):
+        with forge_api.transaction("rollback"):
+            isolated["temporary"] = SimpleNamespace(
+                name="temporary",
+                members=[],
+                main_offset=0,
+                created_type_name=None,
+                is_auto_named=False,
+                pack=1,
+                child_relationships=[],
+                abi_metadata={},
+                provenance=SimpleNamespace(),
+            )
+            raise RuntimeError("abort")
+    assert "temporary" not in isolated
+def test_function_info_rejects_malformed_domain_bounds(monkeypatch):
+    class Functions:
+        @staticmethod
+        def get_at(_ea):
+            return SimpleNamespace(start_ea=0x1000, end_ea=True)
+
+    monkeypatch.setattr(forge_api, "_domain_database_or_none", lambda: SimpleNamespace(functions=Functions()))
+    monkeypatch.setattr(forge_api, "callers_of", lambda *_args: [])
+    monkeypatch.setattr(forge_api, "callees_of", lambda *_args: [])
+    assert forge_api.function_info(0x1000) is None
+
+
+def test_function_info_rejects_reversed_domain_bounds(monkeypatch):
+    class Functions:
+        @staticmethod
+        def get_at(_ea):
+            return SimpleNamespace(start_ea=0x2000, end_ea=0x1000)
+
+    monkeypatch.setattr(forge_api, "_domain_database_or_none", lambda: SimpleNamespace(functions=Functions()))
+    monkeypatch.setattr(forge_api, "callers_of", lambda *_args: [])
+    monkeypatch.setattr(forge_api, "callees_of", lambda *_args: [])
+    assert forge_api.function_info(0x2000) is None
+
+def test_domain_status_is_headless_safe():
+    status = forge_api.domain_status()
+    assert status["preferred"] == "ida-domain"
+    assert isinstance(status["available"], bool)
+
+
+def test_domain_adapter_uses_database_open(fake_ida_domain):
+    from forge.api import domain
+
+    fake = SimpleNamespace()
+    fake_ida_domain.current = fake
+    assert domain.current_database() is fake
+
+
+def test_domain_adapter_records_explicit_fallback():
+    from forge.api import domain
+
+    domain.clear_fallback_records()
+    domain.sdk_fallback("test.capability", "test reason")
+    assert domain.fallback_records()[0].capability == "test.capability"
+    assert domain.fallback_records()[0].reason == "test reason"
+def test_current_database_translates_open_type_error(monkeypatch):
+    from forge.api import domain
+
+    class Database:
+        @staticmethod
+        def open():
+            raise TypeError("unsupported Database.open signature")
+
+    monkeypatch.setattr(domain, "import_module", lambda _name: SimpleNamespace(Database=Database))
+
+    with pytest.raises(domain.DomainUnavailable, match="requires an IDA Domain") as raised:
+        domain.current_database()
+    assert isinstance(raised.value.__cause__, TypeError)
+    assert domain.current_database(required=False) is None
+
+def test_database_open_value_error_is_normalized(monkeypatch):
+    from forge.api import domain
+
+    class Database:
+        @staticmethod
+        def open(*args, **kwargs):
+            raise ValueError("invalid database path")
+
+    monkeypatch.setattr(domain, "import_module", lambda _name: SimpleNamespace(Database=Database))
+
+    with pytest.raises(domain.DomainUnavailable, match="could not open database") as raised:
+        domain.open_database("bad.exe")
+    assert isinstance(raised.value.__cause__, ValueError)
+
+def test_domain_status_reports_preference():
+    status = forge_api.domain_status()
+    assert status["preferred"] == "ida-domain"
+    assert isinstance(status["fallbacks"], list)
+
+def test_domain_is_code_uses_bytes_classifier(monkeypatch, _real_hexrays):
+    from forge.api import domain
+
+    class Bytes:
+        def is_code_at(self, ea):
+            assert ea == 0x401000
+            return True
+
+    domain.clear_fallback_records()
+    monkeypatch.setattr(_real_hexrays, "_current_domain_database", lambda required=False: SimpleNamespace(bytes=Bytes()), raising=False)
+    monkeypatch.setattr(_real_hexrays.ida_ida.idainfo, "procname", "x86", raising=False)
+    assert _real_hexrays.is_code(0x401000) is True
+    assert domain.fallback_records() == ()
+
+
+def test_domain_is_code_failure_records_sdk_fallback(monkeypatch, _real_hexrays):
+    from forge.api import domain
+
+    class Bytes:
+        def is_code_at(self, _ea):
+            raise RuntimeError("unsupported")
+
+    domain.clear_fallback_records()
+    monkeypatch.setattr(_real_hexrays, "_current_domain_database", lambda required=False: SimpleNamespace(bytes=Bytes()), raising=False)
+    monkeypatch.setattr(_real_hexrays.ida_bytes, "get_full_flags", lambda _ea: 1, raising=False)
+    monkeypatch.setattr(_real_hexrays.ida_bytes, "is_code", lambda _flags: False, raising=False)
+    assert _real_hexrays.is_code(0x401000) is False
+    assert any(item.capability == "bytes.is_code_at" for item in domain.fallback_records())
+
+
+def test_domain_is_code_false_is_handled_without_sdk(monkeypatch, _real_hexrays):
+    class Bytes:
+        def is_code_at(self, _ea):
+            return False
+
+    monkeypatch.setattr(
+        _real_hexrays,
+        "_current_domain_database",
+        lambda required=False: SimpleNamespace(bytes=Bytes()),
+        raising=False,
+    )
+    monkeypatch.setattr(_real_hexrays.ida_ida.idainfo, "procname", "x86", raising=False)
+    monkeypatch.setattr(
+        _real_hexrays.ida_bytes,
+        "is_code",
+        lambda _flags: (_ for _ in ()).throw(AssertionError("SDK fallback used")),
+        raising=False,
+    )
+    assert _real_hexrays.is_code(0x401000) is False
+
+
+
+def test_domain_failure_records_caller_fallback(monkeypatch):
+    from forge.api import domain
+
+    class Xrefs:
+        def code_refs_to_ea(self, _ea):
+            raise RuntimeError("unsupported")
+
+    class DomainDb:
+        xrefs = Xrefs()
+
+    domain.clear_fallback_records()
+    monkeypatch.setattr(forge_api, "_domain_database_or_none", lambda: DomainDb())
+    monkeypatch.setattr(forge_api, "_ida_available", lambda: True)
+    monkeypatch.setattr(forge_api, "_sdk_fallback", domain.sdk_fallback)
+    with pytest.raises(AttributeError):
+        forge_api.callers_of(0x401000)
+    assert any(item.capability == "xrefs.callers_of" for item in domain.fallback_records())
+
+
+def test_domain_is_imported_uses_import_lookup(monkeypatch, _real_hexrays):
+    from forge.api import domain
+
+    class Imports:
+        def get_import_at(self, ea):
+            assert ea == 0x140001010
+            return SimpleNamespace(address=ea)
+
+    domain.clear_fallback_records()
+    monkeypatch.setattr(
+        _real_hexrays,
+        "_current_domain_database",
+        lambda required=False: SimpleNamespace(imports=Imports(), base_address=0x140000000),
+        raising=False,
+    )
+    assert _real_hexrays.is_imported(0x1010) is True
+    assert domain.fallback_records() == ()
+
+
+def test_domain_is_imported_fallback_records_failure(monkeypatch, _real_hexrays):
+    from forge.api import domain
+
+    class Imports:
+        def get_import_at(self, _ea):
+            raise RuntimeError("unsupported")
+
+    domain.clear_fallback_records()
+    monkeypatch.setattr(
+        _real_hexrays,
+        "_current_domain_database",
+        lambda required=False: SimpleNamespace(imports=Imports(), base_address=0x140000000),
+        raising=False,
+    )
+    monkeypatch.setattr(_real_hexrays.ida_segment, "getseg", lambda _ea: None, raising=False)
+    monkeypatch.setattr(_real_hexrays.ida_nalt, "get_imagebase", lambda: 0x140000000, raising=False)
+    _real_hexrays.cache.imported_ea.clear()
+    assert _real_hexrays.is_imported(0x1010) is False
+    assert any(item.capability == "imports.get_import_at" for item in domain.fallback_records())
+
+
+def test_domain_is_imported_uses_segment_name(monkeypatch, _real_hexrays):
+    from forge.api import domain
+
+    class Segments:
+        def get_at(self, ea):
+            assert ea == 0x140001010
+            return object()
+
+        def get_name(self, segment):
+            assert segment is not None
+            return ".plt"
+
+    class Imports:
+        def get_import_at(self, _ea):
+            return None
+
+    domain.clear_fallback_records()
+    monkeypatch.setattr(
+        _real_hexrays,
+        "_current_domain_database",
+        lambda required=False: SimpleNamespace(
+            imports=Imports(), segments=Segments(), base_address=0x140000000
+        ),
+        raising=False,
+    )
+    assert _real_hexrays.is_imported(0x1010) is True
+    assert domain.fallback_records() == ()
+
+
+def test_domain_is_imported_non_plt_segment_continues_cache(monkeypatch, _real_hexrays):
+    from forge.api import domain
+
+    class Segments:
+        def get_at(self, _ea):
+            return object()
+
+        def get_name(self, _segment):
+            return ".text"
+
+    class Imports:
+        def get_import_at(self, _ea):
+            return None
+
+    domain.clear_fallback_records()
+    monkeypatch.setattr(
+        _real_hexrays,
+        "_current_domain_database",
+        lambda required=False: SimpleNamespace(
+            imports=Imports(), segments=Segments(), base_address=0x140000000
+        ),
+        raising=False,
+    )
+    monkeypatch.setattr(_real_hexrays.ida_nalt, "get_imagebase", lambda: 0x140000000, raising=False)
+    _real_hexrays.cache.imported_ea.clear()
+    assert _real_hexrays.is_imported(0x1010) is False
+    assert domain.fallback_records() == ()
+
+
+def test_domain_format_string_read_uses_cstring(monkeypatch):
+    from forge.api import domain
+    import forge.api.hexrays as hexrays_mod
+
+    seen = []
+
+    class Bytes:
+        def get_cstring_at(self, ea):
+            seen.append(ea)
+            return "score=%u"
+
+    class DomainDb:
+        bytes = Bytes()
+    class Ctype:
+        obj = 1
+        call = 2
+        cast = 3
+        str = 5
+        ref = 4
+    call = SimpleNamespace(
+        x=SimpleNamespace(obj_ea=0x401200),
+        a=[SimpleNamespace(op=Ctype.obj, obj_ea=0x401100)],
+    )
+    domain.clear_fallback_records()
+    monkeypatch.setattr(forge_api, "_domain_database_or_none", lambda: DomainDb())
+    monkeypatch.setattr(forge_api, "_resolve_structure", lambda _name: SimpleNamespace())
+    monkeypatch.setattr(forge_api, "_printf_call_expressions", lambda _cfunc: [call])
+    monkeypatch.setattr(hexrays_mod, "decompile", lambda _ea: SimpleNamespace())
+    monkeypatch.setattr(hexrays_mod, "ctype", Ctype(), raising=False)
+    result = forge_api.name_members_from_printf("S", 0x401000)
+    assert result == {"ok": True, "renamed": []}
+    assert seen == [0x401100]
+
+
+def test_domain_read_pointer_uses_qword(monkeypatch, _real_hexrays):
+    from forge.api import domain
+
+    class Bytes:
+        def get_qword_at(self, ea):
+            assert ea == 0x401000
+            return 0x140002000
+
+    domain.clear_fallback_records()
+    monkeypatch.setattr(
+        _real_hexrays,
+        "_current_domain_database",
+        lambda required=False: SimpleNamespace(bytes=Bytes(), pointer_size=8),
+        raising=False,
+    )
+    assert _real_hexrays.read_pointer(0x401000) == 0x140002000
+    assert domain.fallback_records() == ()
+
+
+def test_domain_read_pointer_failure_records_fallback(monkeypatch, _real_hexrays):
+    from forge.api import domain
+
+    class Bytes:
+        def get_qword_at(self, _ea):
+            raise RuntimeError("unsupported")
+
+    domain.clear_fallback_records()
+    monkeypatch.setattr(
+        _real_hexrays,
+        "_current_domain_database",
+        lambda required=False: SimpleNamespace(bytes=Bytes(), pointer_size=8),
+        raising=False,
+    )
+    monkeypatch.setattr(_real_hexrays.ida_bytes, "get_64bit", lambda _ea: 7, raising=False)
+    assert _real_hexrays.read_pointer(0x401000) == 7
+    assert any(item.capability == "bytes.read_pointer" for item in domain.fallback_records())
+
+
+def test_domain_bitness_selects_pointer_reader(monkeypatch, _real_hexrays):
+    from forge.api import domain
+
+    seen = []
+
+    class Bytes:
+        def get_dword_at(self, ea):
+            seen.append(ea)
+            return 0x1001
+
+    domain.clear_fallback_records()
+    monkeypatch.setattr(
+        _real_hexrays,
+        "_current_domain_database",
+        lambda required=False: SimpleNamespace(
+            bytes=Bytes(), bitness=32, architecture="ARM"
+        ),
+        raising=False,
+    )
+    assert _real_hexrays.read_pointer(0x401000) == 0x1000
+    assert seen == [0x401000]
+    assert domain.fallback_records() == ()
+ 
+ 
+def test_domain_read_pointer_zero_is_handled_without_sdk(monkeypatch, _real_hexrays):
+    from forge.api import domain
+    class Bytes:
+        def get_dword_at(self, _ea):
+            return 0
+
+    monkeypatch.setattr(
+        _real_hexrays,
+        "_current_domain_database",
+        lambda required=False: SimpleNamespace(pointer_size=4, architecture="x86", bytes=Bytes()),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        _real_hexrays.ida_bytes,
+        "get_32bit",
+        lambda _ea: (_ for _ in ()).throw(AssertionError("SDK fallback used")),
+        raising=False,
+    )
+    assert _real_hexrays.read_pointer(0x401000) == 0
+
+
+def test_try_domain_call_records_failure_and_preserves_success(monkeypatch):
+    from forge.api import domain
+
+    domain.clear_fallback_records()
+    handled, value = domain.try_domain_call(
+        lambda: {"ok": True},
+        capability="test.call",
+        failure_reason="call failed",
+    )
+    assert handled is True
+    assert value == {"ok": True}
+    handled, value = domain.try_domain_call(
+        lambda: (_ for _ in ()).throw(RuntimeError("unsupported")),
+        capability="test.call.failure",
+        failure_reason="call failed",
+    )
+    assert handled is False
+    assert value is None
+    assert domain.fallback_records()[-1].capability == "test.call.failure"
+
+
+def test_import_slot_name_uses_direct_domain_import(monkeypatch):
+    class Imports:
+        def get_import_at(self, ea):
+            assert ea == 0x140001008
+            return SimpleNamespace(name="printf")
+
+    monkeypatch.setattr(
+        forge_api,
+        "_domain_database_or_none",
+        lambda: SimpleNamespace(imports=Imports()),
+    )
+    assert forge_api._import_slot_to_name(0x140001008) == "printf"
+
+
+def test_import_slot_ordinal_uses_domain_name(monkeypatch):
+    class Imports:
+        def get_import_at(self, _ea):
+            return SimpleNamespace(name=None, ordinal=17)
+
+    class Names:
+        def get_at(self, ea):
+            assert ea == 0x140001008
+            return "ordinal_alias"
+
+    monkeypatch.setattr(
+        forge_api,
+        "_domain_database_or_none",
+        lambda: SimpleNamespace(imports=Imports(), names=Names()),
+    )
+    assert forge_api._import_slot_to_name(0x140001008) == "ordinal_alias"
+
+
+def test_domain_function_lookup_failure_records_fallback(monkeypatch):
+    from forge.api import domain
+
+    class Functions:
+        def get_at(self, _ea):
+            raise RuntimeError("unsupported")
+
+    domain.clear_fallback_records()
+    monkeypatch.setattr(
+        forge_api,
+        "_domain_database_or_none",
+        lambda: SimpleNamespace(functions=Functions()),
+    )
+    monkeypatch.setattr(forge_api, "_import_slot_target_ea", lambda _ea: None)
+    result = forge_api._resolve_import_slot_callees([0x140001000])
+    assert result == [0x140001000]
+    assert any(
+        item.capability == "functions.resolve_import_slots"
+        for item in domain.fallback_records()
+    )
+def test_domain_adapter_opens_clean_binary(fake_ida_domain, tmp_path, monkeypatch):
+    from forge.api import domain
+
+    calls = []
+
+    class Database:
+        @classmethod
+        def open(cls, path, **kwargs):
+            calls.append((path, kwargs))
+            return SimpleNamespace(path=path, close=lambda: None)
+
+    import ida_domain
+    monkeypatch.setattr(ida_domain, "Database", Database)
+    result = domain.open_database(tmp_path / "sample.exe", save_on_close=True, options="opts")
+    assert result.path == tmp_path / "sample.exe"
+    assert calls == [(tmp_path / "sample.exe", {"save_on_close": True, "args": "opts"})]
+
+@pytest.mark.parametrize("options", ["", {}, False])
+def test_domain_adapter_forwards_falsey_open_options(
+    fake_ida_domain, tmp_path, monkeypatch, options
+):
+    from forge.api import domain
+
+    calls = []
+
+    class Database:
+        @classmethod
+        def open(cls, path, **kwargs):
+            calls.append((path, kwargs))
+            return SimpleNamespace(path=path)
+
+    import ida_domain
+    monkeypatch.setattr(ida_domain, "Database", Database)
+    domain.open_database(tmp_path / "sample.exe", options=options)
+
+    assert calls == [(tmp_path / "sample.exe", {"save_on_close": False, "args": options})]
+
+
+def test_domain_adapter_omits_none_open_options(fake_ida_domain, tmp_path, monkeypatch):
+    from forge.api import domain
+
+    calls = []
+
+    class Database:
+        @classmethod
+        def open(cls, path, **kwargs):
+            calls.append((path, kwargs))
+            return SimpleNamespace(path=path)
+
+    import ida_domain
+    monkeypatch.setattr(ida_domain, "Database", Database)
+    domain.open_database(tmp_path / "sample.exe")
+
+    assert calls == [(tmp_path / "sample.exe", {"save_on_close": False})]
+
+
+
+@pytest.mark.parametrize("save_on_close", [True, False, 1, 0])
+def test_domain_adapter_forwards_save_flag(
+    fake_ida_domain, tmp_path, monkeypatch, save_on_close
+):
+    from forge.api import domain
+
+    calls = []
+
+    class Database:
+        @classmethod
+        def open(cls, path, **kwargs):
+            calls.append((path, kwargs))
+            return SimpleNamespace(path=path)
+
+    import ida_domain
+    monkeypatch.setattr(ida_domain, "Database", Database)
+    domain.open_database(tmp_path / "sample.exe", save_on_close=save_on_close)
+
+    assert calls == [
+        (tmp_path / "sample.exe", {"save_on_close": save_on_close})
+    ]
+def test_domain_xref_helpers_resolve_function_starts(monkeypatch, _real_hexrays):
+    from forge.api import domain
+
+    class Xrefs:
+        def code_refs_to_ea(self, _ea):
+            return iter([0x401010])
+
+        def data_refs_to_ea(self, _ea):
+            return iter([0x402010])
+
+    class Functions:
+        def get_at(self, ea):
+            return SimpleNamespace(start_ea=ea - 0x10)
+
+    domain.clear_fallback_records()
+    monkeypatch.setattr(
+        _real_hexrays,
+        "_current_domain_database",
+        lambda required=False: SimpleNamespace(xrefs=Xrefs(), functions=Functions()),
+        raising=False,
+    )
+    assert _real_hexrays.get_funcs_calling_address(0x500000) == {0x401000}
+    assert _real_hexrays.get_funcs_referencing_address(0x500000) == {0x401000, 0x402000}
+    assert domain.fallback_records() == ()
+
+
+def test_domain_adapter_open_failure_is_domain_error(fake_ida_domain, monkeypatch):
+    from forge.api import domain
+
+    class Database:
+        @classmethod
+        def open(cls, *args, **kwargs):
+            raise RuntimeError("no idalib")
+
+    import ida_domain
+    monkeypatch.setattr(ida_domain, "Database", Database)
+    with pytest.raises(domain.DomainUnavailable, match="could not open database"):
+        domain.open_database("missing.exe")
+
+
+def test_vtable_boundary_uses_domain_data_refs(monkeypatch):
+    from forge.api import members
+
+    class Xrefs:
+        def data_refs_to_ea(self, ea):
+            assert ea == 0x401010
+            return iter([0x402000])
+
+    monkeypatch.setattr(
+        members,
+        "_current_domain_database",
+        lambda required=False: SimpleNamespace(xrefs=Xrefs()),
+    )
+    assert members._vtable_has_data_reference(0x401010) is True
+
+
+def test_vtable_function_name_uses_domain_names(monkeypatch):
+    from forge.api import members
+
+    class Names:
+        def get_at(self, ea):
+            assert ea == 0x401000
+            return "named_function"
+
+    monkeypatch.setattr(
+        members,
+        "_current_domain_database",
+        lambda required=False: SimpleNamespace(names=Names()),
+    )
+    assert members._function_name(0x401000) == "named_function"
+
+
+
+
+def test_vtable_parser_uses_domain_name(monkeypatch):
+    from forge.api import members
+
+    monkeypatch.setattr(
+        members,
+        "_current_domain_database",
+        lambda required=False: SimpleNamespace(
+            names=SimpleNamespace(get_at=lambda ea: "vftable_domain")
+        ),
+    )
+    table = object.__new__(members.VirtualTable)
+    table.address = 0x401000
+    assert table._parse_vtable_name() == ("vftable_domain", True)
+def test_domain_decompile_result_maps_contract(monkeypatch):
+    from forge.api import domain
+
+    class TypeInfo:
+        def dstr(self):
+            return "int"
+
+    class Variable:
+        def __init__(self, name, is_arg):
+            self.name = name
+            self.is_arg = is_arg
+            self.type_info = TypeInfo()
+
+    class X:
+        is_object = True
+        obj_ea = 0x402000
+
+    class Call:
+        x = X()
+
+    class Function:
+        def to_text(self, remove_tags=True):
+            assert remove_tags is True
+            return ["int f()", "return 0;"]
+
+        local_variables = (Variable("arg", True), Variable("local", False))
+
+        def find_calls(self):
+            return [Call()]
+
+    monkeypatch.setattr(domain, "decompile", lambda _db, _ea: Function())
+    result = domain.decompile_result(object(), 0x401000)
+    assert result == {
+        "ea": 0x401000,
+        "name": None,
+        "pseudocode": "int f()\nreturn 0;",
+        "lvars": [
+            {"index": 0, "name": "arg", "type": "int", "is_arg": True},
+            {"index": 1, "name": "local", "type": "int", "is_arg": False},
+        ],
+        "calls": [0x402000],
+    }
+
+
+
+def test_domain_decompile_result_keeps_stable_empty_name():
+    from forge.api import domain
+
+    function = SimpleNamespace(
+        to_text=lambda remove_tags=True: ["void f()"],
+        local_variables=[],
+        find_calls=lambda: [],
+    )
+    original = domain.decompile
+    domain.decompile = lambda _db, _ea: function
+    try:
+        assert domain.decompile_result(object(), 0x401000)["name"] is None
+    finally:
+        domain.decompile = original
+
+def test_function_info_prefers_domain_function_metadata(monkeypatch):
+    class Function:
+        start_ea = 0x401000
+        end_ea = 0x401120
+
+    class Functions:
+        def get_at(self, ea):
+            return Function() if ea == 0x401010 else None
+
+        def get_name(self, function):
+            assert isinstance(function, Function)
+            return "domain_func"
+
+    class DomainDb:
+        functions = Functions()
+
+    monkeypatch.setattr(forge_api, "_domain_database_or_none", lambda: DomainDb())
+    monkeypatch.setattr(forge_api, "callers_of", lambda *_args: [])
+    monkeypatch.setattr(forge_api, "callees_of", lambda _ea: [0x402000])
+    monkeypatch.setattr(forge_api, "signature", lambda _ea: "int domain_func()")
+    result = forge_api.function_info(0x401010)
+    assert result == {
+        "name": "domain_func",
+        "start_ea": 0x401000,
+        "size": 0x120,
+        "prototype": "int domain_func()",
+        "callers": [],
+        "callees": [0x402000],
+        "refs": [],
+    }
+
+def test_function_info_normalizes_graph_rows(monkeypatch):
+    class Functions:
+        def get_at(self, _ea):
+            return SimpleNamespace(start_ea=0x401000, end_ea=0x401010)
+
+        def get_name(self, _function):
+            return "f"
+
+    monkeypatch.setattr(
+        forge_api, "_domain_database_or_none", lambda: SimpleNamespace(functions=Functions())
+    )
+    monkeypatch.setattr(forge_api, "_resolve_import_slot_callees", lambda values: values)
+    monkeypatch.setattr(forge_api, "callers_of", lambda *_args: [3, True, 2, 3, "bad"])
+    monkeypatch.setattr(forge_api, "callees_of", lambda _ea: [5, 4, False, 5])
+    monkeypatch.setattr(forge_api, "signature", lambda _ea: "void f()")
+
+    result = forge_api.function_info(0x401000)
+
+    assert result["callers"] == [2, 3]
+    assert result["callees"] == [4, 5]
+    assert result["refs"] == [2, 3]
+
+def test_domain_database_session_closes_handle(monkeypatch):
+    from forge.api import domain
+
+    events = []
+
+    class Handle:
+        def __enter__(self):
+            events.append("enter")
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            events.append("exit")
+            return False
+
+    monkeypatch.setattr(domain, "open_database", lambda *args, **kwargs: Handle())
+    with domain.database_session("sample.exe") as handle:
+        assert isinstance(handle, Handle)
+    assert events == ["enter", "exit"]
+
+def test_domain_database_session_translates_cleanup_value_error(monkeypatch):
+    from forge.api import domain
+
+    class Handle:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            raise ValueError("invalid cleanup state")
+
+    monkeypatch.setattr(domain, "open_database", lambda *args, **kwargs: Handle())
+    with pytest.raises(domain.DomainUnavailable, match="cleanup failed") as raised:
+        with domain.database_session("sample.exe"):
+            pass
+    assert isinstance(raised.value.__cause__, ValueError)
+
+
+@pytest.mark.parametrize("error_type", [ValueError, TypeError, RuntimeError, OSError])
+def test_domain_database_session_preserves_body_exception(monkeypatch, error_type):
+    from forge.api import domain
+
+    class Handle:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    monkeypatch.setattr(domain, "open_database", lambda *args, **kwargs: Handle())
+    with pytest.raises(error_type, match="body failure"):
+        with domain.database_session("sample.exe"):
+            raise error_type("body failure")
+
+def test_domain_database_session_cleanup_failure_overrides_body_exception(monkeypatch):
+    from forge.api import domain
+
+    body_error = ValueError("body failure")
+    cleanup_error = RuntimeError("cleanup failure")
+
+    class Handle:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            assert exc is body_error
+            raise cleanup_error
+
+    monkeypatch.setattr(domain, "open_database", lambda *args, **kwargs: Handle())
+    with pytest.raises(domain.DomainUnavailable, match="cleanup failed") as raised:
+        with domain.database_session("sample.exe"):
+            raise body_error
+
+    assert raised.value.__cause__ is cleanup_error
+
+def test_domain_database_session_preserves_cleanup_chaining(monkeypatch):
+    from forge.api import domain
+
+    body_error = ValueError("body failure")
+    cleanup_error = RuntimeError("cleanup failure")
+    seen = []
+
+    class Handle:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            seen.append((exc_type, exc, tb))
+            raise cleanup_error
+
+    monkeypatch.setattr(domain, "open_database", lambda *args, **kwargs: Handle())
+    with pytest.raises(domain.DomainUnavailable) as raised:
+        with domain.database_session("sample.exe"):
+            raise body_error
+
+    assert raised.value.__cause__ is cleanup_error
+    assert seen[0][0] is ValueError
+    assert seen[0][1] is body_error
+    assert seen[0][2] is not None
+    assert raised.value.__context__ is cleanup_error
+def test_domain_database_session_translates_cleanup_type_error(monkeypatch):
+    from forge.api import domain
+
+    class Handle:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            raise TypeError("invalid cleanup state")
+
+    monkeypatch.setattr(domain, "open_database", lambda *args, **kwargs: Handle())
+    with pytest.raises(domain.DomainUnavailable, match="cleanup failed") as raised:
+        with domain.database_session("sample.exe"):
+            pass
+    assert isinstance(raised.value.__cause__, TypeError)
+
+
+def test_domain_database_session_preserves_enter_keyboard_interrupt(monkeypatch):
+    from forge.api import domain
+
+    enter_error = KeyboardInterrupt("enter cancelled")
+    events = []
+
+    class Handle:
+        def __enter__(self):
+            events.append("enter")
+            raise enter_error
+
+        def __exit__(self, exc_type, exc, tb):
+            events.append("exit")
+            raise AssertionError("exit must not run after enter cancellation")
+
+    monkeypatch.setattr(domain, "open_database", lambda *args, **kwargs: Handle())
+    with pytest.raises(KeyboardInterrupt) as raised:
+        with domain.database_session("sample.exe"):
+            pass
+
+    assert raised.value is enter_error
+    assert events == ["enter"]
+def test_domain_database_session_translates_enter_failure(monkeypatch):
+    from forge.api import domain
+
+    enter_error = RuntimeError("enter failure")
+
+    class Handle:
+        def __enter__(self):
+            raise enter_error
+
+        def __exit__(self, exc_type, exc, tb):
+            raise AssertionError("exit must not run after enter failure")
+
+    monkeypatch.setattr(domain, "open_database", lambda *args, **kwargs: Handle())
+    with pytest.raises(domain.DomainUnavailable, match="setup failed") as raised:
+        with domain.database_session("sample.exe"):
+            pass
+    assert raised.value.__cause__ is enter_error
+
+def test_domain_database_session_preserves_open_failure_contract(monkeypatch):
+    from forge.api import domain
+
+    open_error = OSError("open failed")
+    lifecycle = []
+
+    def fail_open(*args, **kwargs):
+        lifecycle.append("open")
+        raise domain.DomainUnavailable("open unavailable") from open_error
+
+    monkeypatch.setattr(domain, "open_database", fail_open)
+    with pytest.raises(domain.DomainUnavailable, match="open unavailable") as raised:
+        with domain.database_session("sample.exe"):
+            raise AssertionError("session body must not run")
+
+    assert raised.value.__cause__ is open_error
+    assert lifecycle == ["open"]
+
+def test_domain_database_session_preserves_open_keyboard_interrupt(monkeypatch):
+    from forge.api import domain
+
+    open_error = KeyboardInterrupt("open cancelled")
+
+    def fail_open(*args, **kwargs):
+        raise open_error
+
+    monkeypatch.setattr(domain, "open_database", fail_open)
+    with pytest.raises(KeyboardInterrupt) as raised:
+        with domain.database_session("sample.exe"):
+            pass
+
+    assert raised.value is open_error
+
+def test_domain_database_session_preserves_keyboard_interrupt(monkeypatch):
+    from forge.api import domain
+
+    body_error = KeyboardInterrupt("cancelled")
+    events = []
+
+    class Handle:
+        def __enter__(self):
+            events.append("enter")
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            events.append(("exit", exc_type, exc))
+            return False
+
+    monkeypatch.setattr(domain, "open_database", lambda *args, **kwargs: Handle())
+    with pytest.raises(KeyboardInterrupt) as raised:
+        with domain.database_session("sample.exe"):
+            raise body_error
+
+    assert raised.value is body_error
+    assert events == ["enter", ("exit", KeyboardInterrupt, body_error)]
+
+
+def test_domain_database_session_forwards_open_arguments(monkeypatch):
+    from forge.api import domain
+
+    calls = []
+    exit_args = []
+    options = {}
+
+    class Handle:
+        def __enter__(self):
+            return "active"
+
+        def __exit__(self, exc_type, exc, tb):
+            exit_args.append((exc_type, exc, tb))
+            return False
+
+    def fake_open(path, *, save_on_close, options):
+        calls.append((path, save_on_close, options))
+        return Handle()
+
+    monkeypatch.setattr(domain, "open_database", fake_open)
+    with domain.database_session(
+        "sample.exe", save_on_close=True, options=options
+    ) as active:
+        assert active == "active"
+
+    assert calls == [("sample.exe", True, options)]
+    assert exit_args == [(None, None, None)]
+
+def test_domain_database_session_normalizes_non_context_handle(monkeypatch):
+    from forge.api import domain
+
+    handle = object()
+    monkeypatch.setattr(domain, "open_database", lambda *args, **kwargs: handle)
+    with pytest.raises(domain.DomainUnavailable, match="setup failed") as raised:
+        with domain.database_session("sample.exe"):
+            raise AssertionError("session body must not run")
+
+    assert isinstance(raised.value.__cause__, AttributeError)
+
+def test_domain_database_session_normalizes_missing_exit(monkeypatch):
+    from forge.api import domain
+
+    class Handle:
+        def __enter__(self):
+            return self
+
+    monkeypatch.setattr(domain, "open_database", lambda *args, **kwargs: Handle())
+    with pytest.raises(domain.DomainUnavailable, match="cleanup failed") as raised:
+        with domain.database_session("sample.exe"):
+            pass
+
+    assert isinstance(raised.value.__cause__, AttributeError)
+
+def test_domain_database_session_normalizes_non_callable_exit(monkeypatch):
+    from forge.api import domain
+
+    class Handle:
+        __exit__ = None
+
+        def __enter__(self):
+            return self
+
+    monkeypatch.setattr(domain, "open_database", lambda *args, **kwargs: Handle())
+    with pytest.raises(domain.DomainUnavailable, match="cleanup failed") as raised:
+        with domain.database_session("sample.exe"):
+            pass
+
+    assert isinstance(raised.value.__cause__, TypeError)
+
+def test_domain_database_session_normalizes_incompatible_exit_signature(
+    monkeypatch,
+):
+    from forge.api import domain
+
+    class Handle:
+        def __enter__(self):
+            return self
+
+        def __exit__(self):
+            return False
+
+    monkeypatch.setattr(domain, "open_database", lambda *args, **kwargs: Handle())
+    with pytest.raises(domain.DomainUnavailable, match="cleanup failed") as raised:
+        with domain.database_session("sample.exe"):
+            pass
+
+    assert isinstance(raised.value.__cause__, TypeError)
+
+def test_domain_database_session_normalizes_keyword_only_exit_signature(
+    monkeypatch,
+):
+    from forge.api import domain
+
+    class Handle:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *, exc_type, exc, tb):
+            return False
+
+    monkeypatch.setattr(domain, "open_database", lambda *args, **kwargs: Handle())
+    with pytest.raises(domain.DomainUnavailable, match="cleanup failed") as raised:
+        with domain.database_session("sample.exe"):
+            pass
+
+    assert isinstance(raised.value.__cause__, TypeError)
+
+def test_domain_database_session_delivers_variadic_exit_arguments(monkeypatch):
+    from forge.api import domain
+
+    body_error = ValueError("body failure")
+    seen = []
+
+    class Handle:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            seen.append(args)
+            return False
+
+    monkeypatch.setattr(domain, "open_database", lambda *args, **kwargs: Handle())
+    with pytest.raises(ValueError) as raised:
+        with domain.database_session("sample.exe"):
+            raise body_error
+
+    assert raised.value is body_error
+    assert seen[0][0] is ValueError
+    assert seen[0][1] is body_error
+    assert seen[0][2] is not None
+
+def test_domain_database_session_allows_exit_traceback_mutation(monkeypatch):
+    from forge.api import domain
+
+    body_error = ValueError("body failure")
+    seen = []
+
+    class Handle:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            seen.append(tb)
+            assert tb is not None
+            tb.tb_next = None
+            return False
+
+    monkeypatch.setattr(domain, "open_database", lambda *args, **kwargs: Handle())
+    with pytest.raises(ValueError) as raised:
+        with domain.database_session("sample.exe"):
+            raise body_error
+
+    assert raised.value is body_error
+    assert len(seen) == 1
+
+def test_domain_database_session_preserves_sys_exception_state(monkeypatch):
+    from forge.api import domain
+
+    import sys
+
+    body_error = ValueError("body failure")
+    seen = []
+
+    class Handle:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            seen.append((exc_type, exc, tb, sys.exc_info()))
+            return False
+
+    monkeypatch.setattr(domain, "open_database", lambda *args, **kwargs: Handle())
+    with pytest.raises(ValueError) as raised:
+        with domain.database_session("sample.exe"):
+            raise body_error
+
+    assert raised.value is body_error
+    exc_type, exc, tb, state = seen[0]
+    assert state == (exc_type, exc, tb)
+
+def test_domain_database_session_preserves_empty_success_exception_state(
+    monkeypatch,
+):
+    from forge.api import domain
+
+    import sys
+
+    seen = []
+
+    class Handle:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            seen.append(((exc_type, exc, tb), sys.exc_info()))
+            return False
+
+    monkeypatch.setattr(domain, "open_database", lambda *args, **kwargs: Handle())
+    with domain.database_session("sample.exe"):
+        pass
+
+    assert seen == [((None, None, None), (None, None, None))]
+
+def test_domain_database_session_supports_self_returning_handle(monkeypatch):
+    from forge.api import domain
+
+    body_error = ValueError("suppressed")
+    handle_ref = []
+    exits = []
+
+    class Handle:
+        def __enter__(self):
+            handle_ref.append(self)
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            exits.append((exc_type, exc, tb))
+            return self
+
+    monkeypatch.setattr(domain, "open_database", lambda *args, **kwargs: Handle())
+    with domain.database_session("sample.exe") as active:
+        assert active is handle_ref[0]
+        raise body_error
+
+    assert len(exits) == 1
+    assert exits[0][1] is body_error
+
+def test_domain_database_session_yields_distinct_active_handle(monkeypatch):
+    from forge.api import domain
+
+    raw_handle = object()
+    active_handle = object()
+    events = []
+
+    class Handle:
+        def __enter__(self):
+            events.append("enter")
+            return active_handle
+
+        def __exit__(self, exc_type, exc, tb):
+            events.append(("exit", exc_type, exc, tb))
+            return False
+
+    handle = Handle()
+    monkeypatch.setattr(domain, "open_database", lambda *args, **kwargs: handle)
+    with domain.database_session("sample.exe") as active:
+        assert active is active_handle
+        assert active is not raw_handle
+
+    assert events == ["enter", ("exit", None, None, None)]
+
+def test_domain_database_session_delivers_active_body_exception_to_raw_handle(
+    monkeypatch,
+):
+    from forge.api import domain
+
+    body_error = ValueError("active body failure")
+    active = object()
+    seen = []
+
+    class Handle:
+        def __enter__(self):
+            return active
+
+        def __exit__(self, exc_type, exc, tb):
+            seen.append((exc_type, exc, tb))
+            return False
+
+    monkeypatch.setattr(domain, "open_database", lambda *args, **kwargs: Handle())
+    with pytest.raises(ValueError) as raised:
+        with domain.database_session("sample.exe") as yielded:
+            assert yielded is active
+            raise body_error
+
+    assert raised.value is body_error
+    assert seen[0][1] is body_error
+    assert seen[0][0] is ValueError
+    assert seen[0][2] is not None
+
+def test_domain_database_session_suppresses_distinct_active_exception(monkeypatch):
+    from forge.api import domain
+
+    body_error = ValueError("suppressed active failure")
+    active = object()
+    seen = []
+
+    class Handle:
+        def __enter__(self):
+            return active
+
+        def __exit__(self, exc_type, exc, tb):
+            seen.append((exc_type, exc, tb))
+            return True
+
+    monkeypatch.setattr(domain, "open_database", lambda *args, **kwargs: Handle())
+    with domain.database_session("sample.exe") as yielded:
+        assert yielded is active
+        raise body_error
+
+    assert len(seen) == 1
+    assert seen[0][1] is body_error
+
+def test_domain_database_session_distinct_cleanup_failure_overrides_body(
+    monkeypatch,
+):
+    from forge.api import domain
+
+    body_error = ValueError("active body failure")
+    cleanup_error = RuntimeError("raw cleanup failure")
+    active = object()
+    seen = []
+
+    class Handle:
+        def __enter__(self):
+            return active
+
+        def __exit__(self, exc_type, exc, tb):
+            seen.append((exc_type, exc, tb))
+            raise cleanup_error
+
+    monkeypatch.setattr(domain, "open_database", lambda *args, **kwargs: Handle())
+    with pytest.raises(domain.DomainUnavailable, match="cleanup failed") as raised:
+        with domain.database_session("sample.exe") as yielded:
+            assert yielded is active
+            raise body_error
+
+    assert raised.value.__cause__ is cleanup_error
+    assert seen[0][1] is body_error
+
+def test_domain_database_session_distinct_cleanup_preserves_context(monkeypatch):
+    from forge.api import domain
+
+    body_error = ValueError("active body failure")
+    cleanup_error = RuntimeError("raw cleanup failure")
+    active = object()
+    seen = []
+
+    class Handle:
+        def __enter__(self):
+            return active
+
+        def __exit__(self, exc_type, exc, tb):
+            seen.append((exc_type, exc, tb))
+            raise cleanup_error
+
+    monkeypatch.setattr(domain, "open_database", lambda *args, **kwargs: Handle())
+    with pytest.raises(domain.DomainUnavailable) as raised:
+        with domain.database_session("sample.exe") as yielded:
+            assert yielded is active
+            raise body_error
+
+    assert raised.value.__cause__ is cleanup_error
+    assert raised.value.__context__ is cleanup_error
+    assert seen[0][1] is body_error
+
+def test_domain_database_session_preserves_distinct_active_keyboard_interrupt(
+    monkeypatch,
+):
+    from forge.api import domain
+
+    cancellation = KeyboardInterrupt("active cancelled")
+    active = object()
+    seen = []
+
+    class Handle:
+        def __enter__(self):
+            return active
+
+        def __exit__(self, exc_type, exc, tb):
+            seen.append((exc_type, exc, tb))
+            return False
+
+    monkeypatch.setattr(domain, "open_database", lambda *args, **kwargs: Handle())
+    with pytest.raises(KeyboardInterrupt) as raised:
+        with domain.database_session("sample.exe") as yielded:
+            assert yielded is active
+            raise cancellation
+
+    assert raised.value is cancellation
+    assert seen[0][0] is KeyboardInterrupt
+    assert seen[0][1] is cancellation
+    assert seen[0][2] is not None
+
+def test_domain_database_session_distinct_cleanup_failure_overrides_cancellation(
+    monkeypatch,
+):
+    from forge.api import domain
+
+    cancellation = KeyboardInterrupt("active cancelled")
+    cleanup_error = RuntimeError("raw cleanup failure")
+    active = object()
+    seen = []
+
+    class Handle:
+        def __enter__(self):
+            return active
+
+        def __exit__(self, exc_type, exc, tb):
+            seen.append((exc_type, exc, tb))
+            raise cleanup_error
+
+    monkeypatch.setattr(domain, "open_database", lambda *args, **kwargs: Handle())
+    with pytest.raises(domain.DomainUnavailable, match="cleanup failed") as raised:
+        with domain.database_session("sample.exe") as yielded:
+            assert yielded is active
+            raise cancellation
+
+    assert raised.value.__cause__ is cleanup_error
+    assert seen[0][0] is KeyboardInterrupt
+    assert seen[0][1] is cancellation
+
+def test_domain_database_session_preserves_distinct_cleanup_keyboard_interrupt(
+    monkeypatch,
+):
+    from forge.api import domain
+
+    cleanup_error = KeyboardInterrupt("raw cleanup cancelled")
+    active = object()
+    seen = []
+
+    class Handle:
+        def __enter__(self):
+            return active
+
+        def __exit__(self, exc_type, exc, tb):
+            seen.append((exc_type, exc, tb))
+            raise cleanup_error
+
+    monkeypatch.setattr(domain, "open_database", lambda *args, **kwargs: Handle())
+    with pytest.raises(KeyboardInterrupt) as raised:
+        with domain.database_session("sample.exe") as yielded:
+            assert yielded is active
+
+    assert raised.value is cleanup_error
+    assert seen == [(None, None, None)]
+
+def test_domain_database_session_preserves_distinct_cleanup_system_exit(
+    monkeypatch,
+):
+    from forge.api import domain
+
+    cleanup_error = SystemExit(17)
+    active = object()
+    seen = []
+
+    class Handle:
+        def __enter__(self):
+            return active
+
+        def __exit__(self, exc_type, exc, tb):
+            seen.append((exc_type, exc, tb))
+            raise cleanup_error
+
+    monkeypatch.setattr(domain, "open_database", lambda *args, **kwargs: Handle())
+    with pytest.raises(SystemExit) as raised:
+        with domain.database_session("sample.exe") as yielded:
+            assert yielded is active
+
+    assert raised.value is cleanup_error
+    assert seen == [(None, None, None)]
+
+def test_domain_database_session_preserves_distinct_cleanup_generator_exit(
+    monkeypatch,
+):
+    from forge.api import domain
+
+    cleanup_error = GeneratorExit()
+    active = object()
+    seen = []
+
+    class Handle:
+        def __enter__(self):
+            return active
+
+        def __exit__(self, exc_type, exc, tb):
+            seen.append((exc_type, exc, tb))
+            raise cleanup_error
+
+    monkeypatch.setattr(domain, "open_database", lambda *args, **kwargs: Handle())
+    with pytest.raises(GeneratorExit) as raised:
+        with domain.database_session("sample.exe") as yielded:
+            assert yielded is active
+
+    assert raised.value is cleanup_error
+    assert seen == [(None, None, None)]
+
+def test_domain_database_session_suppresses_distinct_active_generator_exit(
+    monkeypatch,
+):
+    from forge.api import domain
+
+    cancellation = GeneratorExit()
+    active = object()
+    seen = []
+
+    class Handle:
+        def __enter__(self):
+            return active
+
+        def __exit__(self, exc_type, exc, tb):
+            seen.append((exc_type, exc, tb))
+            return True
+
+    monkeypatch.setattr(domain, "open_database", lambda *args, **kwargs: Handle())
+    with domain.database_session("sample.exe") as yielded:
+        assert yielded is active
+        raise cancellation
+
+    assert seen[0][0] is GeneratorExit
+    assert seen[0][1] is cancellation
+    assert seen[0][2] is not None
+
+def test_domain_database_session_suppresses_distinct_active_system_exit(
+    monkeypatch,
+):
+    from forge.api import domain
+
+    cancellation = SystemExit(17)
+    active = object()
+    seen = []
+
+    class Handle:
+        def __enter__(self):
+            return active
+
+        def __exit__(self, exc_type, exc, tb):
+            seen.append((exc_type, exc, tb))
+            return True
+
+    monkeypatch.setattr(domain, "open_database", lambda *args, **kwargs: Handle())
+    with domain.database_session("sample.exe") as yielded:
+        assert yielded is active
+        raise cancellation
+
+    assert seen[0][0] is SystemExit
+    assert seen[0][1] is cancellation
+    assert seen[0][2] is not None
+
+def test_domain_database_session_suppresses_distinct_active_keyboard_interrupt(
+    monkeypatch,
+):
+    from forge.api import domain
+
+    cancellation = KeyboardInterrupt("active cancelled")
+    active = object()
+    seen = []
+
+    class Handle:
+        def __enter__(self):
+            return active
+
+        def __exit__(self, exc_type, exc, tb):
+            seen.append((exc_type, exc, tb))
+            return True
+
+    monkeypatch.setattr(domain, "open_database", lambda *args, **kwargs: Handle())
+    with domain.database_session("sample.exe") as yielded:
+        assert yielded is active
+        raise cancellation
+
+    assert seen[0][0] is KeyboardInterrupt
+    assert seen[0][1] is cancellation
+    assert seen[0][2] is not None
+
+def test_domain_database_session_suppresses_distinct_active_body_exception(
+    monkeypatch,
+):
+    from forge.api import domain
+
+    body_error = ValueError("active body failure")
+    active = object()
+    seen = []
+
+    class Handle:
+        def __enter__(self):
+            return active
+
+        def __exit__(self, exc_type, exc, tb):
+            seen.append((exc_type, exc, tb))
+            return True
+
+    monkeypatch.setattr(domain, "open_database", lambda *args, **kwargs: Handle())
+    with domain.database_session("sample.exe") as yielded:
+        assert yielded is active
+        raise body_error
+
+    assert seen[0][0] is ValueError
+    assert seen[0][1] is body_error
+    assert seen[0][2] is not None
+
+def test_domain_database_session_suppresses_with_distinct_custom_truthy_result(
+    monkeypatch,
+):
+    from forge.api import domain
+
+    body_error = ValueError("active body failure")
+    active = object()
+    truthiness = []
+    seen = []
+
+    class Truthy:
+        def __bool__(self):
+            truthiness.append(True)
+            return True
+
+    class Handle:
+        def __enter__(self):
+            return active
+
+        def __exit__(self, exc_type, exc, tb):
+            seen.append((exc_type, exc, tb))
+            return Truthy()
+
+    monkeypatch.setattr(domain, "open_database", lambda *args, **kwargs: Handle())
+    with domain.database_session("sample.exe") as yielded:
+        assert yielded is active
+        raise body_error
+
+    assert truthiness == [True]
+    assert seen[0][0] is ValueError
+    assert seen[0][1] is body_error
+    assert seen[0][2] is not None
+
+def test_domain_database_session_reraises_with_distinct_custom_falsey_result(
+    monkeypatch,
+):
+    from forge.api import domain
+
+    body_error = ValueError("active body failure")
+    active = object()
+    truthiness = []
+    seen = []
+
+    class Falsey:
+        def __bool__(self):
+            truthiness.append(True)
+            return False
+
+    class Handle:
+        def __enter__(self):
+            return active
+
+        def __exit__(self, exc_type, exc, tb):
+            seen.append((exc_type, exc, tb))
+            return Falsey()
+
+    monkeypatch.setattr(domain, "open_database", lambda *args, **kwargs: Handle())
+    with pytest.raises(ValueError) as raised:
+        with domain.database_session("sample.exe") as yielded:
+            assert yielded is active
+            raise body_error
+
+    assert raised.value is body_error
+    assert truthiness == [True]
+    assert seen[0][0] is ValueError
+    assert seen[0][1] is body_error
+    assert seen[0][2] is not None
+
+def test_domain_database_session_truthiness_failure_overrides_distinct_body_error(
+    monkeypatch,
+):
+    from forge.api import domain
+
+    body_error = ValueError("active body failure")
+    truthiness_error = RuntimeError("truthiness failure")
+    active = object()
+    seen = []
+
+    class TruthinessFailure:
+        def __bool__(self):
+            raise truthiness_error
+
+    class Handle:
+        def __enter__(self):
+            return active
+
+        def __exit__(self, exc_type, exc, tb):
+            seen.append((exc_type, exc, tb))
+            return TruthinessFailure()
+
+    monkeypatch.setattr(domain, "open_database", lambda *args, **kwargs: Handle())
+    with pytest.raises(RuntimeError) as raised:
+        with domain.database_session("sample.exe") as yielded:
+            assert yielded is active
+            raise body_error
+
+    assert raised.value is truthiness_error
+    assert raised.value.__context__ is body_error
+    assert seen[0][0] is ValueError
+    assert seen[0][1] is body_error
+    assert seen[0][2] is not None
+
+def test_domain_database_session_ignores_distinct_success_cleanup_truthiness(
+    monkeypatch,
+):
+    from forge.api import domain
+
+    active = object()
+    truthiness = []
+    seen = []
+
+    class TruthinessFailure:
+        def __bool__(self):
+            truthiness.append(True)
+            raise RuntimeError("truthiness must not run")
+
+    class Handle:
+        def __enter__(self):
+            return active
+
+        def __exit__(self, exc_type, exc, tb):
+            seen.append((exc_type, exc, tb))
+            return TruthinessFailure()
+
+    monkeypatch.setattr(domain, "open_database", lambda *args, **kwargs: Handle())
+    with domain.database_session("sample.exe") as yielded:
+        assert yielded is active
+
+    assert truthiness == []
+    assert seen == [(None, None, None)]
+
+def test_domain_database_session_preserves_distinct_success_cleanup_keyboard_interrupt(
+    monkeypatch,
+):
+    from forge.api import domain
+
+    cleanup_error = KeyboardInterrupt("raw cleanup cancelled")
+    active = object()
+    seen = []
+
+    class Handle:
+        def __enter__(self):
+            return active
+
+        def __exit__(self, exc_type, exc, tb):
+            seen.append((exc_type, exc, tb))
+            raise cleanup_error
+
+    monkeypatch.setattr(domain, "open_database", lambda *args, **kwargs: Handle())
+    with pytest.raises(KeyboardInterrupt) as raised:
+        with domain.database_session("sample.exe") as yielded:
+            assert yielded is active
+
+    assert raised.value is cleanup_error
+    assert seen == [(None, None, None)]
+
+def test_domain_database_session_preserves_distinct_success_cleanup_system_exit(
+    monkeypatch,
+):
+    from forge.api import domain
+
+    cleanup_error = SystemExit(17)
+    active = object()
+    seen = []
+
+    class Handle:
+        def __enter__(self):
+            return active
+
+        def __exit__(self, exc_type, exc, tb):
+            seen.append((exc_type, exc, tb))
+            raise cleanup_error
+
+    monkeypatch.setattr(domain, "open_database", lambda *args, **kwargs: Handle())
+    with pytest.raises(SystemExit) as raised:
+        with domain.database_session("sample.exe") as yielded:
+            assert yielded is active
+
+    assert raised.value is cleanup_error
+    assert seen == [(None, None, None)]
+
+def test_domain_database_session_preserves_distinct_success_cleanup_generator_exit(
+    monkeypatch,
+):
+    from forge.api import domain
+
+    cleanup_error = GeneratorExit()
+    active = object()
+    seen = []
+
+    class Handle:
+        def __enter__(self):
+            return active
+
+        def __exit__(self, exc_type, exc, tb):
+            seen.append((exc_type, exc, tb))
+            raise cleanup_error
+
+    monkeypatch.setattr(domain, "open_database", lambda *args, **kwargs: Handle())
+    with pytest.raises(GeneratorExit) as raised:
+        with domain.database_session("sample.exe") as yielded:
+            assert yielded is active
+
+    assert raised.value is cleanup_error
+    assert seen == [(None, None, None)]
+
+def test_domain_database_session_distinct_success_cleanup_error_normalizes(
+    monkeypatch,
+):
+    from forge.api import domain
+
+    cleanup_error = ValueError("raw cleanup failure")
+    active = object()
+    seen = []
+
+    class Handle:
+        def __enter__(self):
+            return active
+
+        def __exit__(self, exc_type, exc, tb):
+            seen.append((exc_type, exc, tb))
+            raise cleanup_error
+
+    monkeypatch.setattr(domain, "open_database", lambda *args, **kwargs: Handle())
+    with pytest.raises(domain.DomainUnavailable, match="cleanup failed") as raised:
+        with domain.database_session("sample.exe") as yielded:
+            assert yielded is active
+
+    assert raised.value.__cause__ is cleanup_error
+    assert seen == [(None, None, None)]
+
+def test_domain_database_session_distinct_success_cleanup_oserror_normalizes(
+    monkeypatch,
+):
+    from forge.api import domain
+
+    cleanup_error = OSError("raw cleanup failure")
+    active = object()
+    seen = []
+
+    class Handle:
+        def __enter__(self):
+            return active
+
+        def __exit__(self, exc_type, exc, tb):
+            seen.append((exc_type, exc, tb))
+            raise cleanup_error
+
+    monkeypatch.setattr(domain, "open_database", lambda *args, **kwargs: Handle())
+    with pytest.raises(domain.DomainUnavailable, match="cleanup failed") as raised:
+        with domain.database_session("sample.exe") as yielded:
+            assert yielded is active
+
+    assert raised.value.__cause__ is cleanup_error
+    assert seen == [(None, None, None)]
+
+def test_domain_database_session_distinct_success_cleanup_typeerror_normalizes(
+    monkeypatch,
+):
+    from forge.api import domain
+
+    cleanup_error = TypeError("raw cleanup failure")
+    active = object()
+    seen = []
+
+    class Handle:
+        def __enter__(self):
+            return active
+
+        def __exit__(self, exc_type, exc, tb):
+            seen.append((exc_type, exc, tb))
+            raise cleanup_error
+
+    monkeypatch.setattr(domain, "open_database", lambda *args, **kwargs: Handle())
+    with pytest.raises(domain.DomainUnavailable, match="cleanup failed") as raised:
+        with domain.database_session("sample.exe") as yielded:
+            assert yielded is active
+
+    assert raised.value.__cause__ is cleanup_error
+    assert seen == [(None, None, None)]
+
+def test_domain_database_session_distinct_success_cleanup_runtimeerror_normalizes(
+    monkeypatch,
+):
+    from forge.api import domain
+
+    cleanup_error = RuntimeError("raw cleanup failure")
+    active = object()
+    seen = []
+
+    class Handle:
+        def __enter__(self):
+            return active
+
+        def __exit__(self, exc_type, exc, tb):
+            seen.append((exc_type, exc, tb))
+            raise cleanup_error
+
+    monkeypatch.setattr(domain, "open_database", lambda *args, **kwargs: Handle())
+    with pytest.raises(domain.DomainUnavailable, match="cleanup failed") as raised:
+        with domain.database_session("sample.exe") as yielded:
+            assert yielded is active
+
+    assert raised.value.__cause__ is cleanup_error
+    assert seen == [(None, None, None)]
+
+def test_domain_database_session_distinct_success_cleanup_attributeerror_normalizes(
+    monkeypatch,
+):
+    from forge.api import domain
+
+    cleanup_error = AttributeError("raw cleanup failure")
+    active = object()
+    seen = []
+
+    class Handle:
+        def __enter__(self):
+            return active
+
+        def __exit__(self, exc_type, exc, tb):
+            seen.append((exc_type, exc, tb))
+            raise cleanup_error
+
+    monkeypatch.setattr(domain, "open_database", lambda *args, **kwargs: Handle())
+    with pytest.raises(domain.DomainUnavailable, match="cleanup failed") as raised:
+        with domain.database_session("sample.exe") as yielded:
+            assert yielded is active
+
+    assert raised.value.__cause__ is cleanup_error
+    assert seen == [(None, None, None)]
+
+def test_domain_database_session_distinct_success_cleanup_valueerror_normalizes(
+    monkeypatch,
+):
+    from forge.api import domain
+
+    cleanup_error = ValueError("raw cleanup failure")
+    active = object()
+    seen = []
+
+    class Handle:
+        def __enter__(self):
+            return active
+
+        def __exit__(self, exc_type, exc, tb):
+            seen.append((exc_type, exc, tb))
+            raise cleanup_error
+
+    monkeypatch.setattr(domain, "open_database", lambda *args, **kwargs: Handle())
+    with pytest.raises(domain.DomainUnavailable, match="cleanup failed") as raised:
+        with domain.database_session("sample.exe") as yielded:
+            assert yielded is active
+
+    assert raised.value.__cause__ is cleanup_error
+    assert seen == [(None, None, None)]
+
+def test_domain_database_session_distinct_success_cleanup_keyboard_interrupt_context(
+    monkeypatch,
+):
+    from forge.api import domain
+
+    cleanup_error = KeyboardInterrupt("raw cleanup cancelled")
+    active = object()
+    seen = []
+
+    class Handle:
+        def __enter__(self):
+            return active
+
+        def __exit__(self, exc_type, exc, tb):
+            seen.append((exc_type, exc, tb))
+            raise cleanup_error
+
+    monkeypatch.setattr(domain, "open_database", lambda *args, **kwargs: Handle())
+    with pytest.raises(KeyboardInterrupt) as raised:
+        with domain.database_session("sample.exe") as yielded:
+            assert yielded is active
+
+    assert raised.value is cleanup_error
+    assert raised.value.__context__ is None
+    assert seen == [(None, None, None)]
+
+def test_domain_database_session_distinct_success_cleanup_system_exit_context(
+    monkeypatch,
+):
+    from forge.api import domain
+
+    cleanup_error = SystemExit(17)
+    active = object()
+    seen = []
+
+    class Handle:
+        def __enter__(self):
+            return active
+
+        def __exit__(self, exc_type, exc, tb):
+            seen.append((exc_type, exc, tb))
+            raise cleanup_error
+
+    monkeypatch.setattr(domain, "open_database", lambda *args, **kwargs: Handle())
+    with pytest.raises(SystemExit) as raised:
+        with domain.database_session("sample.exe") as yielded:
+            assert yielded is active
+
+    assert raised.value is cleanup_error
+    assert raised.value.__context__ is None
+    assert seen == [(None, None, None)]
+
+def test_domain_database_session_distinct_success_cleanup_generator_exit_context(
+    monkeypatch,
+):
+    from forge.api import domain
+
+    cleanup_error = GeneratorExit()
+    active = object()
+    seen = []
+
+    class Handle:
+        def __enter__(self):
+            return active
+
+        def __exit__(self, exc_type, exc, tb):
+            seen.append((exc_type, exc, tb))
+            raise cleanup_error
+
+    monkeypatch.setattr(domain, "open_database", lambda *args, **kwargs: Handle())
+    with pytest.raises(GeneratorExit) as raised:
+        with domain.database_session("sample.exe") as yielded:
+            assert yielded is active
+
+    assert raised.value is cleanup_error
+    assert raised.value.__context__ is None
+    assert seen == [(None, None, None)]
+
+def test_domain_database_session_distinct_success_cleanup_error_preserves_context(
+    monkeypatch,
+):
+    from forge.api import domain
+
+    cleanup_error = ValueError("raw cleanup failure")
+    active = object()
+    seen = []
+
+    class Handle:
+        def __enter__(self):
+            return active
+
+        def __exit__(self, exc_type, exc, tb):
+            seen.append((exc_type, exc, tb))
+            raise cleanup_error
+
+    monkeypatch.setattr(domain, "open_database", lambda *args, **kwargs: Handle())
+    with pytest.raises(domain.DomainUnavailable, match="cleanup failed") as raised:
+        with domain.database_session("sample.exe") as yielded:
+            assert yielded is active
+
+    assert raised.value.__cause__ is cleanup_error
+    assert raised.value.__context__ is cleanup_error
+    assert seen == [(None, None, None)]
+
+def test_domain_database_session_distinct_success_cleanup_oserror_preserves_context(
+    monkeypatch,
+):
+    from forge.api import domain
+
+    cleanup_error = OSError("raw cleanup failure")
+    active = object()
+    seen = []
+
+    class Handle:
+        def __enter__(self):
+            return active
+
+        def __exit__(self, exc_type, exc, tb):
+            seen.append((exc_type, exc, tb))
+            raise cleanup_error
+
+    monkeypatch.setattr(domain, "open_database", lambda *args, **kwargs: Handle())
+    with pytest.raises(domain.DomainUnavailable, match="cleanup failed") as raised:
+        with domain.database_session("sample.exe") as yielded:
+            assert yielded is active
+
+    assert raised.value.__cause__ is cleanup_error
+    assert raised.value.__context__ is cleanup_error
+    assert seen == [(None, None, None)]
+
+def test_domain_database_session_distinct_success_cleanup_typeerror_preserves_context(
+    monkeypatch,
+):
+    from forge.api import domain
+
+    cleanup_error = TypeError("raw cleanup failure")
+    active = object()
+    seen = []
+
+    class Handle:
+        def __enter__(self):
+            return active
+
+        def __exit__(self, exc_type, exc, tb):
+            seen.append((exc_type, exc, tb))
+            raise cleanup_error
+
+    monkeypatch.setattr(domain, "open_database", lambda *args, **kwargs: Handle())
+    with pytest.raises(domain.DomainUnavailable, match="cleanup failed") as raised:
+        with domain.database_session("sample.exe") as yielded:
+            assert yielded is active
+
+    assert raised.value.__cause__ is cleanup_error
+    assert raised.value.__context__ is cleanup_error
+    assert seen == [(None, None, None)]
+
+def test_domain_database_session_distinct_success_cleanup_runtimeerror_preserves_context(
+    monkeypatch,
+):
+    from forge.api import domain
+
+    cleanup_error = RuntimeError("raw cleanup failure")
+    active = object()
+    seen = []
+
+    class Handle:
+        def __enter__(self):
+            return active
+
+        def __exit__(self, exc_type, exc, tb):
+            seen.append((exc_type, exc, tb))
+            raise cleanup_error
+
+    monkeypatch.setattr(domain, "open_database", lambda *args, **kwargs: Handle())
+    with pytest.raises(domain.DomainUnavailable, match="cleanup failed") as raised:
+        with domain.database_session("sample.exe") as yielded:
+            assert yielded is active
+
+    assert raised.value.__cause__ is cleanup_error
+    assert raised.value.__context__ is cleanup_error
+    assert seen == [(None, None, None)]
+
+def test_domain_database_session_distinct_success_cleanup_attributeerror_preserves_context(
+    monkeypatch,
+):
+    from forge.api import domain
+
+    cleanup_error = AttributeError("raw cleanup failure")
+    active = object()
+    seen = []
+
+    class Handle:
+        def __enter__(self):
+            return active
+
+        def __exit__(self, exc_type, exc, tb):
+            seen.append((exc_type, exc, tb))
+            raise cleanup_error
+
+    monkeypatch.setattr(domain, "open_database", lambda *args, **kwargs: Handle())
+    with pytest.raises(domain.DomainUnavailable, match="cleanup failed") as raised:
+        with domain.database_session("sample.exe") as yielded:
+            assert yielded is active
+
+    assert raised.value.__cause__ is cleanup_error
+    assert raised.value.__context__ is cleanup_error
+    assert seen == [(None, None, None)]
+
+def test_domain_database_session_distinct_success_cleanup_valueerror_preserves_context(
+    monkeypatch,
+):
+    from forge.api import domain
+
+    cleanup_error = ValueError("raw cleanup failure")
+    active = object()
+    seen = []
+
+    class Handle:
+        def __enter__(self):
+            return active
+
+        def __exit__(self, exc_type, exc, tb):
+            seen.append((exc_type, exc, tb))
+            raise cleanup_error
+
+    monkeypatch.setattr(domain, "open_database", lambda *args, **kwargs: Handle())
+    with pytest.raises(domain.DomainUnavailable, match="cleanup failed") as raised:
+        with domain.database_session("sample.exe") as yielded:
+            assert yielded is active
+
+    assert raised.value.__cause__ is cleanup_error
+    assert raised.value.__context__ is cleanup_error
+    assert seen == [(None, None, None)]
+
+def test_domain_database_session_distinct_success_cleanup_keyboard_interrupt_cause(
+    monkeypatch,
+):
+    from forge.api import domain
+
+    cleanup_error = KeyboardInterrupt("raw cleanup cancelled")
+    active = object()
+    seen = []
+
+    class Handle:
+        def __enter__(self):
+            return active
+
+        def __exit__(self, exc_type, exc, tb):
+            seen.append((exc_type, exc, tb))
+            raise cleanup_error
+
+    monkeypatch.setattr(domain, "open_database", lambda *args, **kwargs: Handle())
+    with pytest.raises(KeyboardInterrupt) as raised:
+        with domain.database_session("sample.exe") as yielded:
+            assert yielded is active
+
+    assert raised.value is cleanup_error
+    assert raised.value.__cause__ is None
+    assert raised.value.__context__ is None
+    assert seen == [(None, None, None)]
+
+def test_domain_database_session_distinct_success_cleanup_system_exit_cause(
+    monkeypatch,
+):
+    from forge.api import domain
+
+    cleanup_error = SystemExit("raw cleanup exited")
+    active = object()
+    seen = []
+
+    class Handle:
+        def __enter__(self):
+            return active
+
+        def __exit__(self, exc_type, exc, tb):
+            seen.append((exc_type, exc, tb))
+            raise cleanup_error
+
+    monkeypatch.setattr(domain, "open_database", lambda *args, **kwargs: Handle())
+    with pytest.raises(SystemExit) as raised:
+        with domain.database_session("sample.exe") as yielded:
+            assert yielded is active
+
+    assert raised.value is cleanup_error
+    assert raised.value.__cause__ is None
+    assert raised.value.__context__ is None
+    assert seen == [(None, None, None)]
+
+def test_domain_database_session_distinct_success_cleanup_generator_exit_cause(
+    monkeypatch,
+):
+    from forge.api import domain
+
+    cleanup_error = GeneratorExit()
+    active = object()
+    seen = []
+
+    class Handle:
+        def __enter__(self):
+            return active
+
+        def __exit__(self, exc_type, exc, tb):
+            seen.append((exc_type, exc, tb))
+            raise cleanup_error
+
+    monkeypatch.setattr(domain, "open_database", lambda *args, **kwargs: Handle())
+    with pytest.raises(GeneratorExit) as raised:
+        with domain.database_session("sample.exe") as yielded:
+            assert yielded is active
+
+    assert raised.value is cleanup_error
+    assert raised.value.__cause__ is None
+    assert raised.value.__context__ is None
+    assert seen == [(None, None, None)]
+
+def test_domain_database_session_distinct_success_cleanup_oserror_preserves_context(
+    monkeypatch,
+):
+    from forge.api import domain
+
+    cleanup_error = OSError("raw cleanup failure")
+    active = object()
+    seen = []
+
+    class Handle:
+        def __enter__(self):
+            return active
+
+        def __exit__(self, exc_type, exc, tb):
+            seen.append((exc_type, exc, tb))
+            raise cleanup_error
+
+    monkeypatch.setattr(domain, "open_database", lambda *args, **kwargs: Handle())
+    with pytest.raises(domain.DomainUnavailable, match="cleanup failed") as raised:
+        with domain.database_session("sample.exe") as yielded:
+            assert yielded is active
+
+    assert raised.value.__cause__ is cleanup_error
+    assert raised.value.__context__ is cleanup_error
+    assert seen == [(None, None, None)]
+
+def test_domain_database_session_distinct_success_cleanup_domainunavailable_identity(
+    monkeypatch,
+):
+    from forge.api import domain
+
+    cleanup_error = domain.DomainUnavailable("raw cleanup unavailable")
+    active = object()
+    seen = []
+
+    class Handle:
+        def __enter__(self):
+            return active
+
+        def __exit__(self, exc_type, exc, tb):
+            seen.append((exc_type, exc, tb))
+            raise cleanup_error
+
+    monkeypatch.setattr(domain, "open_database", lambda *args, **kwargs: Handle())
+    with pytest.raises(domain.DomainUnavailable, match="cleanup failed") as raised:
+        with domain.database_session("sample.exe") as yielded:
+            assert yielded is active
+
+    assert raised.value is not cleanup_error
+    assert raised.value.__cause__ is cleanup_error
+    assert raised.value.__context__ is cleanup_error
+    assert seen == [(None, None, None)]
+
+def test_domain_database_session_distinct_success_cleanup_domainunavailable_subclass(
+    monkeypatch,
+):
+    from forge.api import domain
+
+    class SpecificUnavailable(domain.DomainUnavailable):
+        pass
+
+    cleanup_error = SpecificUnavailable("specific cleanup unavailable")
+    active = object()
+    seen = []
+
+    class Handle:
+        def __enter__(self):
+            return active
+
+        def __exit__(self, exc_type, exc, tb):
+            seen.append((exc_type, exc, tb))
+            raise cleanup_error
+
+    monkeypatch.setattr(domain, "open_database", lambda *args, **kwargs: Handle())
+    with pytest.raises(domain.DomainUnavailable, match="cleanup failed") as raised:
+        with domain.database_session("sample.exe") as yielded:
+            assert yielded is active
+
+    assert type(raised.value) is domain.DomainUnavailable
+    assert raised.value.__cause__ is cleanup_error
+    assert raised.value.__context__ is cleanup_error
+    assert isinstance(raised.value.__cause__, SpecificUnavailable)
+    assert seen == [(None, None, None)]
+
+def test_domain_database_session_cleanup_domainunavailable_subclass_message_isolated(
+    monkeypatch,
+):
+    from forge.api import domain
+
+    class SpecificUnavailable(domain.DomainUnavailable):
+        pass
+
+    cleanup_error = SpecificUnavailable("private cleanup detail")
+    active = object()
+    seen = []
+
+    class Handle:
+        def __enter__(self):
+            return active
+
+        def __exit__(self, exc_type, exc, tb):
+            seen.append((exc_type, exc, tb))
+            raise cleanup_error
+
+    monkeypatch.setattr(domain, "open_database", lambda *args, **kwargs: Handle())
+    with pytest.raises(domain.DomainUnavailable) as raised:
+        with domain.database_session("sample.exe") as yielded:
+            assert yielded is active
+
+    assert str(raised.value) == (
+        "ida-domain database session cleanup failed for sample.exe"
+    )
+    assert "private cleanup detail" not in str(raised.value)
+    assert raised.value.__cause__ is cleanup_error
+    assert raised.value.__context__ is cleanup_error
+    assert seen == [(None, None, None)]
+
+def test_domain_database_session_cleanup_domainunavailable_subclass_traceback(
+    monkeypatch,
+):
+    from forge.api import domain
+
+    class SpecificUnavailable(domain.DomainUnavailable):
+        pass
+
+    cleanup_error = SpecificUnavailable("private cleanup detail")
+    active = object()
+    seen = []
+
+    class Handle:
+        def __enter__(self):
+            return active
+
+        def __exit__(self, exc_type, exc, tb):
+            seen.append((exc_type, exc, tb))
+            raise cleanup_error
+
+    monkeypatch.setattr(domain, "open_database", lambda *args, **kwargs: Handle())
+    with pytest.raises(domain.DomainUnavailable) as raised:
+        with domain.database_session("sample.exe") as yielded:
+            assert yielded is active
+
+    assert str(raised.value) == (
+        "ida-domain database session cleanup failed for sample.exe"
+    )
+    assert raised.value.__cause__ is cleanup_error
+    assert raised.value.__cause__.__traceback__ is not None
+    assert raised.value.__context__ is cleanup_error
+    assert seen == [(None, None, None)]
+
+def test_domain_database_session_setup_attributeerror_preserves_context(
+    monkeypatch,
+):
+    from forge.api import domain
+
+    setup_error = AttributeError("raw enter failure")
+    events = []
+
+    class Handle:
+        def __enter__(self):
+            events.append("enter")
+            raise setup_error
+
+        def __exit__(self, exc_type, exc, tb):
+            events.append("exit")
+
+    monkeypatch.setattr(domain, "open_database", lambda *args, **kwargs: Handle())
+    with pytest.raises(domain.DomainUnavailable, match="setup failed") as raised:
+        with domain.database_session("sample.exe"):
+            raise AssertionError("body must not execute")
+
+    assert raised.value.__cause__ is setup_error
+    assert raised.value.__context__ is setup_error
+    assert events == ["enter"]
+
+def test_domain_database_session_setup_runtimeerror_preserves_context(
+    monkeypatch,
+):
+    from forge.api import domain
+
+    setup_error = RuntimeError("raw enter failure")
+    events = []
+
+    class Handle:
+        def __enter__(self):
+            events.append("enter")
+            raise setup_error
+
+        def __exit__(self, exc_type, exc, tb):
+            events.append("exit")
+
+    monkeypatch.setattr(domain, "open_database", lambda *args, **kwargs: Handle())
+    with pytest.raises(domain.DomainUnavailable, match="setup failed") as raised:
+        with domain.database_session("sample.exe"):
+            raise AssertionError("body must not execute")
+
+    assert raised.value.__cause__ is setup_error
+    assert raised.value.__context__ is setup_error
+    assert events == ["enter"]
+    from forge.api import domain
+
+
+def test_domain_database_session_setup_typeerror_preserves_context(
+    monkeypatch,
+):
+    from forge.api import domain
+
+    setup_error = TypeError("raw enter failure")
+    events = []
+
+    class Handle:
+        def __enter__(self):
+            events.append("enter")
+            raise setup_error
+
+        def __exit__(self, exc_type, exc, tb):
+            events.append("exit")
+
+    monkeypatch.setattr(domain, "open_database", lambda *args, **kwargs: Handle())
+    with pytest.raises(domain.DomainUnavailable, match="setup failed") as raised:
+        with domain.database_session("sample.exe"):
+            raise AssertionError("body must not execute")
+
+    assert raised.value.__cause__ is setup_error
+    assert raised.value.__context__ is setup_error
+    assert events == ["enter"]
+
+def test_domain_database_session_setup_valueerror_preserves_context(
+    monkeypatch,
+):
+    from forge.api import domain
+
+    setup_error = ValueError("raw enter failure")
+    events = []
+
+    class Handle:
+        def __enter__(self):
+            events.append("enter")
+            raise setup_error
+
+        def __exit__(self, exc_type, exc, tb):
+            events.append("exit")
+
+    monkeypatch.setattr(domain, "open_database", lambda *args, **kwargs: Handle())
+    with pytest.raises(domain.DomainUnavailable, match="setup failed") as raised:
+        with domain.database_session("sample.exe"):
+            raise AssertionError("body must not execute")
+
+    assert raised.value.__cause__ is setup_error
+    assert raised.value.__context__ is setup_error
+    assert events == ["enter"]
+
+def test_domain_database_session_setup_oserror_preserves_context(
+    monkeypatch,
+):
+    from forge.api import domain
+
+    setup_error = OSError("raw enter failure")
+    events = []
+
+    class Handle:
+        def __enter__(self):
+            events.append("enter")
+            raise setup_error
+
+        def __exit__(self, exc_type, exc, tb):
+            events.append("exit")
+
+    monkeypatch.setattr(domain, "open_database", lambda *args, **kwargs: Handle())
+    with pytest.raises(domain.DomainUnavailable, match="setup failed") as raised:
+        with domain.database_session("sample.exe"):
+            raise AssertionError("body must not execute")
+
+    assert raised.value.__cause__ is setup_error
+    assert raised.value.__context__ is setup_error
+    assert events == ["enter"]
+
+def test_domain_database_session_setup_domainunavailable_preserves_context(
+    monkeypatch,
+):
+    from forge.api import domain
+
+    setup_error = domain.DomainUnavailable("raw enter unavailable")
+    events = []
+
+    class Handle:
+        def __enter__(self):
+            events.append("enter")
+            raise setup_error
+
+        def __exit__(self, exc_type, exc, tb):
+            events.append("exit")
+
+    monkeypatch.setattr(domain, "open_database", lambda *args, **kwargs: Handle())
+    with pytest.raises(domain.DomainUnavailable, match="setup failed") as raised:
+        with domain.database_session("sample.exe"):
+            raise AssertionError("body must not execute")
+
+    assert raised.value is not setup_error
+    assert raised.value.__cause__ is setup_error
+    assert raised.value.__context__ is setup_error
+    assert events == ["enter"]
+
+def test_domain_database_session_setup_keyboard_interrupt_preserves_identity(
+    monkeypatch,
+):
+    from forge.api import domain
+
+    setup_error = KeyboardInterrupt("raw enter cancelled")
+    events = []
+
+    class Handle:
+        def __enter__(self):
+            events.append("enter")
+            raise setup_error
+
+        def __exit__(self, exc_type, exc, tb):
+            events.append("exit")
+
+    monkeypatch.setattr(domain, "open_database", lambda *args, **kwargs: Handle())
+    with pytest.raises(KeyboardInterrupt) as raised:
+        with domain.database_session("sample.exe"):
+            raise AssertionError("body must not execute")
+
+    assert raised.value is setup_error
+    assert raised.value.__cause__ is None
+    assert raised.value.__context__ is None
+    assert events == ["enter"]
+
+def test_domain_database_session_setup_system_exit_preserves_identity(
+    monkeypatch,
+):
+    from forge.api import domain
+
+    setup_error = SystemExit("raw enter exited")
+    events = []
+
+    class Handle:
+        def __enter__(self):
+            events.append("enter")
+            raise setup_error
+
+        def __exit__(self, exc_type, exc, tb):
+            events.append("exit")
+
+    monkeypatch.setattr(domain, "open_database", lambda *args, **kwargs: Handle())
+    with pytest.raises(SystemExit) as raised:
+        with domain.database_session("sample.exe"):
+            raise AssertionError("body must not execute")
+
+    assert raised.value is setup_error
+    assert raised.value.__cause__ is None
+    assert raised.value.__context__ is None
+    assert events == ["enter"]
+
+def test_domain_database_session_setup_generator_exit_preserves_identity(
+    monkeypatch,
+):
+    from forge.api import domain
+
+    setup_error = GeneratorExit()
+    events = []
+
+    class Handle:
+        def __enter__(self):
+            events.append("enter")
+            raise setup_error
+
+        def __exit__(self, exc_type, exc, tb):
+            events.append("exit")
+
+    monkeypatch.setattr(domain, "open_database", lambda *args, **kwargs: Handle())
+    with pytest.raises(GeneratorExit) as raised:
+        with domain.database_session("sample.exe"):
+            raise AssertionError("body must not execute")
+
+    assert raised.value is setup_error
+    assert raised.value.__cause__ is None
+    assert raised.value.__context__ is None
+    assert events == ["enter"]
+    cleanup_error = KeyboardInterrupt("cleanup cancelled")
+    events = []
+
+    class Handle:
+        def __enter__(self):
+            events.append("enter")
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            events.append("exit")
+            raise cleanup_error
+
+    monkeypatch.setattr(domain, "open_database", lambda *args, **kwargs: Handle())
+    with pytest.raises(KeyboardInterrupt) as raised:
+        with domain.database_session("sample.exe"):
+            pass
+
+    assert raised.value is cleanup_error
+    assert events == ["enter", "exit"]
+
+def test_domain_database_session_body_keyboard_interrupt_truthy_suppresses(
+    monkeypatch,
+):
+    from forge.api import domain
+
+    body_error = KeyboardInterrupt("body cancelled")
+    events = []
+
+    class Handle:
+        def __enter__(self):
+            return object()
+
+        def __exit__(self, exc_type, exc, tb):
+            events.append((exc_type, exc, tb))
+            return True
+
+    monkeypatch.setattr(domain, "open_database", lambda *args, **kwargs: Handle())
+    with domain.database_session("sample.exe"):
+        raise body_error
+
+    assert events[0][0] is KeyboardInterrupt
+    assert events[0][1] is body_error
+    assert events[0][2] is not None
+
+def test_domain_database_session_body_system_exit_truthy_suppresses(
+    monkeypatch,
+):
+    from forge.api import domain
+
+    body_error = SystemExit("body exited")
+    events = []
+
+    class Handle:
+        def __enter__(self):
+            return object()
+
+        def __exit__(self, exc_type, exc, tb):
+            events.append((exc_type, exc, tb))
+            return True
+
+    monkeypatch.setattr(domain, "open_database", lambda *args, **kwargs: Handle())
+    with domain.database_session("sample.exe"):
+        raise body_error
+
+    assert events[0][0] is SystemExit
+    assert events[0][1] is body_error
+    assert events[0][2] is not None
+
+def test_domain_database_session_body_generator_exit_truthy_suppresses(
+    monkeypatch,
+):
+    from forge.api import domain
+
+    body_error = GeneratorExit()
+    events = []
+
+    class Handle:
+        def __enter__(self):
+            return object()
+
+        def __exit__(self, exc_type, exc, tb):
+            events.append((exc_type, exc, tb))
+            return True
+
+    monkeypatch.setattr(domain, "open_database", lambda *args, **kwargs: Handle())
+    with domain.database_session("sample.exe"):
+        raise body_error
+
+    assert events[0][0] is GeneratorExit
+    assert events[0][1] is body_error
+    assert events[0][2] is not None
+
+def test_domain_database_session_body_domainunavailable_truthy_suppresses(
+    monkeypatch,
+):
+    from forge.api import domain
+
+    body_error = domain.DomainUnavailable("body unavailable")
+    events = []
+
+    class Handle:
+        def __enter__(self):
+            return object()
+
+        def __exit__(self, exc_type, exc, tb):
+            events.append((exc_type, exc, tb))
+            return True
+
+    monkeypatch.setattr(domain, "open_database", lambda *args, **kwargs: Handle())
+    with domain.database_session("sample.exe"):
+        raise body_error
+
+    assert events[0][0] is domain.DomainUnavailable
+    assert events[0][1] is body_error
+    assert events[0][2] is not None
+
+def test_domain_database_session_body_domainunavailable_subclass_truthy_suppresses(
+    monkeypatch,
+):
+    from forge.api import domain
+
+    class SpecificUnavailable(domain.DomainUnavailable):
+        pass
+
+    body_error = SpecificUnavailable("body unavailable")
+    events = []
+
+    class Handle:
+        def __enter__(self):
+            return object()
+
+        def __exit__(self, exc_type, exc, tb):
+            events.append((exc_type, exc, tb))
+            return True
+
+    monkeypatch.setattr(domain, "open_database", lambda *args, **kwargs: Handle())
+    with domain.database_session("sample.exe"):
+        raise body_error
+
+    assert events[0][0] is SpecificUnavailable
+    assert events[0][1] is body_error
+    assert events[0][2] is not None
+
+def test_domain_database_session_body_keyboard_interrupt_falsey_reraises(
+    monkeypatch,
+):
+    from forge.api import domain
+
+    body_error = KeyboardInterrupt("body cancelled")
+    events = []
+
+    class Handle:
+        def __enter__(self):
+            return object()
+
+        def __exit__(self, exc_type, exc, tb):
+            events.append((exc_type, exc, tb))
+            return False
+
+    monkeypatch.setattr(domain, "open_database", lambda *args, **kwargs: Handle())
+    with pytest.raises(KeyboardInterrupt) as raised:
+        with domain.database_session("sample.exe"):
+            raise body_error
+
+    assert raised.value is body_error
+    assert raised.value.__cause__ is None
+    assert raised.value.__context__ is None
+    assert events[0][0] is KeyboardInterrupt
+    assert events[0][1] is body_error
+    assert events[0][2] is not None
+
+def test_domain_database_session_body_system_exit_falsey_reraises(
+    monkeypatch,
+):
+    from forge.api import domain
+
+    body_error = SystemExit("body exited")
+    events = []
+
+    class Handle:
+        def __enter__(self):
+            return object()
+
+        def __exit__(self, exc_type, exc, tb):
+            events.append((exc_type, exc, tb))
+            return False
+
+    monkeypatch.setattr(domain, "open_database", lambda *args, **kwargs: Handle())
+    with pytest.raises(SystemExit) as raised:
+        with domain.database_session("sample.exe"):
+            raise body_error
+
+    assert raised.value is body_error
+    assert raised.value.__cause__ is None
+    assert raised.value.__context__ is None
+    assert events[0][0] is SystemExit
+    assert events[0][1] is body_error
+    assert events[0][2] is not None
+
+def test_domain_database_session_body_generator_exit_falsey_reraises(
+    monkeypatch,
+):
+    from forge.api import domain
+
+    body_error = GeneratorExit()
+    events = []
+
+    class Handle:
+        def __enter__(self):
+            return object()
+
+        def __exit__(self, exc_type, exc, tb):
+            events.append((exc_type, exc, tb))
+            return False
+
+    monkeypatch.setattr(domain, "open_database", lambda *args, **kwargs: Handle())
+    with pytest.raises(GeneratorExit) as raised:
+        with domain.database_session("sample.exe"):
+            raise body_error
+
+    assert raised.value is body_error
+    assert raised.value.__cause__ is None
+    assert raised.value.__context__ is None
+    assert events[0][0] is GeneratorExit
+    assert events[0][1] is body_error
+    assert events[0][2] is not None
+
+def test_domain_database_session_body_domainunavailable_falsey_reraises(
+    monkeypatch,
+):
+    from forge.api import domain
+
+    body_error = domain.DomainUnavailable("body unavailable")
+    events = []
+
+    class Handle:
+        def __enter__(self):
+            return object()
+
+        def __exit__(self, exc_type, exc, tb):
+            events.append((exc_type, exc, tb))
+            return False
+
+    monkeypatch.setattr(domain, "open_database", lambda *args, **kwargs: Handle())
+    with pytest.raises(domain.DomainUnavailable) as raised:
+        with domain.database_session("sample.exe"):
+            raise body_error
+
+    assert raised.value is body_error
+    assert raised.value.__cause__ is None
+    assert raised.value.__context__ is None
+    assert events[0][0] is domain.DomainUnavailable
+    assert events[0][1] is body_error
+    assert events[0][2] is not None
+
+def test_domain_database_session_body_domainunavailable_subclass_falsey_reraises(
+    monkeypatch,
+):
+    from forge.api import domain
+
+    class SpecificUnavailable(domain.DomainUnavailable):
+        pass
+
+    body_error = SpecificUnavailable("body unavailable")
+    events = []
+
+    class Handle:
+        def __enter__(self):
+            return object()
+
+        def __exit__(self, exc_type, exc, tb):
+            events.append((exc_type, exc, tb))
+            return False
+
+    monkeypatch.setattr(domain, "open_database", lambda *args, **kwargs: Handle())
+    with pytest.raises(SpecificUnavailable) as raised:
+        with domain.database_session("sample.exe"):
+            raise body_error
+
+    assert raised.value is body_error
+    assert raised.value.__cause__ is None
+    assert raised.value.__context__ is None
+    assert events[0][0] is SpecificUnavailable
+    assert events[0][1] is body_error
+    assert events[0][2] is not None
+
+def test_domain_database_session_success_cleanup_truthiness_isolated(
+    monkeypatch,
+):
+    from forge.api import domain
+
+    truth_error = RuntimeError("truth evaluation failed")
+    truth_calls = []
+    seen = []
+
+    class FailingTruth:
+        def __bool__(self):
+            truth_calls.append(True)
+            raise truth_error
+
+    class Handle:
+        def __enter__(self):
+            return object()
+
+        def __exit__(self, exc_type, exc, tb):
+            seen.append((exc_type, exc, tb))
+            return FailingTruth()
+
+    monkeypatch.setattr(domain, "open_database", lambda *args, **kwargs: Handle())
+    with domain.database_session("sample.exe"):
+        pass
+
+    assert truth_calls == []
+    assert seen == [(None, None, None)]
+
+def test_domain_database_session_success_cleanup_truthy_return_isolated(
+    monkeypatch,
+):
+    from forge.api import domain
+
+    truth_calls = []
+    seen = []
+
+    class TruthyReturn:
+        def __bool__(self):
+            truth_calls.append(True)
+            return True
+
+    class Handle:
+        def __enter__(self):
+            return object()
+
+        def __exit__(self, exc_type, exc, tb):
+            seen.append((exc_type, exc, tb))
+            return TruthyReturn()
+
+    monkeypatch.setattr(domain, "open_database", lambda *args, **kwargs: Handle())
+    with domain.database_session("sample.exe"):
+        pass
+
+    assert truth_calls == []
+    assert seen == [(None, None, None)]
+
+def test_domain_database_session_success_cleanup_domainunavailable_wraps(
+    monkeypatch,
+):
+    from forge.api import domain
+
+    cleanup_error = domain.DomainUnavailable("cleanup unavailable")
+    seen = []
+
+    class Handle:
+        def __enter__(self):
+            return object()
+
+        def __exit__(self, exc_type, exc, tb):
+            seen.append((exc_type, exc, tb))
+            raise cleanup_error
+
+    monkeypatch.setattr(domain, "open_database", lambda *args, **kwargs: Handle())
+    with pytest.raises(domain.DomainUnavailable) as raised:
+        with domain.database_session("sample.exe"):
+            pass
+
+    assert raised.value is not cleanup_error
+    assert str(raised.value) == "ida-domain database session cleanup failed for sample.exe"
+    assert raised.value.__cause__ is cleanup_error
+    assert raised.value.__context__ is cleanup_error
+    assert seen == [(None, None, None)]
+
+def test_domain_database_session_success_cleanup_runtimeerror_wraps(
+    monkeypatch,
+):
+    from forge.api import domain
+
+    cleanup_error = RuntimeError("cleanup failed")
+    seen = []
+
+    class Handle:
+        def __enter__(self):
+            return object()
+
+        def __exit__(self, exc_type, exc, tb):
+            seen.append((exc_type, exc, tb))
+            raise cleanup_error
+
+    monkeypatch.setattr(domain, "open_database", lambda *args, **kwargs: Handle())
+    with pytest.raises(domain.DomainUnavailable) as raised:
+        with domain.database_session("sample.exe"):
+            pass
+
+    assert str(raised.value) == "ida-domain database session cleanup failed for sample.exe"
+    assert raised.value.__cause__ is cleanup_error
+    assert raised.value.__context__ is cleanup_error
+    assert seen == [(None, None, None)]
+
+def test_domain_database_session_success_cleanup_oserror_wraps(
+    monkeypatch,
+):
+    from forge.api import domain
+
+    cleanup_error = OSError("cleanup failed")
+    seen = []
+
+    class Handle:
+        def __enter__(self):
+            return object()
+
+        def __exit__(self, exc_type, exc, tb):
+            seen.append((exc_type, exc, tb))
+            raise cleanup_error
+
+    monkeypatch.setattr(domain, "open_database", lambda *args, **kwargs: Handle())
+    with pytest.raises(domain.DomainUnavailable) as raised:
+        with domain.database_session("sample.exe"):
+            pass
+
+    assert str(raised.value) == "ida-domain database session cleanup failed for sample.exe"
+    assert raised.value.__cause__ is cleanup_error
+    assert raised.value.__context__ is cleanup_error
+    assert seen == [(None, None, None)]
+
+def test_domain_database_session_success_cleanup_typeerror_wraps(
+    monkeypatch,
+):
+    from forge.api import domain
+
+    cleanup_error = TypeError("cleanup failed")
+    seen = []
+
+    class Handle:
+        def __enter__(self):
+            return object()
+
+        def __exit__(self, exc_type, exc, tb):
+            seen.append((exc_type, exc, tb))
+            raise cleanup_error
+
+    monkeypatch.setattr(domain, "open_database", lambda *args, **kwargs: Handle())
+    with pytest.raises(domain.DomainUnavailable) as raised:
+        with domain.database_session("sample.exe"):
+            pass
+
+    assert str(raised.value) == "ida-domain database session cleanup failed for sample.exe"
+    assert raised.value.__cause__ is cleanup_error
+    assert raised.value.__context__ is cleanup_error
+    assert seen == [(None, None, None)]
+
+def test_domain_database_session_success_cleanup_valueerror_wraps(
+    monkeypatch,
+):
+    from forge.api import domain
+
+    cleanup_error = ValueError("cleanup failed")
+    seen = []
+
+    class Handle:
+        def __enter__(self):
+            return object()
+
+        def __exit__(self, exc_type, exc, tb):
+            seen.append((exc_type, exc, tb))
+            raise cleanup_error
+
+    monkeypatch.setattr(domain, "open_database", lambda *args, **kwargs: Handle())
+    with pytest.raises(domain.DomainUnavailable) as raised:
+        with domain.database_session("sample.exe"):
+            pass
+
+    assert str(raised.value) == "ida-domain database session cleanup failed for sample.exe"
+    assert raised.value.__cause__ is cleanup_error
+    assert raised.value.__context__ is cleanup_error
+    assert seen == [(None, None, None)]
+
+def test_domain_database_session_success_cleanup_attributeerror_wraps(
+    monkeypatch,
+):
+    from forge.api import domain
+
+    cleanup_error = AttributeError("cleanup failed")
+    seen = []
+
+    class Handle:
+        def __enter__(self):
+            return object()
+
+        def __exit__(self, exc_type, exc, tb):
+            seen.append((exc_type, exc, tb))
+            raise cleanup_error
+
+    monkeypatch.setattr(domain, "open_database", lambda *args, **kwargs: Handle())
+    with pytest.raises(domain.DomainUnavailable) as raised:
+        with domain.database_session("sample.exe"):
+            pass
+
+    assert str(raised.value) == "ida-domain database session cleanup failed for sample.exe"
+    assert raised.value.__cause__ is cleanup_error
+    assert raised.value.__context__ is cleanup_error
+    assert seen == [(None, None, None)]
+
+def test_domain_database_session_body_error_cleanup_runtimeerror_wraps(
+    monkeypatch,
+):
+    from forge.api import domain
+
+    body_error = ValueError("body failed")
+    cleanup_error = RuntimeError("cleanup failed")
+    seen = []
+
+    class Handle:
+        def __enter__(self):
+            return object()
+
+        def __exit__(self, exc_type, exc, tb):
+            seen.append((exc_type, exc, tb))
+            raise cleanup_error
+
+    monkeypatch.setattr(domain, "open_database", lambda *args, **kwargs: Handle())
+    with pytest.raises(domain.DomainUnavailable) as raised:
+        with domain.database_session("sample.exe"):
+            raise body_error
+
+    assert str(raised.value) == "ida-domain database session cleanup failed for sample.exe"
+    assert raised.value.__cause__ is cleanup_error
+    assert raised.value.__context__ is cleanup_error
+    assert seen[0][0] is ValueError
+    assert seen[0][1] is body_error
+    assert seen[0][2] is not None
+
+def test_domain_database_session_body_error_cleanup_domainunavailable_wraps(
+    monkeypatch,
+):
+    from forge.api import domain
+
+    body_error = ValueError("body failed")
+    cleanup_error = domain.DomainUnavailable("cleanup unavailable")
+    seen = []
+
+    class Handle:
+        def __enter__(self):
+            return object()
+
+        def __exit__(self, exc_type, exc, tb):
+            seen.append((exc_type, exc, tb))
+            raise cleanup_error
+
+    monkeypatch.setattr(domain, "open_database", lambda *args, **kwargs: Handle())
+    with pytest.raises(domain.DomainUnavailable) as raised:
+        with domain.database_session("sample.exe"):
+            raise body_error
+
+    assert raised.value is not cleanup_error
+    assert str(raised.value) == "ida-domain database session cleanup failed for sample.exe"
+    assert raised.value.__cause__ is cleanup_error
+    assert raised.value.__context__ is cleanup_error
+    assert seen[0][0] is ValueError
+    assert seen[0][1] is body_error
+    assert seen[0][2] is not None
+
+def test_domain_database_session_body_error_truthy_cleanup_suppresses_once(
+    monkeypatch,
+):
+    from forge.api import domain
+
+    body_error = ValueError("body failed")
+    truth_calls = []
+    seen = []
+
+    class TruthyReturn:
+        def __bool__(self):
+            truth_calls.append(True)
+            return True
+
+    class Handle:
+        def __enter__(self):
+            return object()
+
+        def __exit__(self, exc_type, exc, tb):
+            seen.append((exc_type, exc, tb))
+            return TruthyReturn()
+
+    monkeypatch.setattr(domain, "open_database", lambda *args, **kwargs: Handle())
+    with domain.database_session("sample.exe"):
+        raise body_error
+
+    assert truth_calls == [True]
+    assert seen[0][0] is ValueError
+    assert seen[0][1] is body_error
+    assert seen[0][2] is not None
+
+def test_domain_database_session_body_error_falsey_cleanup_evaluates_once(
+    monkeypatch,
+):
+    from forge.api import domain
+
+    body_error = ValueError("body failed")
+    truth_calls = []
+    seen = []
+
+    class FalseyReturn:
+        def __bool__(self):
+            truth_calls.append(True)
+            return False
+
+    class Handle:
+        def __enter__(self):
+            return object()
+
+        def __exit__(self, exc_type, exc, tb):
+            seen.append((exc_type, exc, tb))
+            return FalseyReturn()
+
+    monkeypatch.setattr(domain, "open_database", lambda *args, **kwargs: Handle())
+    with pytest.raises(ValueError) as raised:
+        with domain.database_session("sample.exe"):
+            raise body_error
+
+    assert raised.value is body_error
+    assert truth_calls == [True]
+    assert seen[0][0] is ValueError
+    assert seen[0][1] is body_error
+    assert seen[0][2] is not None
+
+def test_domain_database_session_body_error_nonboolean_cleanup_suppresses(
+    monkeypatch,
+):
+    from forge.api import domain
+
+    body_error = ValueError("body failed")
+    seen = []
+
+    class NonBooleanReturn:
+        pass
+
+    class Handle:
+        def __enter__(self):
+            return object()
+
+        def __exit__(self, exc_type, exc, tb):
+            seen.append((exc_type, exc, tb))
+            return NonBooleanReturn()
+
+    monkeypatch.setattr(domain, "open_database", lambda *args, **kwargs: Handle())
+    with domain.database_session("sample.exe"):
+        raise body_error
+
+    assert seen[0][0] is ValueError
+    assert seen[0][1] is body_error
+    assert seen[0][2] is not None
+
+def test_domain_database_session_body_error_integer_cleanup_suppresses(
+    monkeypatch,
+):
+    from forge.api import domain
+
+    body_error = ValueError("body failed")
+    seen = []
+
+    class Handle:
+        def __enter__(self):
+            return object()
+
+        def __exit__(self, exc_type, exc, tb):
+            seen.append((exc_type, exc, tb))
+            return 1
+
+    monkeypatch.setattr(domain, "open_database", lambda *args, **kwargs: Handle())
+    with domain.database_session("sample.exe"):
+        raise body_error
+
+    assert seen[0][0] is ValueError
+    assert seen[0][1] is body_error
+    assert seen[0][2] is not None
+
+def test_domain_database_session_body_error_zero_cleanup_reraises(
+    monkeypatch,
+):
+    from forge.api import domain
+
+    body_error = ValueError("body failed")
+    seen = []
+
+    class Handle:
+        def __enter__(self):
+            return object()
+
+        def __exit__(self, exc_type, exc, tb):
+            seen.append((exc_type, exc, tb))
+            return 0
+
+    monkeypatch.setattr(domain, "open_database", lambda *args, **kwargs: Handle())
+    with pytest.raises(ValueError) as raised:
+        with domain.database_session("sample.exe"):
+            raise body_error
+
+    assert raised.value is body_error
+    assert seen[0][0] is ValueError
+    assert seen[0][1] is body_error
+    assert seen[0][2] is not None
+
+def test_domain_database_session_body_error_true_cleanup_suppresses(
+    monkeypatch,
+):
+    from forge.api import domain
+
+    body_error = ValueError("body failed")
+    seen = []
+
+    class Handle:
+        def __enter__(self):
+            return object()
+
+        def __exit__(self, exc_type, exc, tb):
+            seen.append((exc_type, exc, tb))
+            return True
+
+    monkeypatch.setattr(domain, "open_database", lambda *args, **kwargs: Handle())
+    with domain.database_session("sample.exe"):
+        raise body_error
+
+    assert seen[0][0] is ValueError
+    assert seen[0][1] is body_error
+    assert seen[0][2] is not None
+
+def test_domain_database_session_body_error_false_cleanup_reraises(
+    monkeypatch,
+):
+    from forge.api import domain
+
+    body_error = ValueError("body failed")
+    seen = []
+
+    class Handle:
+        def __enter__(self):
+            return object()
+
+        def __exit__(self, exc_type, exc, tb):
+            seen.append((exc_type, exc, tb))
+            return False
+
+    monkeypatch.setattr(domain, "open_database", lambda *args, **kwargs: Handle())
+    with pytest.raises(ValueError) as raised:
+        with domain.database_session("sample.exe"):
+            raise body_error
+
+    assert raised.value is body_error
+    assert seen[0][0] is ValueError
+    assert seen[0][1] is body_error
+    assert seen[0][2] is not None
+
+def test_domain_database_session_body_error_none_cleanup_reraises(
+    monkeypatch,
+):
+    from forge.api import domain
+
+    body_error = ValueError("body failed")
+    seen = []
+
+    class Handle:
+        def __enter__(self):
+            return object()
+
+        def __exit__(self, exc_type, exc, tb):
+            seen.append((exc_type, exc, tb))
+            return None
+
+    monkeypatch.setattr(domain, "open_database", lambda *args, **kwargs: Handle())
+    with pytest.raises(ValueError) as raised:
+        with domain.database_session("sample.exe"):
+            raise body_error
+
+    assert raised.value is body_error
+    assert seen[0][0] is ValueError
+    assert seen[0][1] is body_error
+    assert seen[0][2] is not None
+
+def test_domain_database_session_body_error_empty_tuple_cleanup_reraises(
+    monkeypatch,
+):
+    from forge.api import domain
+
+    body_error = ValueError("body failed")
+    seen = []
+
+    class Handle:
+        def __enter__(self):
+            return object()
+
+        def __exit__(self, exc_type, exc, tb):
+            seen.append((exc_type, exc, tb))
+            return ()
+
+    monkeypatch.setattr(domain, "open_database", lambda *args, **kwargs: Handle())
+    with pytest.raises(ValueError) as raised:
+        with domain.database_session("sample.exe"):
+            raise body_error
+
+    assert raised.value is body_error
+    assert seen[0][0] is ValueError
+    assert seen[0][1] is body_error
+    assert seen[0][2] is not None
+
+def test_domain_database_session_body_error_nonempty_tuple_cleanup_suppresses(
+    monkeypatch,
+):
+    from forge.api import domain
+
+    body_error = ValueError("body failed")
+    seen = []
+
+    class Handle:
+        def __enter__(self):
+            return object()
+
+        def __exit__(self, exc_type, exc, tb):
+            seen.append((exc_type, exc, tb))
+            return (False,)
+
+    monkeypatch.setattr(domain, "open_database", lambda *args, **kwargs: Handle())
+    with domain.database_session("sample.exe"):
+        raise body_error
+
+    assert seen[0][0] is ValueError
+    assert seen[0][1] is body_error
+    assert seen[0][2] is not None
+
+def test_domain_database_session_body_error_one_element_list_suppresses(
+    monkeypatch,
+):
+    from forge.api import domain
+
+    body_error = ValueError("body failed")
+    seen = []
+
+    class Handle:
+        def __enter__(self):
+            return object()
+
+        def __exit__(self, exc_type, exc, tb):
+            seen.append((exc_type, exc, tb))
+            return [False]
+
+    monkeypatch.setattr(domain, "open_database", lambda *args, **kwargs: Handle())
+    with domain.database_session("sample.exe"):
+        raise body_error
+
+    assert seen[0][0] is ValueError
+    assert seen[0][1] is body_error
+    assert seen[0][2] is not None
+
+def test_domain_database_session_body_error_two_element_list_suppresses(
+    monkeypatch,
+):
+    from forge.api import domain
+
+    body_error = ValueError("body failed")
+    seen = []
+
+    class Handle:
+        def __enter__(self):
+            return object()
+
+        def __exit__(self, exc_type, exc, tb):
+            seen.append((exc_type, exc, tb))
+            return [False, False]
+
+    monkeypatch.setattr(domain, "open_database", lambda *args, **kwargs: Handle())
+    with domain.database_session("sample.exe"):
+        raise body_error
+
+    assert seen[0][0] is ValueError
+    assert seen[0][1] is body_error
+    assert seen[0][2] is not None
+
+def test_domain_database_session_body_error_len_only_cleanup_suppresses(
+    monkeypatch,
+):
+    from forge.api import domain
+
+    body_error = ValueError("body failed")
+    seen = []
+
+    class LenOnlyReturn:
+        def __len__(self):
+            return 1
+
+    class Handle:
+        def __enter__(self):
+            return object()
+
+        def __exit__(self, exc_type, exc, tb):
+            seen.append((exc_type, exc, tb))
+            return LenOnlyReturn()
+
+    monkeypatch.setattr(domain, "open_database", lambda *args, **kwargs: Handle())
+    with domain.database_session("sample.exe"):
+        raise body_error
+
+    assert seen[0][0] is ValueError
+    assert seen[0][1] is body_error
+    assert seen[0][2] is not None
+
+def test_domain_database_session_body_error_zero_len_only_cleanup_reraises(
+    monkeypatch,
+):
+    from forge.api import domain
+
+    body_error = ValueError("body failed")
+    seen = []
+
+    class ZeroLenReturn:
+        def __len__(self):
+            return 0
+
+    class Handle:
+        def __enter__(self):
+            return object()
+
+        def __exit__(self, exc_type, exc, tb):
+            seen.append((exc_type, exc, tb))
+            return ZeroLenReturn()
+
+    monkeypatch.setattr(domain, "open_database", lambda *args, **kwargs: Handle())
+    with pytest.raises(ValueError) as raised:
+        with domain.database_session("sample.exe"):
+            raise body_error
+
+    assert raised.value is body_error
+    assert seen[0][0] is ValueError
+    assert seen[0][1] is body_error
+    assert seen[0][2] is not None
+
+def test_domain_database_session_body_error_length_two_cleanup_suppresses(
+    monkeypatch,
+):
+    from forge.api import domain
+
+    body_error = ValueError("body failed")
+    seen = []
+
+    class LengthTwoReturn:
+        def __len__(self):
+            return 2
+
+    class Handle:
+        def __enter__(self):
+            return object()
+
+        def __exit__(self, exc_type, exc, tb):
+            seen.append((exc_type, exc, tb))
+            return LengthTwoReturn()
+
+    monkeypatch.setattr(domain, "open_database", lambda *args, **kwargs: Handle())
+    with domain.database_session("sample.exe"):
+        raise body_error
+
+    assert seen[0][0] is ValueError
+    assert seen[0][1] is body_error
+    assert seen[0][2] is not None
+
+def test_domain_database_session_body_error_boolean_len_cleanup_suppresses(
+    monkeypatch,
+):
+    from forge.api import domain
+
+    body_error = ValueError("body failed")
+    seen = []
+
+    class BooleanLenReturn:
+        def __len__(self):
+            return True
+
+    class Handle:
+        def __enter__(self):
+            return object()
+
+        def __exit__(self, exc_type, exc, tb):
+            seen.append((exc_type, exc, tb))
+            return BooleanLenReturn()
+
+    monkeypatch.setattr(domain, "open_database", lambda *args, **kwargs: Handle())
+    with domain.database_session("sample.exe"):
+        raise body_error
+
+    assert seen[0][0] is ValueError
+    assert seen[0][1] is body_error
+    assert seen[0][2] is not None
+
+def test_domain_database_session_body_error_raising_len_cleanup_propagates(
+    monkeypatch,
+):
+    from forge.api import domain
+
+    body_error = ValueError("body failed")
+    len_error = ValueError("length failed")
+    seen = []
+
+    class RaisingLenReturn:
+        def __len__(self):
+            raise len_error
+
+    class Handle:
+        def __enter__(self):
+            return object()
+
+        def __exit__(self, exc_type, exc, tb):
+            seen.append((exc_type, exc, tb))
+            return RaisingLenReturn()
+
+    monkeypatch.setattr(domain, "open_database", lambda *args, **kwargs: Handle())
+    with pytest.raises(ValueError) as raised:
+        with domain.database_session("sample.exe"):
+            raise body_error
+
+    assert raised.value is len_error
+    assert raised.value.__cause__ is None
+    assert raised.value.__context__ is body_error
+    assert seen[0][0] is ValueError
+    assert seen[0][1] is body_error
+    assert seen[0][2] is not None
+
+def test_domain_database_session_body_error_raising_bool_cleanup_propagates(
+    monkeypatch,
+):
+    from forge.api import domain
+
+    body_error = ValueError("body failed")
+    bool_error = ValueError("truth failed")
+    seen = []
+
+    class RaisingBoolReturn:
+        def __bool__(self):
+            raise bool_error
+
+    class Handle:
+        def __enter__(self):
+            return object()
+
+        def __exit__(self, exc_type, exc, tb):
+            seen.append((exc_type, exc, tb))
+            return RaisingBoolReturn()
+
+    monkeypatch.setattr(domain, "open_database", lambda *args, **kwargs: Handle())
+    with pytest.raises(ValueError) as raised:
+        with domain.database_session("sample.exe"):
+            raise body_error
+
+    assert raised.value is bool_error
+    assert raised.value.__cause__ is None
+    assert raised.value.__context__ is body_error
+    assert seen[0][0] is ValueError
+    assert seen[0][1] is body_error
+    assert seen[0][2] is not None
+
+def test_domain_database_session_body_error_nonboolean_bool_cleanup_typeerror(
+    monkeypatch,
+):
+    from forge.api import domain
+
+    body_error = ValueError("body failed")
+    seen = []
+
+    class NonBooleanBoolReturn:
+        def __bool__(self):
+            return 1
+
+    class Handle:
+        def __enter__(self):
+            return object()
+
+        def __exit__(self, exc_type, exc, tb):
+            seen.append((exc_type, exc, tb))
+            return NonBooleanBoolReturn()
+
+    monkeypatch.setattr(domain, "open_database", lambda *args, **kwargs: Handle())
+    with pytest.raises(TypeError) as raised:
+        with domain.database_session("sample.exe"):
+            raise body_error
+
+    assert raised.value.__cause__ is None
+    assert raised.value.__context__ is body_error
+    assert seen[0][0] is ValueError
+    assert seen[0][1] is body_error
+    assert seen[0][2] is not None
+
+def test_domain_database_session_body_error_false_bool_cleanup_reraises(
+    monkeypatch,
+):
+    from forge.api import domain
+
+    body_error = ValueError("body failed")
+    seen = []
+
+    class FalseBoolReturn:
+        def __bool__(self):
+            return False
+
+    class Handle:
+        def __enter__(self):
+            return object()
+
+        def __exit__(self, exc_type, exc, tb):
+            seen.append((exc_type, exc, tb))
+            return FalseBoolReturn()
+
+    monkeypatch.setattr(domain, "open_database", lambda *args, **kwargs: Handle())
+    with pytest.raises(ValueError) as raised:
+        with domain.database_session("sample.exe"):
+            raise body_error
+
+    assert raised.value is body_error
+    assert raised.value.__cause__ is None
+    assert seen[0][0] is ValueError
+    assert seen[0][1] is body_error
+    assert seen[0][2] is not None
+
+def test_domain_database_session_body_error_notimplemented_bool_cleanup_typeerror(
+    monkeypatch,
+):
+    from forge.api import domain
+
+    body_error = ValueError("body failed")
+    seen = []
+
+    class NotImplementedBoolReturn:
+        def __bool__(self):
+            return NotImplemented
+
+    class Handle:
+        def __enter__(self):
+            return object()
+
+        def __exit__(self, exc_type, exc, tb):
+            seen.append((exc_type, exc, tb))
+            return NotImplementedBoolReturn()
+
+    monkeypatch.setattr(domain, "open_database", lambda *args, **kwargs: Handle())
+    with pytest.raises(TypeError) as raised:
+        with domain.database_session("sample.exe"):
+            raise body_error
+
+    assert raised.value.__cause__ is None
+    assert raised.value.__context__ is body_error
+    assert seen[0][0] is ValueError
+    assert seen[0][1] is body_error
+    assert seen[0][2] is not None
+
+def test_domain_database_session_successful_cleanup_does_not_truth_test_result(
+    monkeypatch,
+):
+    from forge.api import domain
+
+    seen = []
+
+    class RaisingBoolReturn:
+        def __bool__(self):
+            raise AssertionError("successful cleanup must not truth-test result")
+
+    class Handle:
+        def __enter__(self):
+            return object()
+
+        def __exit__(self, exc_type, exc, tb):
+            seen.append((exc_type, exc, tb))
+            return RaisingBoolReturn()
+
+    monkeypatch.setattr(domain, "open_database", lambda *args, **kwargs: Handle())
+    with domain.database_session("sample.exe"):
+        pass
+
+    assert seen == [(None, None, None)]
+
+def test_domain_database_session_successful_cleanup_releases_result(
+    monkeypatch,
+):
+    from forge.api import domain
+
+    seen = []
+
+    class CleanupReturn:
+        def __del__(self):
+            seen.append("released")
+
+    class Handle:
+        def __enter__(self):
+            return object()
+
+        def __exit__(self, exc_type, exc, tb):
+            assert (exc_type, exc, tb) == (None, None, None)
+            return CleanupReturn()
+
+    monkeypatch.setattr(domain, "open_database", lambda *args, **kwargs: Handle())
+    with domain.database_session("sample.exe"):
+        pass
+
+    assert seen == ["released"]
+
+def test_domain_database_session_body_error_false_cleanup_releases_result(
+    monkeypatch,
+):
+    from forge.api import domain
+
+    body_error = ValueError("body failed")
+    seen = []
+
+    class CleanupReturn:
+        def __bool__(self):
+            return False
+
+        def __del__(self):
+            seen.append("released")
+
+    class Handle:
+        def __enter__(self):
+            return object()
+
+        def __exit__(self, exc_type, exc, tb):
+            assert exc_type is ValueError
+            assert exc is body_error
+            assert tb is not None
+            return CleanupReturn()
+
+    monkeypatch.setattr(domain, "open_database", lambda *args, **kwargs: Handle())
+    with pytest.raises(ValueError) as raised:
+        with domain.database_session("sample.exe"):
+            raise body_error
+
+    assert raised.value is body_error
+    assert seen == ["released"]
+
+def test_domain_database_session_body_error_suppressed_cleanup_releases_result(
+    monkeypatch,
+):
+    import gc
+    import weakref
+
+    from forge.api import domain
+
+    body_error = ValueError("body failed")
+    returned = []
+
+    class CleanupReturn:
+        def __bool__(self):
+            return True
+
+    class Handle:
+        def __enter__(self):
+            return object()
+
+        def __exit__(self, exc_type, exc, tb):
+            assert exc_type is ValueError
+            assert exc is body_error
+            assert tb is not None
+            result = CleanupReturn()
+            returned.append(weakref.ref(result))
+            return result
+
+    monkeypatch.setattr(domain, "open_database", lambda *args, **kwargs: Handle())
+    with domain.database_session("sample.exe"):
+        raise body_error
+
+    assert returned[0]() is not None
+    del body_error
+    gc.collect()
+    assert returned[0]() is None
+
+def test_domain_database_session_body_error_truth_error_releases_cleanup_result(
+    monkeypatch,
+):
+    import gc
+    import weakref
+
+    from forge.api import domain
+
+    body_error = ValueError("body failed")
+    truth_error = ValueError("truth failed")
+    returned = []
+
+    class CleanupReturn:
+        def __bool__(self):
+            raise truth_error
+
+    class Handle:
+        def __enter__(self):
+            return object()
+
+        def __exit__(self, exc_type, exc, tb):
+            assert exc is body_error
+            result = CleanupReturn()
+            returned.append(weakref.ref(result))
+            return result
+
+    monkeypatch.setattr(domain, "open_database", lambda *args, **kwargs: Handle())
+    with pytest.raises(ValueError) as raised:
+        with domain.database_session("sample.exe"):
+            raise body_error
+
+    assert raised.value is truth_error
+    assert raised.value.__context__ is body_error
+    assert returned[0]() is not None
+    del truth_error
+    del body_error
+    del raised
+    gc.collect()
+    assert returned[0]() is None
+
+def test_domain_database_session_truth_error_preserves_existing_cause(
+    monkeypatch,
+):
+    from forge.api import domain
+
+    body_error = ValueError("body failed")
+    truth_error = ValueError("truth failed")
+    cause_error = RuntimeError("original cause")
+    truth_error.__cause__ = cause_error
+
+    class CleanupReturn:
+        def __bool__(self):
+            raise truth_error
+
+    class Handle:
+        def __enter__(self):
+            return object()
+
+        def __exit__(self, exc_type, exc, tb):
+            return CleanupReturn()
+
+    monkeypatch.setattr(domain, "open_database", lambda *args, **kwargs: Handle())
+    with pytest.raises(ValueError) as raised:
+        with domain.database_session("sample.exe"):
+            raise body_error
+
+    assert raised.value is truth_error
+    assert raised.value.__cause__ is cause_error
+    assert raised.value.__context__ is body_error
+
+def test_domain_database_session_truth_error_preserves_existing_context(
+    monkeypatch,
+):
+    from forge.api import domain
+
+    body_error = ValueError("body failed")
+    truth_error = ValueError("truth failed")
+    context_error = RuntimeError("original context")
+    truth_error.__context__ = context_error
+
+    class CleanupReturn:
+        def __bool__(self):
+            raise truth_error
+
+    class Handle:
+        def __enter__(self):
+            return object()
+
+        def __exit__(self, exc_type, exc, tb):
+            return CleanupReturn()
+
+    monkeypatch.setattr(domain, "open_database", lambda *args, **kwargs: Handle())
+    with pytest.raises(ValueError) as raised:
+        with domain.database_session("sample.exe"):
+            raise body_error
+
+    assert raised.value is truth_error
+    assert raised.value.__context__ is body_error
+
+def test_domain_database_session_body_error_keyboard_interrupt_truth_cleanup(
+    monkeypatch,
+):
+    from forge.api import domain
+
+    body_error = ValueError("body failed")
+    interrupt = KeyboardInterrupt("truth interrupted")
+    seen = []
+
+    class CleanupReturn:
+        def __bool__(self):
+            raise interrupt
+
+    class Handle:
+        def __enter__(self):
+            return object()
+
+        def __exit__(self, exc_type, exc, tb):
+            seen.append((exc_type, exc, tb))
+            return CleanupReturn()
+
+    monkeypatch.setattr(domain, "open_database", lambda *args, **kwargs: Handle())
+    with pytest.raises(KeyboardInterrupt) as raised:
+        with domain.database_session("sample.exe"):
+            raise body_error
+
+    assert raised.value is interrupt
+    assert raised.value.__cause__ is None
+    assert raised.value.__context__ is body_error
+    assert seen[0][0] is ValueError
+    assert seen[0][1] is body_error
+    assert seen[0][2] is not None
+
+def test_domain_database_session_body_error_system_exit_truth_cleanup(
+    monkeypatch,
+):
+    from forge.api import domain
+
+    body_error = ValueError("body failed")
+    exit_error = SystemExit("truth exited")
+    seen = []
+
+    class CleanupReturn:
+        def __bool__(self):
+            raise exit_error
+
+    class Handle:
+        def __enter__(self):
+            return object()
+
+        def __exit__(self, exc_type, exc, tb):
+            seen.append((exc_type, exc, tb))
+            return CleanupReturn()
+
+    monkeypatch.setattr(domain, "open_database", lambda *args, **kwargs: Handle())
+    with pytest.raises(SystemExit) as raised:
+        with domain.database_session("sample.exe"):
+            raise body_error
+
+    assert raised.value is exit_error
+    assert raised.value.__cause__ is None
+    assert raised.value.__context__ is body_error
+    assert seen[0][0] is ValueError
+    assert seen[0][1] is body_error
+    assert seen[0][2] is not None
+
+def test_domain_database_session_body_error_generator_exit_truth_cleanup(
+    monkeypatch,
+):
+    from forge.api import domain
+
+    body_error = ValueError("body failed")
+    generator_exit = GeneratorExit()
+    seen = []
+
+    class CleanupReturn:
+        def __bool__(self):
+            raise generator_exit
+
+    class Handle:
+        def __enter__(self):
+            return object()
+
+        def __exit__(self, exc_type, exc, tb):
+            seen.append((exc_type, exc, tb))
+            return CleanupReturn()
+
+    monkeypatch.setattr(domain, "open_database", lambda *args, **kwargs: Handle())
+    with pytest.raises(GeneratorExit) as raised:
+        with domain.database_session("sample.exe"):
+            raise body_error
+
+    assert raised.value is generator_exit
+    assert raised.value.__cause__ is None
+    assert raised.value.__context__ is body_error
+    assert seen[0][0] is ValueError
+    assert seen[0][1] is body_error
+    assert seen[0][2] is not None
+
+def test_domain_database_session_body_error_custom_baseexception_truth_cleanup(
+    monkeypatch,
+):
+    from forge.api import domain
+
+    body_error = ValueError("body failed")
+    seen = []
+
+    class CustomBaseError(BaseException):
+        pass
+
+    truth_error = CustomBaseError("truth failed")
+
+    class CleanupReturn:
+        def __bool__(self):
+            raise truth_error
+
+    class Handle:
+        def __enter__(self):
+            return object()
+
+        def __exit__(self, exc_type, exc, tb):
+            seen.append((exc_type, exc, tb))
+            return CleanupReturn()
+
+    monkeypatch.setattr(domain, "open_database", lambda *args, **kwargs: Handle())
+    with pytest.raises(CustomBaseError) as raised:
+        with domain.database_session("sample.exe"):
+            raise body_error
+
+    assert raised.value is truth_error
+    assert raised.value.__cause__ is None
+    assert raised.value.__context__ is body_error
+    assert seen[0][0] is ValueError
+    assert seen[0][1] is body_error
+    assert seen[0][2] is not None
+
+def test_domain_database_session_custom_baseexception_preserves_cause(
+    monkeypatch,
+):
+    from forge.api import domain
+
+    body_error = ValueError("body failed")
+    truth_error = type("CustomBaseError", (BaseException,), {})("truth failed")
+    cause_error = RuntimeError("original cause")
+    truth_error.__cause__ = cause_error
+
+    class CleanupReturn:
+        def __bool__(self):
+            raise truth_error
+
+    class Handle:
+        def __enter__(self):
+            return object()
+
+        def __exit__(self, exc_type, exc, tb):
+            return CleanupReturn()
+
+    monkeypatch.setattr(domain, "open_database", lambda *args, **kwargs: Handle())
+    with pytest.raises(type(truth_error)) as raised:
+        with domain.database_session("sample.exe"):
+            raise body_error
+
+    assert raised.value is truth_error
+    assert raised.value.__cause__ is cause_error
+    assert raised.value.__context__ is body_error
+
+def test_domain_database_session_custom_baseexception_replaces_context(
+    monkeypatch,
+):
+    from forge.api import domain
+
+    body_error = ValueError("body failed")
+
+    class CustomBaseError(BaseException):
+        pass
+
+    truth_error = CustomBaseError("truth failed")
+    truth_error.__context__ = RuntimeError("original context")
+
+    class CleanupReturn:
+        def __bool__(self):
+            raise truth_error
+
+    class Handle:
+        def __enter__(self):
+            return object()
+
+        def __exit__(self, exc_type, exc, tb):
+            return CleanupReturn()
+
+    monkeypatch.setattr(domain, "open_database", lambda *args, **kwargs: Handle())
+    with pytest.raises(CustomBaseError) as raised:
+        with domain.database_session("sample.exe"):
+            raise body_error
+
+    assert raised.value is truth_error
+    assert raised.value.__context__ is body_error
+
+def test_domain_database_session_custom_baseexception_preserves_cause_replaces_context(
+    monkeypatch,
+):
+    from forge.api import domain
+
+    body_error = ValueError("body failed")
+
+    class CustomBaseError(BaseException):
+        pass
+
+    truth_error = CustomBaseError("truth failed")
+    cause_error = RuntimeError("original cause")
+    truth_error.__cause__ = cause_error
+    truth_error.__context__ = RuntimeError("original context")
+
+    class CleanupReturn:
+        def __bool__(self):
+            raise truth_error
+
+    class Handle:
+        def __enter__(self):
+            return object()
+
+        def __exit__(self, exc_type, exc, tb):
+            return CleanupReturn()
+
+    monkeypatch.setattr(domain, "open_database", lambda *args, **kwargs: Handle())
+    with pytest.raises(CustomBaseError) as raised:
+        with domain.database_session("sample.exe"):
+            raise body_error
+
+    assert raised.value is truth_error
+    assert raised.value.__cause__ is cause_error
+    assert raised.value.__context__ is body_error
+
+def test_domain_database_session_truth_error_from_inner_handler_preserves_chain(
+    monkeypatch,
+):
+    from forge.api import domain
+
+    body_error = ValueError("body failed")
+    inner_error = RuntimeError("inner failed")
+    truth_error = ValueError("truth failed")
+
+    class CleanupReturn:
+        def __bool__(self):
+            try:
+                raise inner_error
+            except RuntimeError as caught:
+                truth_error.__context__ = caught
+                raise truth_error
+
+    class Handle:
+        def __enter__(self):
+            return object()
+
+        def __exit__(self, exc_type, exc, tb):
+            return CleanupReturn()
+
+    monkeypatch.setattr(domain, "open_database", lambda *args, **kwargs: Handle())
+    with pytest.raises(ValueError) as raised:
+        with domain.database_session("sample.exe"):
+            raise body_error
+
+    assert raised.value is truth_error
+    assert raised.value.__context__ is inner_error
+    assert inner_error.__context__ is body_error
+
+def test_domain_database_session_truth_error_from_nested_finally_preserves_chain(
+    monkeypatch,
+):
+    from forge.api import domain
+
+    body_error = ValueError("body failed")
+    inner_error = RuntimeError("inner failed")
+    truth_error = ValueError("truth failed")
+
+    class CleanupReturn:
+        def __bool__(self):
+            try:
+                try:
+                    raise inner_error
+                finally:
+                    raise truth_error
+            except ValueError:
+                raise
+
+    class Handle:
+        def __enter__(self):
+            return object()
+
+        def __exit__(self, exc_type, exc, tb):
+            return CleanupReturn()
+
+    monkeypatch.setattr(domain, "open_database", lambda *args, **kwargs: Handle())
+    with pytest.raises(ValueError) as raised:
+        with domain.database_session("sample.exe"):
+            raise body_error
+
+    assert raised.value is truth_error
+    assert raised.value.__context__ is inner_error
+    assert inner_error.__context__ is body_error
+
+def test_domain_database_session_truth_error_from_nested_except_finally_chain(
+    monkeypatch,
+):
+    from forge.api import domain
+
+    body_error = ValueError("body failed")
+    inner_error = RuntimeError("inner failed")
+    truth_error = ValueError("truth failed")
+
+    class CleanupReturn:
+        def __bool__(self):
+            try:
+                try:
+                    raise inner_error
+                except RuntimeError as caught:
+                    assert caught is inner_error
+                finally:
+                    raise truth_error
+            except ValueError:
+                raise
+
+    class Handle:
+        def __enter__(self):
+            return object()
+
+        def __exit__(self, exc_type, exc, tb):
+            return CleanupReturn()
+
+    monkeypatch.setattr(domain, "open_database", lambda *args, **kwargs: Handle())
+    with pytest.raises(ValueError) as raised:
+        with domain.database_session("sample.exe"):
+            raise body_error
+
+    assert raised.value is truth_error
+    assert raised.value.__context__ is body_error
+    assert inner_error.__context__ is body_error
+
+def test_domain_database_session_truth_error_from_plain_raise_uses_body_context(
+    monkeypatch,
+):
+    from forge.api import domain
+
+    body_error = ValueError("body failed")
+    truth_error = ValueError("truth failed")
+
+    class CleanupReturn:
+        def __bool__(self):
+            try:
+                raise truth_error
+            except ValueError:
+                raise
+
+    class Handle:
+        def __enter__(self):
+            return object()
+
+        def __exit__(self, exc_type, exc, tb):
+            return CleanupReturn()
+
+    monkeypatch.setattr(domain, "open_database", lambda *args, **kwargs: Handle())
+    with pytest.raises(ValueError) as raised:
+        with domain.database_session("sample.exe"):
+            raise body_error
+
+    assert raised.value is truth_error
+    assert raised.value.__context__ is body_error
+
+def test_domain_database_session_truth_error_from_nested_with_uses_body_context(
+    monkeypatch,
+):
+    from forge.api import domain
+
+    body_error = ValueError("body failed")
+    truth_error = ValueError("truth failed")
+    inner_seen = []
+
+    class InnerCM:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            inner_seen.append((exc_type, exc, tb))
+            raise truth_error
+
+    class CleanupReturn:
+        def __bool__(self):
+            with InnerCM():
+                return True
+
+    class Handle:
+        def __enter__(self):
+            return object()
+
+        def __exit__(self, exc_type, exc, tb):
+            return CleanupReturn()
+
+    monkeypatch.setattr(domain, "open_database", lambda *args, **kwargs: Handle())
+    with pytest.raises(ValueError) as raised:
+        with domain.database_session("sample.exe"):
+            raise body_error
+
+    assert raised.value is truth_error
+    assert raised.value.__context__ is body_error
+    assert inner_seen[0][0] is None
+    assert inner_seen[0][1] is None
+
+def test_domain_database_session_truth_error_from_suppressing_nested_with(
+    monkeypatch,
+):
+    from forge.api import domain
+
+    body_error = ValueError("body failed")
+    inner_error = RuntimeError("inner failed")
+    truth_error = ValueError("truth failed")
+    inner_seen = []
+
+    class InnerCM:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            inner_seen.append((exc_type, exc, tb))
+            return True
+
+    class CleanupReturn:
+        def __bool__(self):
+            with InnerCM():
+                raise inner_error
+            raise truth_error
+
+    class Handle:
+        def __enter__(self):
+            return object()
+
+        def __exit__(self, exc_type, exc, tb):
+            return CleanupReturn()
+
+    monkeypatch.setattr(domain, "open_database", lambda *args, **kwargs: Handle())
+    with pytest.raises(ValueError) as raised:
+        with domain.database_session("sample.exe"):
+            raise body_error
+
+    assert raised.value is truth_error
+    assert raised.value.__context__ is body_error
+    assert inner_seen[0][0] is RuntimeError
+    assert inner_seen[0][1] is inner_error
+    assert inner_seen[0][2] is not None
+
+def test_domain_database_session_body_error_empty_list_cleanup_reraises(
+    monkeypatch,
+):
+    from forge.api import domain
+
+    body_error = ValueError("body failed")
+    seen = []
+
+    class Handle:
+        def __enter__(self):
+            return object()
+
+        def __exit__(self, exc_type, exc, tb):
+            seen.append((exc_type, exc, tb))
+            return []
+
+    monkeypatch.setattr(domain, "open_database", lambda *args, **kwargs: Handle())
+    with pytest.raises(ValueError) as raised:
+        with domain.database_session("sample.exe"):
+            raise body_error
+
+    assert raised.value is body_error
+    assert seen[0][0] is ValueError
+    assert seen[0][1] is body_error
+    assert seen[0][2] is not None
+
+def test_domain_database_session_honors_cleanup_suppression(monkeypatch):
+    from forge.api import domain
+
+    body_error = ValueError("suppressed body failure")
+    seen = []
+
+    class Handle:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            seen.append((exc_type, exc))
+            return True
+
+    monkeypatch.setattr(domain, "open_database", lambda *args, **kwargs: Handle())
+    with domain.database_session("sample.exe"):
+        raise body_error
+
+    assert seen == [(ValueError, body_error)]
+
+@pytest.mark.parametrize("exit_result, suppress", [(None, False), (0, False), ([], False), (False, False), (1, True), ([1], True), (True, True)])
+def test_domain_database_session_uses_exit_truthiness(
+    monkeypatch, exit_result, suppress
+):
+    from forge.api import domain
+
+    body_error = ValueError("body failure")
+    seen = []
+
+    class Handle:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            seen.append((exc_type, exc))
+            return exit_result
+
+    monkeypatch.setattr(domain, "open_database", lambda *args, **kwargs: Handle())
+    if suppress:
+        with domain.database_session("sample.exe"):
+            raise body_error
+    else:
+        with pytest.raises(ValueError, match="body failure"):
+            with domain.database_session("sample.exe"):
+                raise body_error
+
+    assert seen == [(ValueError, body_error)]
+
+def test_domain_database_session_preserves_exit_truth_failure(monkeypatch):
+    from forge.api import domain
+
+    truth_error = RuntimeError("cannot evaluate cleanup result")
+    body_error = ValueError("body failure")
+    seen = []
+
+    class ExitResult:
+        def __bool__(self):
+            raise truth_error
+
+    class Handle:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            seen.append((exc_type, exc))
+            return ExitResult()
+
+    monkeypatch.setattr(domain, "open_database", lambda *args, **kwargs: Handle())
+    with pytest.raises(RuntimeError) as raised:
+        with domain.database_session("sample.exe"):
+            raise body_error
+
+    assert raised.value is truth_error
+    assert seen == [(ValueError, body_error)]
+
+def test_domain_database_session_delivers_exit_arguments(monkeypatch):
+    from forge.api import domain
+
+    body_error = ValueError("body failure")
+    seen = []
+
+    class Handle:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            seen.append((exc_type, exc, tb))
+            return False
+
+    monkeypatch.setattr(domain, "open_database", lambda *args, **kwargs: Handle())
+    with pytest.raises(ValueError) as raised:
+        with domain.database_session("sample.exe"):
+            raise body_error
+
+    assert raised.value is body_error
+    assert seen[0][0] is ValueError
+    assert seen[0][1] is body_error
+    assert seen[0][2] is not None
+
+
+def test_domain_database_session_delivers_empty_exit_arguments(monkeypatch):
+    from forge.api import domain
+
+    seen = []
+
+    class Handle:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            seen.append((exc_type, exc, tb))
+            return False
+
+    monkeypatch.setattr(domain, "open_database", lambda *args, **kwargs: Handle())
+    with domain.database_session("sample.exe"):
+        pass
+
+    assert seen == [(None, None, None)]
+
+def test_current_database_optional_outside_ida():
+    from forge.api.domain import current_database
+
+    assert current_database(required=False) is None
+
+def test_is_type_prefers_domain_type_lookup(monkeypatch):
+    class Types:
+        def get_by_name(self, name):
+            return object() if name == "Present" else None
+
+    class DomainDb:
+        types = Types()
+
+    monkeypatch.setattr(forge_api, "_domain_database_or_none", lambda: DomainDb())
+    assert forge_api.is_type("Present") is True
+    assert forge_api.is_type("Missing") is False
+
+
+
+def test_type_of_uses_domain_type_details(monkeypatch):
+    class TInfo:
+        def is_udt(self):
+            return False
+
+        def is_ptr(self):
+            return False
+
+        def is_func(self):
+            return True
+
+        def dstr(self):
+            return "int f()"
+
+    class Types:
+        def get_by_name(self, name):
+            return TInfo() if name == "f" else None
+
+        def get_details(self, _tinfo):
+            return SimpleNamespace(name="f", declaration="int f()", size=8)
+
+    monkeypatch.setattr(forge_api, "_domain_database_or_none", lambda: SimpleNamespace(types=Types()))
+    assert forge_api.type_of("f") == {
+        "name": "f",
+        "type": "int f()",
+        "size": 8,
+        "kind": "function",
+        "members": [],
+    }
+
+
+def test_named_types_uses_domain_type_details(monkeypatch):
+    class Types:
+        def get_all(self):
+            return iter([object(), object()])
+
+        def get_details(self, tinfo):
+            return SimpleNamespace(name="B" if tinfo is not None else "A")
+
+    monkeypatch.setattr(forge_api, "_domain_database_or_none", lambda: SimpleNamespace(types=Types()))
+    assert forge_api.named_types() == ["B"]
+
+    import ida_typeinf
+    from forge.api import domain
+
+    class Types:
+        def get_by_name(self, _name):
+            raise RuntimeError("unsupported")
+
+    monkeypatch.setattr(forge_api, "_domain_database_or_none", lambda: SimpleNamespace(types=Types()))
+    monkeypatch.setattr(
+        ida_typeinf.tinfo_t,
+        "get_named_type",
+        lambda self, *args, **kwargs: False,
+        raising=False,
+    )
+    domain.clear_fallback_records()
+    assert forge_api.is_type("Missing") is False
+    assert any(item.capability == "types.is_type" for item in domain.fallback_records())
+
+
+def test_domain_parse_function_decl_prefers_domain(monkeypatch):
+    sentinel = object()
+    calls = []
+
+    class Types:
+        def parse_one_declaration(self, library, declaration):
+            calls.append((library, declaration))
+            return sentinel
+
+    monkeypatch.setattr(forge_api, "_domain_database_or_none", lambda: SimpleNamespace(types=Types()))
+    assert forge_api._parse_function_decl("int f(void)") is sentinel
+    assert calls == [(None, "int f(void)")]
+def test_set_func_proto_prefers_domain_application(monkeypatch):
+    calls = []
+
+    class Types:
+        def apply_declaration_at(self, ea, declaration):
+            calls.append((ea, declaration))
+            return True
+
+    class DomainDb:
+        types = Types()
+
+    monkeypatch.setattr(forge_api, "_domain_database_or_none", lambda: DomainDb())
+    monkeypatch.setattr(forge_api, "signature", lambda _ea: "int f(int)")
+    result = forge_api.set_func_proto(0x401000, "int f(int)")
+    assert result == {"ok": True, "ea": 0x401000, "prototype": "int f(int)"}
+    assert calls == [(0x401000, "int f(int)")]
+
+
+def test_set_func_proto_domain_rejection_is_structured_error(monkeypatch):
+    class Types:
+        def apply_declaration_at(self, _ea, _declaration):
+            raise ValueError("bad declaration")
+
+    class DomainDb:
+        types = Types()
+
+    monkeypatch.setattr(forge_api, "_domain_database_or_none", lambda: DomainDb())
+    result = forge_api.set_func_proto(0x401000, "not valid")
+    assert result == {"ok": False, "error": "could not parse declaration 'not valid'"}
+
+
+def test_set_func_proto_domain_rejection_is_terminal(monkeypatch):
+    class Types:
+        def apply_declaration_at(self, _ea, _declaration):
+            return False
+
+    class DomainDb:
+        types = Types()
+
+    monkeypatch.setattr(forge_api, "_domain_database_or_none", lambda: DomainDb())
+    monkeypatch.setattr(forge_api, "_parse_function_decl", lambda _decl: (_ for _ in ()).throw(AssertionError("SDK fallback")))
+
+    result = forge_api.set_func_proto(0x401000, "not valid")
+    assert result == {"ok": False, "error": "could not parse declaration 'not valid'"}
+
+def test_rename_local_prefers_domain_wrappers(monkeypatch):
+    events = []
+
+    class Variable:
+        def __init__(self, name):
+            self.name = name
+
+        def set_user_name(self, name):
+            events.append(("set", self.name, name))
+            self.name = name
+
+    class Function:
+        local_variables = (Variable("arg"), Variable("local"))
+
+        def save_local_variable_info(self, variable, *, save_name=False):
+            events.append(("save", variable.name, save_name))
+            return save_name
+
+    class Pseudocode:
+        def decompile(self, _ea):
+            return Function()
+
+    class DomainDb:
+        pseudocode = Pseudocode()
+
+    monkeypatch.setattr(forge_api, "_domain_database_or_none", lambda: DomainDb())
+    assert forge_api.rename_local(0x401000, "arg", "renamed") is True
+    assert forge_api.rename_local(0x401000, 1, "local2") is True
+    assert events == [("set", "arg", "renamed"), ("save", "renamed", True), ("set", "local", "local2"), ("save", "local2", True)]
+
+def test_set_lvar_types_prefers_domain_local_mutation(monkeypatch):
+    events = []
+
+    class Variable:
+        def __init__(self, name, is_arg):
+            self.name = name
+            self.is_arg = is_arg
+
+        def set_type(self, tinfo):
+            events.append(("set", self.name, tinfo))
+            return True
+
+    class Function:
+        local_variables = (Variable("arg", True), Variable("local", False))
+
+        def save_local_variable_info(self, variable, *, save_type=False):
+            events.append(("save", variable.name, save_type))
+            return save_type
+
+    class Types:
+        def parse_one_declaration(self, library, declaration):
+            events.append(("parse", library, declaration))
+            return declaration
+
+    class Pseudocode:
+        def decompile(self, _ea):
+            return Function()
+
+    class DomainDb:
+        pseudocode = Pseudocode()
+        types = Types()
+
+    monkeypatch.setattr(forge_api, "_domain_database_or_none", lambda: DomainDb())
+    monkeypatch.setattr(
+        forge_api,
+        "_domain_decompile_result",
+        lambda _db, _ea: {"pseudocode": "void *arg;"},
+    )
+    result = forge_api.set_lvar_types(0x401000, {"arg": "World *", "local": "*"})
+    assert result == {
+        "ok": True,
+        "updated": [{"name": "arg", "ok": True}, {"name": "local", "ok": False}],
+        "signature": "void *arg;",
+    }
+    assert events == [
+        ("parse", None, "World *"),
+        ("set", "arg", "World *"),
+        ("save", "arg", True),
+    ]
 
 class FakeTinfo:
     """Minimal tinfo double that Member construction + display can use."""
@@ -63,7 +4890,95 @@ def _reset_store():
     forge_api._structures.clear()
     forge_api._state.current = None
 
+def test_resolve_import_slot_callees_prefers_domain_function_lookup(monkeypatch):
+    class Function:
+        start_ea = 0x402000
 
+    class Functions:
+        def get_at(self, ea):
+            return Function() if ea == 0x401000 else None
+
+    class DomainDb:
+        functions = Functions()
+
+    monkeypatch.setattr(forge_api, "_domain_database_or_none", lambda: DomainDb())
+    assert forge_api._resolve_import_slot_callees([0x401000]) == [0x402000]
+
+
+
+def test_import_slot_name_prefers_domain_names_and_segments(monkeypatch):
+    class Segment:
+        pass
+
+    class Names:
+        def get_at(self, _ea):
+            return "named_target"
+
+    class Segments:
+        def get_at(self, _ea):
+            return Segment()
+
+        def get_name(self, _segment):
+            return ".text"
+
+    class DomainDb:
+        names = Names()
+        segments = Segments()
+
+    monkeypatch.setattr(forge_api, "_domain_database_or_none", lambda: DomainDb())
+    assert forge_api._import_slot_to_name(0x401000) == "named_target"
+
+def test_add_named_sub_heads_prefers_domain_byte_discovery(monkeypatch):
+    class Function:
+        start_ea = 0x401000
+
+    class Bytes:
+        def get_data_size_at(self, ea):
+            return 4
+
+        def get_next_head(self, ea, end):
+            return None if ea >= 0x401008 else 0x401008
+
+    class Names:
+        def get_at(self, ea):
+            return "qword_401008" if ea == 0x401008 else None
+
+    class Xrefs:
+        def data_refs_to_ea(self, _ea):
+            return iter(())
+
+    class Functions:
+        def get_at(self, _ea):
+            return Function()
+
+    class DomainDb:
+        bytes = Bytes()
+        names = Names()
+        xrefs = Xrefs()
+        functions = Functions()
+
+    class Target:
+        name = "global_probe"
+
+        def __init__(self):
+            self.members = []
+
+        def get_member_by_offset(self, offset):
+            return next((m for m in self.members if m["offset"] == offset), None)
+
+    target = Target()
+    monkeypatch.setattr(forge_api, "_domain_database_or_none", lambda: DomainDb())
+    monkeypatch.setattr(
+        forge_api,
+        "add_member",
+        lambda structure, offset, type, name=None: target.members.append(
+            {"structure": structure, "offset": offset, "type": type, "name": name}
+        ),
+    )
+    forge_api._add_named_sub_heads(target, 0x401000, 0x10)
+    assert target.members == [
+        {"structure": "global_probe", "offset": 8, "type": "u32", "name": "qword"}
+    ]
 def test_help_catalog_lists_every_api_function():
     catalog = forge_api.help()
     functions = catalog["functions"]
@@ -75,12 +4990,86 @@ def test_help_catalog_lists_every_api_function():
         assert entry["example"]
         assert entry["group"]
 
+def test_recover_abi_structure_replaces_layout_and_persists_metadata():
+    name = "AbiBuilderProbe"
+    if name in forge_api.structures():
+        forge_api.remove_structure(name)
+    result = forge_api.recover_abi_structure(
+        name,
+        [{"offset": 0, "type": "u64", "name": "vptr"}],
+        abi={
+            "rtti_name": "fixture::Probe",
+            "bases": [{"name": "fixture_Entity", "offset": 0}],
+        },
+    )
+    assert result["name"] == name
+    assert result["abi_metadata"]["rtti_name"] == "fixture::Probe"
+    assert result["members"][0]["name"] == "vptr"
+
+
+def test_recover_abi_structure_preserves_sites_and_provenance():
+    """ABI rebuild keeps scan evidence and provenance: scanned_variables
+    recorded on the prior member merge into the rebuilt ABI member at the
+    same offset (reported under preserved_sites), and the cpp_synthesis
+    provenance set by synthesize_cpp survives the rebuild untouched."""
+    name = "AbiPreserveProbe"
+    if name in forge_api.structures():
+        forge_api.remove_structure(name)
+
+    first = forge_api.synthesize_cpp(
+        name,
+        [{"offset": 0, "type": "u64", "name": "vptr"}],
+        abi={"rtti_name": "fixture::Probe"},
+        roots=[{"object_ea": 0x14001000, "function_ea": 0x140002750}],
+        commit=False,
+    )
+    assert first["ok"] is True
+    assert first["provenance"]["kind"] == "cpp_synthesis"
+
+    # Scan evidence on the synthesized member (as deep_scan would record it).
+    forge_api._resolve_structure(name).members[0].scanned_variables = {"v0"}
+
+    rebuilt = forge_api.recover_abi_structure(
+        name,
+        [
+            {"offset": 0, "type": "u64", "name": "vptr"},
+            {"offset": 8, "type": "u32", "name": "id"},
+        ],
+        abi={"rtti_name": "fixture::Probe"},
+    )
+
+    assert rebuilt["preserved_sites"] == [{"offset": 0, "member": "vptr"}]
+    target = forge_api._resolve_structure(name)
+    assert target.get_member_by_offset(0).scanned_variables == {"v0"}
+    assert target.get_member_by_offset(8).name == "id"
+    provenance = target.provenance
+    kind = (
+        provenance.get("kind")
+        if isinstance(provenance, dict)
+        else getattr(provenance, "kind", None)
+    )
+    assert kind == "cpp_synthesis"
+
 
 def test_help_topic_scoped():
     entry = forge_api.help("deep_scan")["functions"]["deep_scan"]
     assert entry["group"] == "scan"
     with pytest.raises(forge_api.ForgeApiError):
         forge_api.help("does_not_exist")
+
+
+def test_help_catalog_is_deterministically_ordered_and_topic_scoped():
+    first = forge_api.help()
+    names = list(first["functions"])
+    expected = sorted(
+        forge_api.__all__,
+        key=lambda name: (first["functions"][name]["group"], name),
+    )
+    assert names == expected
+
+    topic = forge_api.help("deep_scan")
+    assert list(topic["functions"]) == ["deep_scan"]
+    assert topic["functions"]["deep_scan"] == first["functions"]["deep_scan"]
 
 
 def test_requires_ida_guard(monkeypatch):
@@ -833,6 +5822,134 @@ def test_create_type_overwrite_success_returns_type_name(monkeypatch):
     assert "int x" in result["declaration"]
 
 
+def test_create_type_pack_readiness_gate_returns_structured_error(monkeypatch):
+    """Gap #9 wiring: create_type refuses to pack when the catalog readiness
+    report is not ok — structured unresolved error, set_cdecl never reached."""
+    _commit_stubs(monkeypatch, parses=True, set_result=object())
+    forge_api.create_structure("S")
+    forge_api.add_member("S", 0, "u32")
+
+    monkeypatch.setattr(
+        forge_api.catalog,
+        "pack_readiness",
+        lambda name: SimpleNamespace(
+            ok=False,
+            to_dict=lambda: {
+                "ok": False,
+                "structure": name,
+                "checked": 1,
+                "blocked": [
+                    {"member_name": "f", "status": "unresolved_reference"}
+                ],
+                "unresolved_types": ["Missing"],
+                "error": (
+                    "cannot pack in 'S': member 'f' @ 0x0 references "
+                    "unresolved types: Missing"
+                ),
+            },
+        ),
+    )
+    from forge.api import structure as structure_mod
+
+    committed = []
+    monkeypatch.setattr(
+        structure_mod.Structure,
+        "set_cdecl",
+        lambda self, *a, **k: committed.append(a) or object(),
+        raising=False,
+    )
+
+    result = forge_api.create_type("S", overwrite=True)
+
+    assert result["ok"] is False
+    assert result["code"] == "unresolved_references"
+    assert result["unresolved_types"] == ["Missing"]
+    assert result["blocked_members"][0]["member_name"] == "f"
+    assert "cannot pack in 'S'" in result["error"]
+    assert committed == []
+
+
+def test_commit_declaration_pack_readiness_gate_returns_structured_error(monkeypatch):
+    """Gap #9 wiring on the declaration-text commit path: the readiness gate
+    runs before set_cdecl and surfaces the structured unresolved error."""
+    _commit_stubs(monkeypatch, parses=True, set_result=object())
+    forge_api.create_structure("S")
+    forge_api.add_member("S", 0, "u32")
+
+    monkeypatch.setattr(
+        forge_api.catalog,
+        "pack_readiness",
+        lambda name: SimpleNamespace(
+            ok=False,
+            to_dict=lambda: {
+                "ok": False,
+                "structure": name,
+                "checked": 1,
+                "blocked": [],
+                "unresolved_types": ["Missing"],
+                "error": "cannot pack in 'S': unresolved types: Missing",
+            },
+        ),
+    )
+    from forge.api import structure as structure_mod
+
+    committed = []
+    monkeypatch.setattr(
+        structure_mod.Structure,
+        "set_cdecl",
+        lambda self, *a, **k: committed.append(a) or object(),
+        raising=False,
+    )
+
+    result = forge_api.commit_declaration("S", "struct S { int f; };")
+
+    assert result["ok"] is False
+    assert result["code"] == "unresolved_references"
+    assert result["unresolved_types"] == ["Missing"]
+    assert committed == []
+
+
+def test_rename_structure_refreshes_references_on_type_refile(monkeypatch):
+    """Gap #10 rename path: renaming a structure whose IDA type is re-filed
+    (created_type_name follows the rename) re-points the stored references
+    through the payload-rewrite refresh helper."""
+    forge_api.create_structure("X")
+    structure = forge_api._resolve_structure("X")
+    structure.created_type_name = "X"
+    monkeypatch.setattr(
+        type(structure),
+        "rename_created_type",
+        lambda self, old, new: setattr(self, "created_type_name", new) or True,
+        raising=False,
+    )
+    calls = []
+    monkeypatch.setattr(
+        forge_api,
+        "_refresh_references_after_rename",
+        lambda old, new: calls.append((old, new)) or {"repointed_rows": 0},
+        raising=False,
+    )
+
+    assert forge_api.rename_structure("X", "Y") is True
+    assert calls == [("X", "Y")]
+
+
+def test_rename_structure_without_created_type_skips_refresh(monkeypatch):
+    """Renaming a structure that never committed a type must NOT trigger the
+        references refresh (no re-file happened, no rows to re-point)."""
+    forge_api.create_structure("X")
+    calls = []
+    monkeypatch.setattr(
+        forge_api,
+        "_refresh_references_after_rename",
+        lambda old, new: calls.append((old, new)),
+        raising=False,
+    )
+
+    assert forge_api.rename_structure("X", "Y") is True
+    assert calls == []
+
+
 # ---------------------------------------------------------------------------
 # R11: headless finalize / finalize_all / create_child_types
 # ---------------------------------------------------------------------------
@@ -928,6 +6045,31 @@ def test_finalize_reports_unresolved_children(monkeypatch):
 
     assert result == {"ok": False, "unresolved": ["Missing"]}
 
+
+def test_create_child_types_preserves_sorted_child_order(monkeypatch):
+    class Child:
+        def __init__(self, name):
+            self.name = name
+            self.created_type_name = None
+
+        def create_type_if_ready(self, _structures, *, headless=False):
+            self.created_type_name = self.name
+            return object()
+
+    class Target:
+        child_relationships = [object()]
+
+        def iter_child_structures(self, _structures):
+            return iter([Child("Alpha"), Child("Zulu")])
+
+        def get_unresolved_child_names(self, _structures):
+            return []
+
+    target = Target()
+    monkeypatch.setattr(forge_api, "_require_ida", lambda: None)
+    monkeypatch.setattr(forge_api, "_resolve_structure", lambda *_args: target)
+    result = forge_api.create_child_types("Parent")
+    assert result == {"ok": True, "created": ["Alpha", "Zulu"], "skipped": []}
 
 def test_finalize_all_runs_headless_subtree(monkeypatch):
     """R11: finalize_all walks subtrees headless (no pack dialogs) and
@@ -1099,27 +6241,71 @@ def test_deep_scan_auto_creates_structure_and_auto_retypes_root(monkeypatch, _re
 
 
 def test_deep_scan_root_type_hint_overrides_integral_auto(monkeypatch, _real_hexrays):
-    """I.8: an explicit root_type declaration wins over the auto void *."""
-    import ida_hexrays
-
-    monkeypatch.setattr(_real_hexrays, "decompile", lambda ea: _scan_cfunc("a1", "__int64"), raising=False)
-    monkeypatch.setattr(ida_hexrays, "lvar_locator_t", lambda loc, defea: SimpleNamespace(location=loc, defea=defea), raising=False)
-    monkeypatch.setattr(ida_hexrays, "lvar_saved_info_t", type("S", (), {"__init__": lambda self: setattr(self, "ll", None) or setattr(self, "type", None)}), raising=False)
-    monkeypatch.setattr(ida_hexrays, "MLI_TYPE", 0x10, raising=False)
-    retyped = []
-    monkeypatch.setattr(ida_hexrays, "modify_user_lvar_info", lambda ea, flags, lvi: retyped.append(lvi.type.dstr()) or True, raising=False)
+    """I.8: an explicit root_type declaration wins over the integral auto type."""
+    monkeypatch.setattr(
+        _real_hexrays,
+        "decompile",
+        lambda ea: _scan_cfunc("a1", "__int64"),
+        raising=False,
+    )
     monkeypatch.setattr(members_mod, "parse_user_tinfo", lambda decl: FakeTinfo(decl), raising=False)
-    from importlib import import_module as _import
-    scanner_mod = _import("forge.api.scanner")
+    scanner_mod = __import__("importlib").import_module("forge.api.scanner")
+    monkeypatch.setattr(scanner_mod, "NewDeepScanVisitor", _ScanVisitorStub, raising=False)
+    calls = []
+    monkeypatch.setattr(
+        forge_api,
+        "set_lvar_types",
+        lambda ea, types, *, scope: calls.append((ea, types, scope))
+        or {"ok": True, "updated": [{"name": "a1", "ok": True}]},
+    )
+    monkeypatch.setattr(_real_hexrays, "mark_cfunc_dirty", lambda ea, close=False: None, raising=False)
+
+    forge_api.deep_scan(0x140001000, var_name="a1", root_type="World *")
+    assert calls == [(0x401000, {"a1": "World *"}, "all")]
+
+def test_deep_scan_root_retype_uses_absolute_ea_facade(monkeypatch, _real_hexrays):
+    module_calls = []
+    monkeypatch.setattr(_real_hexrays, "decompile", lambda ea: _scan_cfunc("a1", "__int64"), raising=False)
+    monkeypatch.setattr(members_mod, "parse_user_tinfo", lambda decl: FakeTinfo(decl), raising=False)
+    scanner_mod = __import__("importlib").import_module("forge.api.scanner")
     monkeypatch.setattr(scanner_mod, "NewDeepScanVisitor", _ScanVisitorStub, raising=False)
 
-    forge_api.deep_scan(0x401000, var_name="a1", root_type="World *")
+    def facade_set(ea, types, *, scope):
+        module_calls.append((ea, types, scope))
+        return {"ok": True, "updated": [{"name": "a1", "ok": True}]}
 
-    # Gap #3 (recovery eval 2026-08-13): the stub scan produces no
-    # evidence, so the root retype is undone — a failed scan must not
-    # leave the lvar re-typed.
-    assert retyped == ["World *", "__int64"]
+    monkeypatch.setattr(forge_api, "set_lvar_types", facade_set)
+    monkeypatch.setattr(_real_hexrays, "mark_cfunc_dirty", lambda ea, close=False: None, raising=False)
+    forge_api.deep_scan(0x140001000, var_name="a1", root_type="World *")
+    assert module_calls == [(0x401000, {"a1": "World *"}, "all")]
 
+def test_deep_scan_returns_structured_root_retype_failure(monkeypatch, _real_hexrays):
+    """A failed C++ stack-root retype must not escape as InvalidEAError."""
+    monkeypatch.setattr(
+        _real_hexrays,
+        "decompile",
+        lambda ea: _scan_cfunc("a1", "__int64"),
+        raising=False,
+    )
+    restored = []
+    monkeypatch.setattr(
+        forge_api,
+        "set_lvar_types",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            RuntimeError("Invalid effective address: 0x1100000000")
+        ),
+    )
+    monkeypatch.setattr(
+        forge_api,
+        "_restore_root_type",
+        lambda cfunc, obj, prior: restored.append(prior),
+    )
+
+    result = forge_api.deep_scan(0x1400017A0, var_name="a1", root_type="void *")
+
+    assert result["ok"] is False
+    assert "root lvar retype failed" in result["error"]
+    assert restored == ["__int64"]
 
 def test_deep_scan_skips_retype_for_pointer_root(monkeypatch, _real_hexrays):
     """I.8: an already-pointer root needs no retype (no visitor churn)."""
@@ -1133,6 +6319,74 @@ def test_deep_scan_skips_retype_for_pointer_root(monkeypatch, _real_hexrays):
 
     assert result["structure"] == "Structure"
     assert result["members"] == []
+
+
+def test_deep_scan_subobject_wraps_root_and_reports_base_offset(monkeypatch, _real_hexrays):
+    """deep_scan subobject mode must root the shared visitor at a
+    SubobjectScanObject (child coordinates) and report the subobject base —
+    never leak root_type, never scan the whole parent."""
+    from forge.api.scan_subobject import SubobjectScanObject
+
+    monkeypatch.setattr(
+        _real_hexrays,
+        "decompile",
+        lambda ea: _scan_cfunc("a1", "World *"),
+        raising=False,
+    )
+    monkeypatch.setattr(members_mod, "parse_user_tinfo", lambda decl: FakeTinfo(decl), raising=False)
+    from importlib import import_module as _import
+    scanner_mod = _import("forge.api.scanner")
+
+    captured = {}
+
+    class _Vis:
+        def __init__(self, *args, **kwargs):
+            captured["args"] = args  # (cfunc, origin, obj, structure, ...)
+
+        def process(self):
+            pass
+
+    monkeypatch.setattr(scanner_mod, "NewDeepScanVisitor", _Vis, raising=False)
+
+    result = forge_api.deep_scan(
+        0x401000, subobject={"base_offset": 0x1B60, "var_name": "a1"}
+    )
+
+    assert result["subobject"] == 0x1B60
+    assert result["structure"] == "Structure"
+    assert result["members"] == []
+    root = captured["args"][2]
+    assert isinstance(root, SubobjectScanObject)
+    assert root.base_offset == 0x1B60
+    # The wrapped parent keeps the parent variable identity (a1 : World *).
+    assert root.name == "a1"
+    assert root.tinfo is None  # tinfo deliberately dropped (child type unknown)
+
+
+def test_deep_scan_subobject_rejects_root_type(monkeypatch, _real_hexrays):
+    """Retyping the parent lvar to the child type would break the
+    base-offset addressing — root_type with subobject is refused."""
+    monkeypatch.setattr(_real_hexrays, "decompile", lambda ea: _scan_cfunc("a1", "__int64"), raising=False)
+    from importlib import import_module as _import
+    scanner_mod = _import("forge.api.scanner")
+    monkeypatch.setattr(
+        scanner_mod, "NewDeepScanVisitor", type("V", (), {}), raising=False
+    )
+
+    result = forge_api.deep_scan(
+        0x401000, root_type="Child *", subobject={"base_offset": 0x1B60, "var_name": "a1"}
+    )
+
+    assert result["ok"] is False
+    assert "root_type is not supported with subobject" in result["error"]
+def test_scan_result_marks_success_explicitly():
+    target = type("Target", (), {"name": "Recovered", "members": []})()
+
+    assert forge_api._scan_result(target) == {
+        "ok": True,
+        "structure": "Recovered",
+        "members": [],
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -1697,6 +6951,33 @@ def test_apply_type_redefine_range_del_items_end_is_span_end(monkeypatch):
     assert calls == [(0x6000, 0x08, 0x6040)]
 
 
+
+
+def test_apply_type_domain_rejection_is_structured_and_terminal(monkeypatch):
+    class Types:
+        def parse_one_declaration(self, *_args):
+            return object()
+
+        def apply_at(self, *_args):
+            return False
+
+    class DomainDb:
+        types = Types()
+
+    monkeypatch.setattr(forge_api, "_domain_database_or_none", lambda: DomainDb())
+    monkeypatch.setattr(forge_api, "_require_ida", lambda: None)
+    monkeypatch.setattr(
+        forge_api,
+        "_try_domain_method",
+        lambda db, namespace, method, *args, **kwargs: (
+            (True, object()) if method == "parse_one_declaration" else (True, False)
+        ),
+    )
+    import forge.api.members as members
+    monkeypatch.setattr(members, "parse_user_tinfo", lambda _decl: (_ for _ in ()).throw(AssertionError("SDK fallback")))
+
+    result = forge_api.apply_type(0x401000, "u32")
+    assert result == {"ok": False, "error": "could not apply type at 0x401000"}
 def test_apply_type_redefine_range_skips_span_delete_for_user_named_head(monkeypatch):
     """R2.2: a user-named SUB-head inside the span blocks the full-span
     delete — the user's name is never swallowed; the type still applies at
@@ -1806,7 +7087,112 @@ def test_apply_type_parse_failure_reports_error(monkeypatch):
     monkeypatch.setattr(members_mod, "parse_user_tinfo", lambda decl: None, raising=False)
     result = forge_api.apply_type(0x401000, "NotParsable */")
     assert result == {"ok": False, "error": "could not parse declaration 'NotParsable */'"}
-    monkeypatch.setattr(members_mod, "parse_user_tinfo", lambda decl: FakeTinfo(decl.split()[0]), raising=False)
+
+def test_apply_type_prefers_domain_for_simple_declaration(monkeypatch):
+    events = []
+
+    class Tinfo:
+        def dstr(self):
+            return "int"
+
+    class Types:
+        def parse_one_declaration(self, library, declaration):
+            events.append(("parse", library, declaration))
+            return Tinfo()
+
+        def apply_at(self, tinfo, ea):
+            events.append(("apply", tinfo, ea))
+            return True
+
+    class DomainDb:
+        types = Types()
+
+    monkeypatch.setattr(forge_api, "_domain_database_or_none", lambda: DomainDb())
+    result = forge_api.apply_type(0x401000, "int")
+    assert result == {"ok": True, "ea": 0x401000, "type": "int"}
+def test_apply_type_domain_verifies_read_back_before_trusting(monkeypatch):
+    """R2.5 (recovery eval 2026-08-30): ``domain.apply_at`` can report
+    success while idalib's deferred analysis drops the item type, so the
+    facade must read the tinfo back (``ida_nalt.get_tinfo(tinfo_out, ea)``)
+    before trusting it. When the read-back lands the type, apply_type
+    returns the VERIFIED domain result and does NOT fall through to the
+    SDK apply path."""
+    import ida_nalt
+    import ida_typeinf
+
+    class Tinfo:
+        def dstr(self):
+            return "int"
+
+    class Types:
+        def parse_one_declaration(self, library, declaration):
+            return Tinfo()
+
+        def apply_at(self, tinfo, ea):
+            return True
+
+    class DomainDb:
+        types = Types()
+
+    sdk_applies = []
+    monkeypatch.setattr(forge_api, "_domain_database_or_none", lambda: DomainDb())
+    read_backs = []
+    monkeypatch.setattr(
+        ida_nalt,
+        "get_tinfo",
+        lambda tinfo_out, ea: read_backs.append(ea) or True,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        ida_typeinf,
+        "apply_tinfo",
+        lambda ea, tinfo, flags: sdk_applies.append(ea),
+        raising=False,
+    )
+    monkeypatch.setattr(ida_typeinf, "TINFO_DEFINITE", 0x100, raising=False)
+
+    result = forge_api.apply_type(0x401000, "int")
+
+    # the read-back verified the tinfo actually landed at the EA
+    assert read_backs == [0x401000]
+    assert result == {"ok": True, "ea": 0x401000, "type": "int"}
+    assert sdk_applies == [], "verified domain result must not fall through to the SDK"
+
+
+def test_apply_type_domain_false_success_falls_through_to_sdk(monkeypatch):
+    """R2.5: when domain ``apply_at`` reports success but the read-back
+    ``ida_nalt.get_tinfo`` does NOT land the type (idalib dropped it), the
+    facade must not trust the false domain success — it falls through to the
+    definitive SDK apply path (``ida_typeinf.apply_tinfo``) so the type is
+    actually committed."""
+    import ida_nalt
+    import ida_typeinf
+
+    class Types:
+        def parse_one_declaration(self, library, declaration):
+            return FakeTinfo("int")
+
+        def apply_at(self, tinfo, ea):
+            return True
+
+    class DomainDb:
+        types = Types()
+
+    sdk_applies = []
+    monkeypatch.setattr(forge_api, "_domain_database_or_none", lambda: DomainDb())
+    monkeypatch.setattr(ida_nalt, "get_tinfo", lambda tinfo_out, ea: False, raising=False)
+    monkeypatch.setattr(
+        ida_typeinf,
+        "apply_tinfo",
+        lambda ea, tinfo, flags: sdk_applies.append(ea),
+        raising=False,
+    )
+    monkeypatch.setattr(ida_typeinf, "TINFO_DEFINITE", 0x100, raising=False)
+
+    result = forge_api.apply_type(0x401000, "int")
+
+    assert sdk_applies == [0x401000], "unverified domain success must fall through to the SDK"
+    assert result == {"ok": True, "ea": 0x401000, "type": "int"}
 
 
 def test_scan_from_allocation_orchestrates(monkeypatch):
@@ -2300,6 +7686,7 @@ def test_scan_global_adds_named_sub_heads(monkeypatch, _real_hexrays):
 
     result = forge_api.scan_global(0x1400A4000)
 
+    assert result["ok"] is True
     members = {m["name"]: m for m in result["members"]}
     assert result["structure"] == "global_obj_1400a4000"
     assert members["qword"]["offset"] == 0x40
@@ -2425,6 +7812,38 @@ def test_collapse_stride_runs_preserves_non_runs(monkeypatch):
     assert collapsed[2]["name"] == "d"
 
 
+def test_collapse_stride_runs_detaches_preserved_rows(monkeypatch):
+    rows = [
+        {"offset": 0, "name": "single", "type": "u32", "size": 4, "enabled": True},
+        {"offset": 0x20, "name": "disabled", "type": "u8", "size": 1, "enabled": False},
+    ]
+    result = forge_api._collapse_stride_runs(rows)
+    result[0]["name"] = "mutated"
+    result[1]["name"] = "mutated-disabled"
+    assert rows[0]["name"] == "single"
+    assert rows[1]["name"] == "disabled"
+
+
+def test_scan_from_allocation_detaches_allocation_row(monkeypatch):
+    row = {"ea": 0x401000, "var": "a1", "kind": "HEAP", "size_hint": 8, "callee": None}
+    monkeypatch.setattr(forge_api, "guess_allocation", lambda *a, **k: [row])
+    monkeypatch.setattr(forge_api, "_allocation_root_prior_type", lambda *a, **k: None)
+    monkeypatch.setattr(forge_api, "deep_scan", lambda *a, **k: {"members": []})
+    result = forge_api.scan_from_allocation(0x401000, name="Detached")
+    result["allocation"]["var"] = "mutated"
+    assert row["var"] == "a1"
+
+
+def test_merge_member_rows_detaches_selected_rows():
+    base = [{"offset": 0, "name": "base", "score": 1}]
+    extra = [{"offset": 4, "name": "extra", "score": 2}]
+    result = forge_api._merge_member_rows(base, extra)
+    result[0]["name"] = "mutated-base"
+    result[1]["name"] = "mutated-extra"
+    assert base == [{"offset": 0, "name": "base", "score": 1}]
+    assert extra == [{"offset": 4, "name": "extra", "score": 2}]
+
+
 def test_scan_global_sub_heads_skip_existing_member(monkeypatch, _real_hexrays):
     """I.20: an offset that already has a member is not overwritten."""
     import sys as _sys
@@ -2484,10 +7903,13 @@ def test_apply_type_store_fallback_creates_placeholder_first(monkeypatch):
 
     forge_api.create_structure("GridNode")
     forged = []
+    # idc_parse_types returns an ERROR COUNT: 0 == success, nonzero == the
+    # parse failed. The stub must mimic the success shape the placeholder
+    # gate must proceed on (the old stub returned True, the inverted truth).
     monkeypatch.setattr(
         ida_typeinf,
         "idc_parse_types",
-        lambda decl, flags: forged.append(decl) or True,
+        lambda decl, flags: forged.append(decl) or 0,
         raising=False,
     )
     monkeypatch.setattr(forge_api, "is_type", lambda name: False, raising=False)
@@ -2609,6 +8031,46 @@ def test_callees_of_keeps_unresolvable_slot_ea(monkeypatch):
     monkeypatch.setattr(forge_api, "_import_slot_to_name", lambda ea: None, raising=False)
 
     assert forge_api.callees_of(0x401000) == [0x180001000]
+
+
+def test_import_slot_target_uses_domain_qword(monkeypatch):
+    from forge.api import domain
+
+    class Bytes:
+        def get_qword_at(self, ea):
+            assert ea == 0x180001000
+            return 0x140002000
+
+    class DomainDb:
+        bytes = Bytes()
+        database = SimpleNamespace(pointer_size=8)
+        functions = SimpleNamespace(get_at=lambda ea: SimpleNamespace(start_ea=ea))
+
+    domain.clear_fallback_records()
+    monkeypatch.setattr(forge_api, "_domain_database_or_none", lambda: DomainDb())
+    monkeypatch.setattr(forge_api, "_import_slot_to_name", lambda _ea: "printf")
+    assert forge_api._import_slot_target_ea(0x180001000) == 0x140002000
+    assert domain.fallback_records() == ()
+
+
+def test_import_slot_target_domain_failure_records_fallback(monkeypatch):
+    from forge.api import domain
+
+    class Bytes:
+        def get_qword_at(self, _ea):
+            raise RuntimeError("unsupported")
+
+    class DomainDb:
+        bytes = Bytes()
+        database = SimpleNamespace(pointer_size=8)
+        functions = SimpleNamespace(get_at=lambda ea: SimpleNamespace(start_ea=ea))
+
+    domain.clear_fallback_records()
+    monkeypatch.setattr(forge_api, "_domain_database_or_none", lambda: DomainDb())
+    monkeypatch.setattr(forge_api, "_import_slot_to_name", lambda _ea: "printf")
+    monkeypatch.setattr(forge_api, "_sdk_fallback", domain.sdk_fallback)
+    assert forge_api._import_slot_target_ea(0x180001000) == 0
+    assert any(item.capability == "bytes.import_slot_pointer" for item in domain.fallback_records())
 
 
 def test_function_info_aggregates_recon(monkeypatch, _real_hexrays):
@@ -2958,8 +8420,6 @@ def test_e11_set_member_unknown_name_raises(monkeypatch):
 
     with pytest.raises(forge_api.ForgeApiError):
         forge_api.set_member("Coll", 0x10, member_name="nope", name="x")
-
-
 def test_e24_get_member_disambiguates_by_type(monkeypatch):
     """E24: same offset + same name but different types — member_type
     selects the right member (the (offset, name, type) triple match)."""
@@ -3162,6 +8622,31 @@ def test_undo_type_refuses_to_delete_type_created_by_commit(monkeypatch):
 def test_undo_type_missing_snapshot_errors(monkeypatch):
     monkeypatch.setattr(forge_api, "_UNDO_STORE", dict)
 
+
+
+def test_named_type_declaration_uses_domain_existence_preflight(monkeypatch):
+    class Types:
+        def get_by_name(self, name):
+            return object() if name == "Present" else None
+
+    monkeypatch.setattr(forge_api, "_domain_database_or_none", lambda: SimpleNamespace(types=Types()))
+    assert forge_api._named_type_declaration("Missing") is None
+
+
+def test_named_type_declaration_does_not_use_domain_export_as_serializer(monkeypatch):
+    calls = []
+
+    class Types:
+        def get_by_name(self, _name):
+            return object()
+
+        def export_type(self, *_args):
+            calls.append("export")
+            raise AssertionError("export_type is not a serializer")
+
+    monkeypatch.setattr(forge_api, "_domain_database_or_none", lambda: SimpleNamespace(types=Types()))
+    forge_api._named_type_declaration("Present")
+    assert calls == []
     result = forge_api.undo_type("S")
 
     assert result["ok"] is False
@@ -3202,6 +8687,22 @@ def test_create_typedef_parse_failure_is_loud(monkeypatch):
 
     assert result["ok"] is False
     assert "could not parse typedef declaration" in result["error"]
+
+def test_create_typedef_prefers_domain_registration(monkeypatch):
+    calls = []
+
+    class Types:
+        def parse_one_declaration(self, library, declaration, name):
+            calls.append((library, declaration, name))
+            return object()
+
+    class DomainDb:
+        types = Types()
+
+    monkeypatch.setattr(forge_api, "_domain_database_or_none", lambda: DomainDb())
+    result = forge_api.create_typedef("Word", "unsigned int")
+    assert result == {"ok": True, "type": "Word"}
+    assert calls == [(None, "unsigned int", "Word")]
 
 
 def test_create_typedef_falls_back_to_hexrays_create_typedef(monkeypatch):
@@ -3541,7 +9042,58 @@ def test_rename_member_error_dicts(monkeypatch):
         forge_api.rename_member("Outer", 0, "int")
 
 
-def test_add_member_accepts_inline_union_type(monkeypatch):
+
+
+def test_rename_member_domain_same_name_avoids_sdk(monkeypatch):
+    class Member:
+        offset = 8
+        name = "field"
+
+    class Types:
+        def get_by_name(self, _name):
+            return object()
+
+        def get_udt_members(self, _tinfo):
+            return [Member()]
+
+    monkeypatch.setattr(forge_api, "_domain_database_or_none", lambda: SimpleNamespace(types=Types()))
+    assert forge_api.rename_member("Outer", 8, "field") == {
+        "ok": True,
+        "type": "Outer",
+        "offset": 8,
+        "from": "field",
+        "to": "field",
+    }
+def test_add_member_accepts_inline_union_type():
+    """E28: add_member with an inline union type lands a real member."""
+    forge_api.create_structure("Variant")
+    member = forge_api.add_member(
+        "Variant",
+        0,
+        "union { unsigned __int32 as_u32; int as_i32; float as_f32; void *as_ptr; }",
+        name="as",
+    )
+    assert member["name"] == "as"
+    assert member["offset"] == 0
+
+
+def test_placeholder_detection_uses_domain_members(monkeypatch):
+    class TInfo:
+        def is_udt(self):
+            return True
+
+    class Member:
+        name = "_placeholder"
+
+    class Types:
+        def get_by_name(self, _name):
+            return TInfo()
+
+        def get_udt_members(self, _tinfo):
+            return iter([Member()])
+
+    monkeypatch.setattr(forge_api, "_domain_database_or_none", lambda: SimpleNamespace(types=Types()))
+    assert forge_api._is_forge_placeholder_type("Node") is True
     """E28: add_member with an inline union type lands a real member."""
     forge_api.create_structure("Variant")
     member = forge_api.add_member(
@@ -3688,6 +9240,29 @@ def test_name_members_from_printf_recognizes_local_wrappers(monkeypatch, _real_h
     assert result["ok"] is True
     assert result["renamed"] == ["id"]
     assert forge_api.get_member("Player", 0x00)["name"] == "id"
+
+def test_printf_callee_name_prefers_domain_function_metadata(monkeypatch):
+    class Function:
+        pass
+
+    class Functions:
+        def get_at(self, _ea):
+            return Function()
+
+        def get_name(self, _function):
+            return "log_msg"
+
+    class DomainDb:
+        functions = Functions()
+
+    monkeypatch.setattr(forge_api, "_domain_database_or_none", lambda: DomainDb())
+    monkeypatch.setattr(forge_api, "imports", lambda: [])
+    monkeypatch.setattr(
+        forge_api,
+        "_iter_ctree_calls",
+        lambda _cfunc: [SimpleNamespace(x=SimpleNamespace(obj_ea=0x401000))],
+    )
+    assert len(forge_api._printf_call_expressions(SimpleNamespace())) == 1
 
 
 def test_name_members_from_printf_no_printf_call(monkeypatch, _real_hexrays):
@@ -4148,22 +9723,7 @@ def test_guess_allocation_callee_statement_wrapper_property(monkeypatch, _real_h
     """Live 9.4 finding: treeitem statements arrive through a
     property-style to_specific_type that must not be called — the alias
     chain still resolves `return v` where v = w; w = calloc(...)."""
-    import sys as _sys
-
     import ida_funcs
-
-    visitor_module = _sys.modules["forge.api.visitor"]
-    if not hasattr(visitor_module, "RecursiveUpwardsObjectVisitor"):
-        visitor_module.RecursiveUpwardsObjectVisitor = type(
-            "RecursiveUpwardsObjectVisitor",
-            (),
-            {
-                "__init__": lambda self, *a, **k: None,
-                "parent_expr": lambda self: None,
-                "get_line": lambda self: "",
-                "_cfunc": None,
-            },
-        )
 
     from forge.api.scan_object import ObjectType
     from forge.features.guess_allocation import guess_allocation as guess_mod
@@ -4268,6 +9828,22 @@ def test_rename_ea_fails_loudly(monkeypatch):
     assert result["ok"] is False
     assert "dup_name" in result["error"]
 
+def test_rename_ea_prefers_domain_names(monkeypatch):
+    calls = []
+
+    class Names:
+        def set_name(self, ea, name, flags):
+            calls.append((ea, name, flags))
+            return True
+
+    class DomainDb:
+        names = Names()
+
+    monkeypatch.setattr(forge_api, "_domain_database_or_none", lambda: DomainDb())
+    result = forge_api.rename_ea(0x140001000, "domain_name")
+    assert result == {"ok": True, "ea": 0x140001000, "name": "domain_name"}
+    assert calls == [(0x140001000, "domain_name", 1)]
+
 
 def test_templated_args_with_suffixes_synthesize_names():
     assert forge_api._templated_args_with_suffixes(["u32"]) == ["u32", "u32"]
@@ -4353,3 +9929,85 @@ def test_create_type_reports_parser_rejection(monkeypatch):
     assert result["ok"] is False
     assert "rejected" in result["error"]
     assert "4" in result["error"]
+def test_type_of_ea_dispatches_nalt_get_tinfo_with_correct_arg_order(monkeypatch):
+    """Bug 4 (recovery eval): ``type_of(<EA>)`` on IDA 9.4 called the
+    nonexistent module-level ``ida_typeinf.get_tinfo(ea, tinfo)`` (and a
+    swapped-arg ``ida_bytes.get_tinfo`` fallback), returning None for every
+    address. It must call ``ida_nalt.get_tinfo(tinfo, ea)`` and map the
+    result into the scalar dict — no IDA runtime required."""
+    import ida_bytes
+    import ida_nalt
+    import ida_typeinf
+
+    call_args = []
+
+    def _nalt_get_tinfo(tinfo, ea):
+        call_args.append(("nalt", tinfo, ea))
+        tinfo._name = "const char *"
+        tinfo._size = 8
+        return True
+
+    monkeypatch.setattr(
+        ida_nalt, "get_tinfo", _nalt_get_tinfo, raising=False
+    )
+    monkeypatch.setattr(
+        ida_bytes,
+        "get_tinfo",
+        lambda tinfo, ea: call_args.append(("bytes", tinfo, ea)) or False,
+        raising=False,
+    )
+    landed = []
+
+    class _FakeEA:
+        def __init__(self):
+            self._name = ""
+            self._size = 0
+
+        def dstr(self):
+            return self._name
+
+        def get_size(self):
+            return self._size
+
+    monkeypatch.setattr(
+        ida_typeinf,
+        "tinfo_t",
+        lambda: landed.append(_FakeEA()) or landed[-1],
+        raising=False,
+    )
+
+    result = forge_api.type_of(0x140007E28)
+
+    # ida_nalt is preferred and receives (tinfo_out, ea) — never (ea, tinfo);
+    # landed[0] is the exact tinfo instance passed into get_tinfo
+    assert call_args == [("nalt", landed[0], 0x140007E28)]
+    assert result == {
+        "name": 0x140007E28,
+        "type": "const char *",
+        "size": 8,
+        "kind": "scalar",
+        "members": [],
+    }
+
+
+def test_type_of_ea_falls_back_to_bytes_and_none_when_unavailable(monkeypatch):
+    """Bug 4: without ``ida_nalt.get_tinfo`` the facade falls back to
+    ``ida_bytes.get_tinfo``; when neither lands, ``type_of(EA)`` returns
+    None instead of raising."""
+    import ida_bytes
+    import ida_nalt
+    import ida_typeinf
+
+    monkeypatch.delattr(ida_nalt, "get_tinfo", raising=False)
+    calls = []
+
+    def _bytes_get_tinfo(tinfo, ea):
+        calls.append((tinfo, ea))
+        return False  # no tinfo landed
+
+    monkeypatch.setattr(ida_bytes, "get_tinfo", _bytes_get_tinfo, raising=False)
+    monkeypatch.setattr(ida_typeinf, "tinfo_t", lambda: object(), raising=False)
+
+    assert forge_api.type_of(0x140007E28) is None
+    assert len(calls) == 1
+    assert calls[0][1] == 0x140007E28

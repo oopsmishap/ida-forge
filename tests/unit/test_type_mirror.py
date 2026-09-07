@@ -370,6 +370,20 @@ def test_push_all_reports_failures(_registry, monkeypatch):
     assert result["pushed"] == ["Good"]
     assert set(result["failed"]) == {"Bad"}
 
+def test_push_all_processes_catalog_names_sorted(monkeypatch):
+    from forge.api.store import catalog
+
+    catalog.clear()
+    catalog["Zulu"] = object()
+    catalog["Alpha"] = object()
+    seen = []
+    monkeypatch.setattr(forge_api, "_require_ida", lambda: None)
+    monkeypatch.setattr(forge_api, "push_type", lambda name: seen.append(name) or True)
+
+    result = forge_api.push_all()
+    assert seen == ["Alpha", "Zulu"]
+    assert result == {"pushed": ["Alpha", "Zulu"], "failed": {}}
+
 
 def test_refresh_types_updates_members_keeping_names(_registry):
     """I.27: refresh_types re-imports changed IDB member types in place,
@@ -409,3 +423,72 @@ def test_push_then_refresh_is_noop(_registry):
     result = forge_api.refresh_types()
 
     assert result == {"updated": [], "unchanged": ["World"], "renamed": []}
+
+
+def test_idb_udt_snapshot_uses_domain_types(monkeypatch):
+    import forge_api
+
+    member = SimpleNamespace(offset=8, name="field", type=SimpleNamespace(dstr=lambda: "u64"))
+    tinfo = SimpleNamespace(is_udt=lambda: True)
+    monkeypatch.setattr(
+        forge_api,
+        "_current_domain_database",
+        lambda required=False: SimpleNamespace(
+            types=SimpleNamespace(
+                get_by_name=lambda name: tinfo,
+                get_details=lambda value: SimpleNamespace(name="Widget"),
+                get_udt_members=lambda value: iter([member]),
+            )
+        ),
+    )
+    digest, rows = forge_api._idb_udt_snapshot("Widget")
+    assert rows == [(8, "field", "u64")]
+    assert digest
+
+
+def test_domain_named_udt_enumeration_returns_names(monkeypatch):
+    import forge_api
+
+    tinfo = SimpleNamespace(is_udt=lambda: True)
+    monkeypatch.setattr(
+        forge_api,
+        "_current_domain_database",
+        lambda required=False: SimpleNamespace(
+            types=SimpleNamespace(
+                get_all=lambda: iter([tinfo]),
+                get_details=lambda value: SimpleNamespace(name="Widget"),
+            )
+        ),
+    )
+    assert forge_api._domain_named_udts() == [("Widget", tinfo)]
+
+
+def test_domain_base_type_names_uses_library_argument(monkeypatch):
+    import forge_api
+
+    base_til = object()
+    tinfo = SimpleNamespace()
+    calls = []
+    monkeypatch.setattr(
+        forge_api,
+        "_current_domain_database",
+        lambda required=False: SimpleNamespace(
+            types=SimpleNamespace(
+                get_all=lambda **kwargs: (calls.append(kwargs) or iter([tinfo])),
+                get_details=lambda value: SimpleNamespace(name="BaseT"),
+            )
+        ),
+    )
+    assert forge_api._domain_base_type_names(base_til) == {"BaseT"}
+    assert calls == [{"library": base_til}]
+
+
+def test_push_type_records_ordinal_fallback(_registry):
+    from forge.api import domain
+
+    forge_api.create_structure("World")
+    forge_api.add_member("World", 0, "u32", name="x")
+    _registry["World"] = FakeUdt("World", [(0, "x", "u32")])
+    domain.clear_fallback_records()
+    assert forge_api.push_type("World") is True
+    assert any(item.capability == "types.ordinal" for item in domain.fallback_records())
