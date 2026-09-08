@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
 from contextlib import suppress
-from typing import Any, Callable
+from typing import Any
 
 try:
     import ida_expr

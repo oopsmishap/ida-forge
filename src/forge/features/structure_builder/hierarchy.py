@@ -13,9 +13,9 @@ result as unique structures with ``automatic_hierarchy`` /
 from __future__ import annotations
 
 import copy
-from collections.abc import Iterable, Mapping, MutableMapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, MutableMapping, Sequence
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Callable
+from typing import TYPE_CHECKING
 
 import forge.api.types as forge_types
 from forge.api.members import AbstractMember, LinkedStructureMember, VirtualTable

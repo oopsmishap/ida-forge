@@ -7,7 +7,7 @@ IDA type system — including nested ("child") structures reached through
 pointer members.
 
 - **License / origin**: community/side-project codebase (`@oopsmishap`).
-- **Host**: IDA Pro ≥ 9.0 with the Hex-Rays decompiler; Python ≥ 3.9 (IDA 9.x
+- **Host**: IDA Pro ≥ 9.0 with the Hex-Rays decompiler; Python ≥ 3.10 (IDA 9.x
   bundles 3.12).
 
 ## Features

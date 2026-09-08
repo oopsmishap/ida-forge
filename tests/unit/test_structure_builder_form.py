@@ -1589,7 +1589,7 @@ def test_build_structure_table_debug_csv_falls_back_for_root_labels_and_lines(mo
     csv_text = structure_form._build_structure_table_debug_csv()
     rows = list(csv.reader(io.StringIO(csv_text)))
 
-    row = dict(zip(rows[0], rows[1]))
+    row = dict(zip(rows[0], rows[1], strict=False))
 
     assert row["scan_location_count"] == "1"
     assert row["scan_locations"] == "child_func@0x401234"
@@ -1645,7 +1645,7 @@ def test_build_structure_table_debug_csv_reads_simpleline_line_text(monkeypatch)
 
     csv_text = structure_form._build_structure_table_debug_csv()
     rows = list(csv.reader(io.StringIO(csv_text)))
-    row = dict(zip(rows[0], rows[1]))
+    row = dict(zip(rows[0], rows[1], strict=False))
 
     assert row["scan_lines"] == "parent->child = value;"
     assert row["scan_root_lines"] == "if (ok) {"

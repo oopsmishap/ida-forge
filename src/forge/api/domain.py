@@ -21,7 +21,7 @@ from typing import Any
 
 from packaging.version import InvalidVersion, Version
 
-MIN_PYTHON = "3.9"
+MIN_PYTHON = "3.10"
 MIN_IDA = "9.1"
 DOMAIN_DISTRIBUTION = "ida-domain"
 
