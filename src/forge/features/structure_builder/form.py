@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import contextlib
 import copy
 import csv
 import io
-from collections.abc import Iterator
+import uuid
+from collections.abc import Iterable, Iterator
 from enum import IntEnum
 
 import ida_funcs
@@ -18,6 +20,7 @@ from forge.api.hexrays import (
 )
 from forge.api.members import AbstractMember, Member, VirtualTable, parse_user_tinfo
 from forge.api.scan_object import ScanObject
+from forge.api.store import catalog
 from forge.api.structure import Structure, StructureRelationship
 from forge.api.ui import set_row_background_color, set_row_foreground_color
 from forge.features.structure_builder.child_scan import ChildScanMixin
@@ -27,7 +30,14 @@ from forge.features.structure_builder.dialogs import (
     MemberEditorValues,
 )
 from forge.util.logging import log_debug, log_warning
-from forge.util.qt import QtCore, QtGui, QtWidgets, qt_exec, qt_flag_value, qt_item_flags
+from forge.util.qt import (
+    QtCore,
+    QtGui,
+    QtWidgets,
+    qt_combined_flags,
+    qt_exec,
+    qt_item_flags,
+)
 
 from .config import config
 from .ui_form import Ui_view_form
@@ -61,14 +71,23 @@ class StructureBuilderForm(ChildScanMixin, ida_kernwin.PluginForm):
         super().__init__()
         self.parent = None
         self.ui = None
-        self.structures: dict[str, Structure] = {}
+        # I.28: the GUI form and the headless forge_api share one catalog —
+        # a structure created headless shows up in the form and vice versa.
+        self.structures = catalog
         self.current_structure: Structure | None = None
         self.layout = None
         self._shortcut_actions: list[QtGui.QAction] = []
         self._last_table_selection_signature: tuple | None = None
+        catalog.events.append(self.reload_structure_list)
     def show(self):
         if self.ui is not None and not self._qt_widget_alive(self.ui):
             self._reset_ui_state()
+        # OnClose/reset unsubscribes from the shared catalog, but this form is
+        # a module-level singleton re-shown by ShowStructureFormAction — so a
+        # close+reshow cycle must re-subscribe or the form stops seeing
+        # headless catalog mutations (I.28).
+        if self.reload_structure_list not in catalog.events:
+            catalog.events.append(self.reload_structure_list)
         return ida_kernwin.PluginForm.Show(self, "Structure Builder")
 
     def OnCreate(self, form):
@@ -92,10 +111,13 @@ class StructureBuilderForm(ChildScanMixin, ida_kernwin.PluginForm):
 
         Stale structures from a previous DB session must not survive a close
         or plugin reload — the relaunched form starts from an empty scanner.
+        The shared catalog is deliberately NOT cleared: headless structures
+        outlive the form (I.28).
         """
-        self.structures.clear()
         self.current_structure = None
         self._reset_ui_state()
+        with contextlib.suppress(ValueError):
+            catalog.events.remove(self.reload_structure_list)
 
     def _reset_ui_state(self) -> None:
         self.parent = None
@@ -261,11 +283,18 @@ class StructureBuilderForm(ChildScanMixin, ida_kernwin.PluginForm):
         self.ui.tbl_structure.setSelectionMode(
             QtWidgets.QAbstractItemView.ExtendedSelection
         )
-        # qt_flag_value: bitwise OR on PySide6's EditTrigger enums would trip
-        # the PyQt5-shim RuntimeWarning; combine the int values instead.
+        # qt_combined_flags: bitwise OR on PySide6's EditTrigger enums
+        # would trip the PyQt5-shim RuntimeWarning, and the plain-int form
+        # is REJECTED by PySide6's typed setEditTriggers — combine ints,
+        # then wrap in the binding's EditTrigger type when it exists.
         self.ui.tbl_structure.setEditTriggers(
-            qt_flag_value(QtWidgets.QAbstractItemView.DoubleClicked)
-            | qt_flag_value(QtWidgets.QAbstractItemView.EditKeyPressed)
+            qt_combined_flags(
+                QtWidgets.QAbstractItemView.DoubleClicked,
+                QtWidgets.QAbstractItemView.EditKeyPressed,
+                flags_type=getattr(
+                    QtWidgets.QAbstractItemView, "EditTrigger", None
+                ),
+            )
         )
         # Per-state row colors (origin / disabled / collision) carry
         # the visual structure. The Qt default alternating-row painter
@@ -702,24 +731,14 @@ class StructureBuilderForm(ChildScanMixin, ida_kernwin.PluginForm):
         name = ida_kernwin.ask_str("", ida_kernwin.HIST_IDENT, "Enter structure name:")
         self.create_structure(name)
 
-    def _make_unique_structure_name(self, base_name: str) -> str:
-        if base_name not in self.structures:
-            return base_name
-
-        copy_index = 2
-        candidate = f"{base_name} Copy"
-        while candidate in self.structures:
-            candidate = f"{base_name} Copy {copy_index}"
-            copy_index += 1
-        return candidate
-
     def _next_auto_structure_name(self) -> str:
-        index = 1
-        while True:
-            candidate = f"auto_struct_{index:03d}"
-            if candidate not in self.structures:
-                return candidate
-            index += 1
+        # A unique, non-generic auto-name: "Structure" as a literal name was
+        # easy to collide with (user structs, stale lookups after rename), so
+        # auto-created structures get a short random suffix. unique_name()
+        # guards against the astronomically-unlikely uuid collision.
+        return self._make_unique_structure_name(
+            f"structure_{uuid.uuid4().hex[:8]}"
+        )
 
     def _clone_member(self, member: AbstractMember):
         cloned_member = copy.copy(member)
@@ -803,6 +822,32 @@ class StructureBuilderForm(ChildScanMixin, ida_kernwin.PluginForm):
 
         self.update_action_states()
         return structure
+
+    def _make_unique_structure_name(self, base_name: str) -> str:
+        """A catalog-unique variant of ``base_name`` (``base``, ``base Copy``...).
+
+        Delegates to the shared catalog so headless (forge_api) structures and
+        GUI structures share one namespace (I.28).
+        """
+        return catalog.unique_name(base_name)
+
+    def _register_structure_models(
+        self, structures: Iterable[Structure]
+    ) -> tuple[Structure, ...]:
+        """Insert committed hierarchy structures into the shared catalog.
+
+        Registering = inserting into ``self.structures`` (the shared catalog),
+        which fires the catalog change event so both the GUI and the headless
+        facade see the new models.
+        """
+        registered = tuple(structures)
+        # One catalog transaction per hierarchy commit: a single snapshot +
+        # change notification instead of one per structure (O(N) snapshots
+        # and N GUI tree rebuilds would otherwise compound per member).
+        with catalog.transaction(f"register {len(registered)} structure models"):
+            for structure in registered:
+                self.structures[structure.name] = structure
+        return registered
 
     def prompt_create_structure(self):
         name = ida_kernwin.ask_str("", ida_kernwin.HIST_IDENT, "Enter structure name:")
@@ -936,7 +981,9 @@ class StructureBuilderForm(ChildScanMixin, ida_kernwin.PluginForm):
                 log_warning(f"Linked child structure {child_name} does not exist.", True)
                 continue
 
-            child_structure.create_type_if_ready(self.structures)
+            child_structure.create_type_if_ready(
+                self.structures, headless=True
+            )
 
         self._refresh_all_linked_member_types()
         self.update_structure_fields()
@@ -945,7 +992,9 @@ class StructureBuilderForm(ChildScanMixin, ida_kernwin.PluginForm):
         if self.current_structure is None:
             return
 
-        self.current_structure.create_subtree_types_postorder(self.structures)
+        self.current_structure.create_subtree_types_postorder(
+            self.structures, headless=True
+        )
         self._refresh_all_linked_member_types()
         self.update_structure_fields()
 
@@ -1624,14 +1673,23 @@ class StructureBuilderForm(ChildScanMixin, ida_kernwin.PluginForm):
         if not self.current_structure.rename_created_type(old_name, name):
             return
 
-        self.structures[name] = self.current_structure
-        del self.structures[old_name]
+        # Update the object's name BEFORE the dict mutations below: each one
+        # fires the catalog change event (self.structures IS the catalog),
+        # which synchronously runs the GUI's reload_structure_list. If the
+        # name lagged, that re-entrant reload would read the stale old name
+        # after the old key is gone -> "Structure <oldname> does not exist!".
         self.current_structure.name = name
         self.current_structure.is_auto_named = False
+
+        # clear the filter before the catalog mutations: each one fires the
+        # reload callback, which re-reads the (possibly reset) UI state
+        if self.ui is not None:
+            self.ui.input_filter.clear()
+        self.structures[name] = self.current_structure
+        del self.structures[old_name]
         for structure in self.structures.values():
             structure.rename_relationship_references(old_name, name)
 
-        self.ui.input_filter.clear()
         self.reload_structure_list()
         if not self._select_structure_in_tree(name):
             self.set_structure(name)
@@ -2008,7 +2066,28 @@ class StructureBuilderForm(ChildScanMixin, ida_kernwin.PluginForm):
         if self.current_structure is None:
             return
 
-        self.current_structure.create_type_if_ready(self.structures)
+        self.current_structure.create_type_if_ready(
+            self.structures, headless=True
+        )
+        self._refresh_all_linked_member_types()
+        self.update_structure_fields()
+
+    def structure_table_finalize_with_preview(self):
+        if self.current_structure is None:
+            return
+
+        unresolved = self.current_structure.get_unresolved_child_names(self.structures)
+        if unresolved:
+            log_warning(
+                f"Cannot create type for {self.current_structure.name}: "
+                f"unresolved child structures: {', '.join(unresolved)}",
+                True,
+            )
+            return
+        if not self.current_structure.refresh_linked_member_types(self.structures):
+            return
+
+        self.current_structure.pack_structure()
         self._refresh_all_linked_member_types()
         self.update_structure_fields()
 
@@ -2077,6 +2156,12 @@ class StructureBuilderForm(ChildScanMixin, ida_kernwin.PluginForm):
         finalize_action = menu.addAction("Create Type")
         finalize_action.setEnabled(bool(self.current_structure.members))
         finalize_action.triggered.connect(self.structure_table_finalize)
+
+        finalize_edit_action = menu.addAction("Create Type (Edit Declaration)...")
+        finalize_edit_action.setEnabled(bool(self.current_structure.members))
+        finalize_edit_action.triggered.connect(
+            self.structure_table_finalize_with_preview
+        )
 
         create_child_types_action = menu.addAction("Create Child Types")
         create_child_types_action.setEnabled(bool(self.current_structure.child_relationships))

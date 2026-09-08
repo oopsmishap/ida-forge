@@ -14,10 +14,30 @@ import ida_typeinf
 import ida_xref
 
 from forge.api import cache
+from forge.api.domain import current_database as _current_domain_database
+from forge.api.domain import sdk_fallback as _sdk_fallback
+from forge.api.domain import try_domain_method as _try_domain_method
 from forge.api.tinfo import is_incomplete_tinfo
 from forge.api.types import types
 from forge.util.logging import log_debug, log_error, log_warning
 from forge.util.util import DocIntEnum
+
+
+def _domain_function_for_offset(ea: int):
+    handled, function = _try_domain_method(
+        _current_domain_database(required=False),
+        "functions",
+        "get_at",
+        ea,
+        capability="functions.offset_str",
+        unavailable_reason=(
+            "ida-domain function lookup unavailable on this build/session"
+        ),
+        failure_reason="ida-domain function lookup failed for offset formatting",
+    )
+    if handled:
+        return function
+    return ida_funcs.get_func(ea)
 
 
 def to_hex(ea: int) -> str:
@@ -37,9 +57,22 @@ def decompile(ea: int):
         log_debug(f"Skipping decompile at {to_hex(ea)} (BADADDR)")
         return None
     # Only real functions produce a meaningful ctree; decompiling data/thunk
-    # regions wastes time and can raise on unusual inputs. The decompiler
-    # parenthesises function chunks, so get_func is the reliable check.
-    if ida_funcs.get_func(ea) is None:
+    # regions wastes time and can raise on unusual inputs. Prefer Domain's
+    # structured function lookup before the SDK compatibility path.
+    handled, function = _try_domain_method(
+        _current_domain_database(required=False),
+        "functions",
+        "get_at",
+        ea,
+        capability="functions.decompile_precondition",
+        unavailable_reason=(
+            "ida-domain function lookup unavailable on this build/session"
+        ),
+        failure_reason="ida-domain function lookup failed before decompilation",
+    )
+    if not handled or function is None:
+        function = ida_funcs.get_func(ea)
+    if function is None:
         log_warning(
             f"Skipping decompile at {to_hex(ea)}: not a function"
         )
@@ -62,12 +95,167 @@ def mark_cfunc_dirty(ea: int, close_views: bool = False) -> None:
     if hasattr(ida_hexrays, "mark_cfunc_dirty"):
         ida_hexrays.mark_cfunc_dirty(ea, close_views)
 
+
+def set_lvar_type(cfunc, lvar, tinfo) -> bool:
+    """Commit a local variable's type headless.
+
+    Domain-first: ``db.pseudocode.decompile(ea)`` → ``find_local_variable``
+    → ``set_type`` + ``save_local_variable_info(save_type=True)`` — the same
+    operation the facade's ``set_lvar_types`` domain path uses (ida-domain
+    0.5.1, ``PseudocodeFunction``). Falls back to the raw SDK path
+    (``modify_user_lvar_info`` with the mandatory ``MLI_TYPE`` flag — without
+    it the call returns False silently) when the Domain route is unavailable
+    or cannot resolve the variable. (``vdui_t.set_lvar_type`` is GUI-only and
+    ``cfunc.set_lvar_type`` was removed in IDA 9.4, so these are the only
+    working headless paths.)
+
+    Returns:
+        bool — True when the type was committed.
+    """
+    entry_ea = getattr(cfunc, "entry_ea", None)
+    lvar_name = getattr(lvar, "name", None)
+    handled, function = _try_domain_method(
+        _current_domain_database(required=False),
+        "pseudocode",
+        "decompile",
+        entry_ea,
+        capability="pseudocode.decompile.set_lvar_type",
+        unavailable_reason=(
+            "ida-domain pseudocode decompilation unavailable for local-variable retyping on this build/session"
+        ),
+        failure_reason="ida-domain pseudocode decompilation failed for local-variable retyping",
+        exceptions=(Exception,),
+    )
+    if handled:
+        find_local = getattr(function, "find_local_variable", None)
+        variable = (
+            find_local(lvar_name)
+            if callable(find_local) and lvar_name is not None
+            else None
+        )
+        set_type = getattr(variable, "set_type", None)
+        save = getattr(function, "save_local_variable_info", None)
+        try:
+            if (
+                variable is not None
+                and callable(set_type)
+                and callable(save)
+                and set_type(tinfo)
+                and save(variable, save_type=True)
+            ):
+                return True
+        except Exception as exc:  # noqa: BLE001 — any Domain mutation failure falls back to the SDK path
+            log_debug(f"ida-domain local-variable retyping failed: {exc!r}")
+        _sdk_fallback(
+            "pseudocode.decompile.set_lvar_type",
+            "ida-domain local-variable mutation unavailable on this build/session",
+        )
+    lvi = ida_hexrays.lvar_saved_info_t()
+    lvi.ll = ida_hexrays.lvar_locator_t(lvar.location, lvar.defea)
+    lvi.type = tinfo
+    return bool(ida_hexrays.modify_user_lvar_info(entry_ea, ida_hexrays.MLI_TYPE, lvi))
+
 def get_line(ctree: ida_hexrays.ctree_parentee_t, cfunc) -> str:
     for p in reversed(ctree.parents):
         if not p.is_expr():
             return ida_lines.tag_remove(p.print1(cfunc.__ref__()))
     log_warning("Parent instruction is not found")
     return ""
+
+
+def _return_value(return_insn):
+    """The expression a ``return`` statement returns.
+
+    The binding exposes the value either directly (``.x`` — unit doubles
+    and older builds) or through the statement's return struct
+    (``.creturn``/``.details`` — live 9.4 finding 2026-08-15: the
+    statement carries ``creturn_t`` with the value under ``.x``).
+    """
+    value = getattr(return_insn, "x", None)
+    if value is not None:
+        return value
+    return_struct = (
+        getattr(return_insn, "creturn", None)
+        or getattr(return_insn, "details", None)
+        or getattr(return_insn, "ret", None)
+    )
+    if return_struct is not None:
+        value = getattr(return_struct, "expr", None)
+        if value is not None:
+            return value
+        return getattr(return_struct, "x", None)
+    return None
+
+
+def iter_returned_exprs(cfunc, ret_op=None):
+    """Yield the expression of every ``return <expr>`` statement.
+
+    Shared by the allocation guesser and :func:`scan_returned` (E.22/F.3).
+    ``ret_op`` defaults to the module's ctree return code; pass an explicit
+    code to match test doubles. Walks treeitems when present (skipping
+    items without statement bodies — 9.4 live finding 2026-08-15),
+    falling back to a ctree-visitor walk.
+    """
+    if ret_op is None:
+        ret_op = (
+            getattr(ctype, "ret", None)
+            or getattr(ctype, "cit_ret", None)
+            or getattr(ctype, "cit_return", None)
+        )
+    found: list = []
+    treeitems = getattr(cfunc, "treeitems", None)
+    if treeitems:
+        for item in treeitems:
+            # to_specific_type is a method on some builds and a property
+            # on the live 9.4 build — either way the specific object is
+            # what carries the statement/expression.
+            to_specific = getattr(item, "to_specific_type", None)
+            if callable(to_specific):
+                specific = to_specific()
+            elif to_specific is not None:
+                specific = to_specific
+            else:
+                specific = getattr(item, "it", None) or item
+            if ret_op is not None and getattr(specific, "op", None) == ret_op:
+                value = _return_value(specific)
+                if value is not None:
+                    found.append(value)
+        if found:
+            yield from found
+            return
+        # treeitems exist but expose no statement bodies on this build
+        # (9.4 live finding 2026-08-15: ret items carry x=None) — walk
+        # the ctree instead.
+
+    walker_cls = getattr(ida_hexrays, "ctree_visitor_t", None)
+    if walker_cls is None or ret_op is None:
+        return
+
+    class _ReturnWalker(walker_cls):
+        def __init__(self):
+            try:
+                walker_cls.__init__(self, 0)
+            except TypeError:
+                walker_cls.__init__(self, None)  # pragma: no cover — binding drift
+            self.returned = []
+
+        def visit_insn(self, insn):
+            # the binding hook for statements is visit_insn, not
+            # visit_statement (O1 live finding, 2026-08-13)
+            if getattr(insn, "op", None) == ret_op:
+                value = _return_value(insn)
+                if value is not None:
+                    self.returned.append(value)
+            return 0
+
+    walker = _ReturnWalker()
+    body = getattr(cfunc, "body", None)
+    if body is not None:
+        try:
+            walker.apply_to(body, None)
+        except Exception:  # noqa: BLE001 — walk is best-effort
+            return
+    yield from walker.returned
 
 
 def collect_ctree_items_near_ea(
@@ -97,7 +285,7 @@ def collect_ctree_items_near_ea(
     if (exhaustive or not candidates) and eamap is not None:
         try:
             candidates.extend(list(eamap.get(ea, [])))
-        except Exception:  # noqa: BLE001 — eamap shape differs across IDA versions
+        except Exception:  # noqa: BLE001 — eamap API drift is probed, not fatal
             log_debug(f"eamap lookup failed for {to_hex(ea)}; skipping")
 
     body = getattr(cfunc, "body", None)
@@ -108,7 +296,7 @@ def collect_ctree_items_near_ea(
     ):
         try:
             closest_item = body.find_closest_addr(ea)
-        except Exception:  # noqa: BLE001 — stale cfunc after IDB type changes
+        except Exception:  # noqa: BLE001 — find_closest_addr drift is probed, not fatal
             log_debug(f"find_closest_addr failed for {to_hex(ea)}; skipping")
             closest_item = None
         if closest_item is not None:
@@ -141,26 +329,115 @@ def get_ordinal(tinfo: ida_typeinf.tinfo_t):
 
 def read_pointer(ea):
     """Read a pointer-sized value from the database at ``ea``."""
-    if types.width == 8:
+    domain_db = _current_domain_database(required=False)
+    pointer_width = getattr(domain_db, "pointer_size", None) if domain_db is not None else None
+    architecture = None
+    if domain_db is not None:
+        if pointer_width is None:
+            bitness = getattr(domain_db, "bitness", None)
+            if bitness in (32, 64):
+                pointer_width = bitness // 8
+        architecture = getattr(domain_db, "architecture", None)
+    if pointer_width is None:
+        pointer_width = types.width
+    is_arm = (architecture or ida_ida.idainfo.procname) == "ARM"
+    reader_name = "get_qword_at" if pointer_width == 8 else "get_dword_at"
+    handled, ptr = _try_domain_method(
+        domain_db,
+        "bytes",
+        reader_name,
+        ea,
+        capability="bytes.read_pointer",
+        unavailable_reason=(
+            "ida-domain pointer reader unavailable on this build/session"
+        ),
+        failure_reason="ida-domain pointer read failed",
+    )
+    if handled:
+        if pointer_width != 8 and is_arm:
+            ptr &= -2
+        return ptr
+    if pointer_width == 8:
         return ida_bytes.get_64bit(ea)
     ptr = ida_bytes.get_32bit(ea)
-    if ida_ida.idainfo.procname == "ARM":
+    if is_arm:
         ptr &= -2  # clear thumb bit
     return ptr
-
-
 def is_code(ea: int):
-    flags = ida_bytes.get_full_flags(ea & -2) if ida_ida.idainfo.procname == "ARM" else ida_bytes.get_full_flags(ea)
-    return ida_bytes.is_code(flags)
+    normalized_ea = ea & -2 if ida_ida.idainfo.procname == "ARM" else ea
+    handled, result = _try_domain_method(
+        _current_domain_database(required=False),
+        "bytes",
+        "is_code_at",
+        normalized_ea,
+        capability="bytes.is_code_at",
+        unavailable_reason=(
+            "ida-domain code classification unavailable on this build/session"
+        ),
+        failure_reason="ida-domain code classification failed for address",
+    )
+    if handled:
+        return bool(result)
+    return ida_bytes.is_code(ida_bytes.get_full_flags(normalized_ea))
 
 
 def is_imported(ea: int):
-    seg = ida_segment.getseg(ea)
-    if seg is not None and ida_segment.get_segm_name(seg) == ".plt":
+    domain_db = _current_domain_database(required=False)
+    image_base = getattr(domain_db, "base_address", None)
+    if image_base is None:
+        image_base = ida_nalt.get_imagebase()
+    # Domain accepts absolute EAs. Preserve compatibility with callers that
+    # provide an RVA by lifting only values below the image base.
+    normalized_ea = ea + image_base if ea < image_base else ea
+    handled, imported = _try_domain_method(
+        domain_db,
+        "imports",
+        "get_import_at",
+        normalized_ea,
+        capability="imports.get_import_at",
+        unavailable_reason=(
+            "ida-domain import lookup unavailable on this build/session"
+        ),
+        failure_reason="ida-domain import lookup failed for address",
+    )
+    if handled and imported is not None:
         return True
-    return ea + ida_nalt.get_imagebase() in cache.imported_ea
-
-
+    segment_domain_failed = False
+    segment, segment_handled = None, False
+    if domain_db is not None:
+        segment_handled, segment = _try_domain_method(
+            domain_db,
+            "segments",
+            "get_at",
+            normalized_ea,
+            capability="segments.name",
+            unavailable_reason=(
+                "ida-domain segment lookup/name unavailable on this build/session"
+            ),
+            failure_reason="ida-domain segment lookup/name failed for import detection",
+        )
+    if segment_handled and segment is not None:
+        name_handled, segment_name = _try_domain_method(
+            domain_db,
+            "segments",
+            "get_name",
+            segment,
+            capability="segments.name",
+            unavailable_reason=(
+                "ida-domain segment lookup/name unavailable on this build/session"
+            ),
+            failure_reason="ida-domain segment lookup/name failed for import detection",
+        )
+        if name_handled and segment_name == ".plt":
+            return True
+        segment_domain_failed = not name_handled
+    else:
+        segment_domain_failed = not segment_handled
+    if segment_domain_failed or domain_db is None:
+        seg = ida_segment.getseg(normalized_ea)
+        if seg is not None and ida_segment.get_segm_name(seg) == ".plt":
+            return True
+    return normalized_ea in cache.imported_ea
 def get_argument(
     cfunc: ida_hexrays.cfunc_t, idx: int
 ) -> tuple[ida_hexrays.lvar_t, int]:
@@ -279,14 +556,53 @@ def get_func_argument_info(
         return idx, func_tinfo.get_nth_arg(idx)
     return idx, None
 
+def _domain_function_starts(domain_db, sources, capability) -> set[int] | None:
+    starts = set()
+    for source in sources:
+        handled, function = _try_domain_method(
+            domain_db,
+            "functions",
+            "get_at",
+            source,
+            capability=capability,
+            unavailable_reason="ida-domain function lookup unavailable on this build/session",
+            failure_reason="ida-domain function lookup failed while resolving xref source",
+            exceptions=(Exception,),
+        )
+        if not handled:
+            return None
+        if function:
+            starts.add(function.start_ea)
+        else:
+            log_debug(f"Could not find function for address 0x{to_hex(source)}")
+    return starts
+
 
 def get_funcs_calling_address(ea):
-    """
-    Returns a set of function start addresses that call the specified address.
-
-    :param ea: The address to search for.
-    :return: A set of function start addresses.
-    """
+    """Return function starts containing Domain code-xref sources."""
+    domain_db = _current_domain_database(required=False)
+    if domain_db is not None:
+        handled, sources = _try_domain_method(
+            domain_db,
+            "xrefs",
+            "code_refs_to_ea",
+            ea,
+            capability="xrefs.get_funcs_calling_address",
+            unavailable_reason="ida-domain database/xref API unavailable for code-xref resolution",
+            failure_reason="ida-domain code-xref iteration failed",
+            exceptions=(Exception,),
+        )
+        if handled:
+            starts = _domain_function_starts(
+                domain_db, sources, "xrefs.get_funcs_calling_address"
+            )
+            if starts is not None:
+                return starts
+    else:
+        _sdk_fallback(
+            "xrefs.get_funcs_calling_address",
+            "ida-domain database unavailable for code-xref resolution",
+        )
     xref_ea = ida_xref.get_first_cref_to(ea)
     xrefs = set()
     while xref_ea != ida_idaapi.BADADDR:
@@ -294,36 +610,63 @@ def get_funcs_calling_address(ea):
         if xref_func:
             xrefs.add(xref_func.start_ea)
         else:
-            log_warning(f"Could not find function for address 0x{to_hex(xref_ea)}")
+            log_debug(f"Could not find function for address 0x{to_hex(xref_ea)}")
         xref_ea = ida_xref.get_next_cref_to(ea, xref_ea)
     return xrefs
 
 
 def get_funcs_referencing_address(ea: int) -> set[int]:
-    """
-    Returns a set of function start addresses that reference the specified address.
-
-    This is broader than `get_funcs_calling_address()` and includes functions that
-    read/write a global variable through code or data xrefs.
-    """
+    """Return function starts containing Domain code or data-xref sources."""
+    domain_db = _current_domain_database(required=False)
+    if domain_db is not None:
+        handled, code_sources = _try_domain_method(
+            domain_db,
+            "xrefs",
+            "code_refs_to_ea",
+            ea,
+            capability="xrefs.get_funcs_referencing_address",
+            unavailable_reason="ida-domain xref API unavailable for code/data-xref resolution",
+            failure_reason="ida-domain code-xref iteration failed",
+            exceptions=(Exception,),
+        )
+        if handled:
+            data_handled, data_sources = _try_domain_method(
+                domain_db,
+                "xrefs",
+                "data_refs_to_ea",
+                ea,
+                capability="xrefs.get_funcs_referencing_address",
+                unavailable_reason="ida-domain xref API unavailable for code/data-xref resolution",
+                failure_reason="ida-domain data-xref iteration failed",
+                exceptions=(Exception,),
+            )
+            if data_handled:
+                starts = _domain_function_starts(
+                    domain_db,
+                    list(code_sources) + list(data_sources),
+                    "xrefs.get_funcs_referencing_address",
+                )
+                if starts is not None:
+                    return starts
+    else:
+        _sdk_fallback(
+            "xrefs.get_funcs_referencing_address",
+            "ida-domain database unavailable for xref resolution",
+        )
     xrefs: set[int] = set()
     xref = ida_xref.xrefblk_t()
     if not xref.first_to(ea, ida_xref.XREF_ALL):
         return xrefs
-
     while True:
         xref_func = ida_funcs.get_func(xref.frm)
         if xref_func is not None:
             xrefs.add(xref_func.start_ea)
         if not xref.next_to():
             break
-
     return xrefs
-
-
 def get_member_name(tinfo: ida_typeinf.tinfo_t, offset: int) -> str:
     """
-    Acquires the member name based on the given struct/union
+    Acquires the member name based on the given struct/union.
 
     :param tinfo: ida_typeinf.tinfo_t
     :param offset: index of member within struct/union
@@ -347,7 +690,7 @@ def is_legal_type(tinfo: ida_typeinf.tinfo_t) -> bool:
         clr_const = getattr(tinfo, "clr_const", None)
         if callable(clr_const):
             clr_const()
-    except Exception:  # noqa: BLE001 — broken tinfo wrappers are rejected below
+    except Exception:  # noqa: BLE001 — malformed tinfo doubles must read as not-legal, not raise
         return False
 
     # Forward declarations and other incomplete wrappers are not usable root types.
@@ -413,12 +756,24 @@ def to_function_offset_str(ea: int) -> str:
     :param int ea: the address to convert
     :return: the nice string representation of the address
     """
-    func = ida_funcs.get_func(ea)
+    func = _domain_function_for_offset(ea)
     if func is None:
         return "<no-function>"
 
     func_start_ea = func.start_ea
-    func_name = ida_name.get_name(func_start_ea) or to_hex(func_start_ea)
+    domain_db = _current_domain_database(required=False)
+    handled, func_name = _try_domain_method(
+        domain_db,
+        "names",
+        "get_at",
+        func_start_ea,
+        capability="names.offset_str",
+        unavailable_reason="ida-domain name lookup unavailable on this build/session",
+        failure_reason="ida-domain name lookup failed for offset formatting",
+    )
+    if not handled:
+        func_name = None
+    func_name = func_name or ida_name.get_name(func_start_ea) or to_hex(func_start_ea)
     offset = ea - func_start_ea
     if offset == 0:
         return func_name
@@ -445,7 +800,7 @@ class e_mopt(DocIntEnum):
     v = 6, "global variable"
     b = 7, "micro basic block (mblock_t)"
     f = 8, "list of arguments"
-    l = 9, "local variable"  # noqa: E741 — mirrors the IDA C API name
+    l = 9, "local variable"  # noqa: E741 — mirrors the IDA mop_t mnemonic
     a = 10, "mop_addr_t: address of operand (mop_l, mop_v, mop_S, mop_r)"
     h = 11, "helper function"
     c = 12, "mcases"

@@ -123,3 +123,8 @@ def test_idc_state_round_trip_via_plugmod(monkeypatch):
     # The registered callbacks are exactly these bound methods.
     assert calls[0]["fp"] == plugmod.get_state
     assert calls[1]["fp"] == plugmod.add_state
+
+def test_register_idc_func_skips_when_ida_expr_unavailable(monkeypatch):
+    monkeypatch.setattr(forge.plugin, "ida_expr", None)
+    register_idc_func(_FakePlugmod())
+    unregister_idc_func()

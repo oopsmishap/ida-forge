@@ -14,6 +14,8 @@ from forge.api.scan_object import (
     StructureReferenceObject,
     VariableObject,
     _extract_offset_expression,
+    _make_offset_scan_object,
+    _safe_struct_name,
 )
 
 
@@ -166,6 +168,60 @@ def test_global_variable_and_call_argument_targets_match_expected_expression():
 
     assert GlobalVariableObject(0x1234).is_target(global_expr) is True
     assert CallArgumentObject(0x5678, 0).is_target(call_expr) is True
+
+def test_safe_struct_name_rejects_void_and_integral_aliases():
+    # Hexrays' dstr() of a void-pointer pointee, a void lvar, or any
+    # integral scalar returns these strings. Treating them as struct names
+    # produces "struct void { ... }" downstream and triggers "Void type is
+    # forbidden here" from the parser per affected site.
+    assert _safe_struct_name(FakeType("void")) is None
+    assert _safe_struct_name(FakeType("void *", pointed=FakeType("void"))) is None
+    assert _safe_struct_name(FakeType("void[N]")) is None
+    assert _safe_struct_name(FakeType("const void *", pointed=FakeType("void"))) is None
+    assert _safe_struct_name(FakeType("nullptr")) is None
+    assert _safe_struct_name(FakeType("_DWORD")) is None
+    assert _safe_struct_name(FakeType("_QWORD[4]")) is None
+    # real struct names survive untouched
+    assert _safe_struct_name(FakeType("MyStruct")) == "MyStruct"
+    assert _safe_struct_name(FakeType("MyStruct *", pointed=FakeType("MyStruct"))) == "MyStruct *"
+    # defensive defaults
+    assert _safe_struct_name(None) is None
+    assert _safe_struct_name(SimpleNamespace(dstr=lambda: "")) is None
+
+
+def test_scan_object_create_returns_none_for_void_memptr_and_memref(monkeypatch):
+    """A ``void *`` access must not be turned into a StructureReferenceObject
+    carrying the literal struct name ``"void"`` — that gets fed to the parser
+    later and produces "Void type is forbidden here" + dialog spam per row.
+    """
+    cfunc = FakeCfunc([FakeLvar("arg0")])
+    monkeypatch.setattr(ScanObject, "get_expression_address", staticmethod(lambda _cfunc, expr: expr.ea))
+
+    ptr_expr = FakeExpr(
+        ctype.memptr,
+        m=8,
+        x=SimpleNamespace(type=FakeType("void *", pointed=FakeType("void"))),
+        type=FakeType("field_t"),
+        ea=0x30,
+    )
+    assert ScanObject.create(cfunc, ptr_expr) is None
+
+    ref_expr = FakeExpr(
+        ctype.memref,
+        m=4,
+        x=SimpleNamespace(type=FakeType("void")),
+        type=FakeType("field_t"),
+        ea=0x40,
+    )
+    assert ScanObject.create(cfunc, ref_expr) is None
+
+
+def test_make_offset_scan_object_skips_void_base(monkeypatch):
+    base = SimpleNamespace(tinfo=FakeType("void *", pointed=FakeType("void")), name="x", ea=0x100)
+    assert _make_offset_scan_object(base, 0x10) is base
+    # integral alias as the base must also yield no reference object
+    base2 = SimpleNamespace(tinfo=FakeType("_QWORD"), name="y", ea=0x200)
+    assert _make_offset_scan_object(base2, 0x8) is base2
 
 
 
@@ -425,6 +481,29 @@ def test_memory_allocation_object_create_handles_direct_and_casted_calls(monkeyp
     assert via_cast.scan_root_function_name == "sub_1000"
 
 
+def test_scan_object_create_with_promote_root_false_leaves_root_unset(monkeypatch):
+    """A mid-walk ScanObject.create (visitor step, assignment tracking) must
+    NOT promote the lvar to a new scan root — that promotion is what causes
+    a ``v0->field = v2`` LHS to be picked up as a fresh scan root when the
+    scan was started on ``v2``.
+    """
+    cfunc = FakeCfunc([FakeLvar("v2")], entry_ea=0x401000)
+    monkeypatch.setattr(
+        ScanObject,
+        "get_expression_address",
+        staticmethod(lambda _cfunc, expr: expr.ea),
+    )
+    var_expr = FakeExpr(ctype.var, v=SimpleNamespace(idx=0), ea=0x401020)
+    obj = ScanObject.create(cfunc, var_expr, promote_root=False)
+    assert obj is not None
+    assert obj.name == "v2"
+    assert obj.scan_root_function_ea == -1  # BADADDR sentinel from __init__
+    assert obj.scan_root_ea == -1
+    # And the default behaviour (promote_root=True) still promotes.
+    promoted = ScanObject.create(cfunc, var_expr)
+    assert promoted.scan_root_function_ea == 0x401000
+    assert promoted.scan_root_ea == 0x401020
+
 
 
 def test_memory_allocation_object_create_multiplies_calloc_size(monkeypatch):
@@ -448,6 +527,64 @@ def test_memory_allocation_object_create_multiplies_calloc_size(monkeypatch):
     assert obj is not None
     assert obj.name == "calloc"
     assert obj.size == 0x2C
+
+
+def test_extract_numeric_argument_folds_constant_arithmetic(monkeypatch):
+    """I.24: mul/add/sub fold when both operands are constant; a variable
+    operand makes the whole expression unknown (None)."""
+    monkeypatch.setattr(ctype, "mul", 30, raising=False)
+    monkeypatch.setattr(ctype, "add", 31, raising=False)
+    monkeypatch.setattr(ctype, "sub", 32, raising=False)
+
+    prod = FakeExpr(ctype.mul, x=FakeNumberExpr(4), y=FakeNumberExpr(8))
+    assert MemoryAllocationObject._extract_numeric_argument([prod], 0) == 32
+
+    total = FakeExpr(ctype.add, x=FakeNumberExpr(10), y=FakeNumberExpr(44))
+    assert MemoryAllocationObject._extract_numeric_argument([total], 0) == 54
+
+    diff = FakeExpr(ctype.sub, x=FakeNumberExpr(64), y=FakeNumberExpr(8))
+    assert MemoryAllocationObject._extract_numeric_argument([diff], 0) == 56
+
+    # nested: (2 + 6) * 3
+    inner = FakeExpr(ctype.add, x=FakeNumberExpr(2), y=FakeNumberExpr(6))
+    outer = FakeExpr(ctype.mul, x=inner, y=FakeNumberExpr(3))
+    assert MemoryAllocationObject._extract_numeric_argument([outer], 0) == 24
+
+    # a variable operand poisons the fold
+    partial = FakeExpr(ctype.mul, x=FakeExpr(ctype.var), y=FakeNumberExpr(12))
+    assert MemoryAllocationObject._extract_numeric_argument([partial], 0) is None
+    assert MemoryAllocationObject._extract_numeric_argument([], 0) is None
+
+
+def test_memory_allocation_object_size_hint_unknown_vs_real_zero(monkeypatch):
+    """I.24: calloc(w*h, 12) — non-constant first operand — still creates a
+    row with size None; calloc(4, 8) folds to 32."""
+    import ida_name
+
+    monkeypatch.setattr(ida_name, "get_short_name", lambda _ea: "calloc")
+    monkeypatch.setattr(
+        ScanObject,
+        "get_expression_address",
+        staticmethod(lambda _cfunc, expr: expr.ea),
+    )
+
+    known = FakeExpr(
+        ctype.call,
+        x=SimpleNamespace(obj_ea=0x5000),
+        a=[FakeNumberExpr(4), FakeNumberExpr(8)],
+        ea=0x77,
+    )
+    unknown = FakeExpr(
+        ctype.call,
+        x=SimpleNamespace(obj_ea=0x5000),
+        a=[FakeExpr(ctype.var), FakeNumberExpr(12)],
+        ea=0x78,
+    )
+
+    assert MemoryAllocationObject.create(FakeCfunc([]), known).size == 32
+    obj = MemoryAllocationObject.create(FakeCfunc([]), unknown)
+    assert obj is not None
+    assert obj.size is None
 
 
 def test_memory_allocation_object_create_uses_windows_heapalloc_size_argument(monkeypatch):
@@ -496,16 +633,17 @@ def test_memory_allocation_object_create_supports_prefixed_linux_kernel_allocato
     assert obj.size == 0x40
 
 
-def test_memory_allocation_object_create_returns_zero_for_non_numeric_size(monkeypatch):
+def test_memory_allocation_object_create_returns_none_size_for_non_numeric_size(monkeypatch):
+    """I.24: an unprovably-constant size still creates the allocation row
+    (size None), so callers can tell "unknown" from a real zero."""
     import ida_name
 
     monkeypatch.setattr(ida_name, "get_short_name", lambda _ea: "malloc")
     call = FakeExpr(ctype.call, x=SimpleNamespace(obj_ea=0x5000), a=[FakeExpr(ctype.var)], ea=0x99)
     obj = MemoryAllocationObject.create(FakeCfunc([]), call)
 
-
-
-    assert obj.size == 0
+    assert obj is not None
+    assert obj.size is None
 
 
 
@@ -547,7 +685,7 @@ def test_memory_allocation_object_create_handles_missing_size_argument(monkeypat
     obj = MemoryAllocationObject.create(FakeCfunc([]), call)
 
     assert obj is not None
-    assert obj.size == 0
+    assert obj.size is None
 
 def test_get_argument_index_resolves_formal_argument_ordinals():
     import importlib.util
@@ -583,3 +721,60 @@ def test_memory_allocation_create_ignores_cast_without_inner_call(monkeypatch):
     monkeypatch.setattr(ScanObject, "get_expression_address", staticmethod(lambda _cfunc, expr: expr.ea))
     bad_cast = FakeExpr(ctype.cast, x=None)
     assert MemoryAllocationObject.create(FakeCfunc([]), bad_cast) is None
+
+
+def test_global_object_name_uses_domain_names(monkeypatch):
+    from forge.api import scan_object
+
+    monkeypatch.setattr(
+        scan_object,
+        "_current_domain_database",
+        lambda required=False: SimpleNamespace(
+            names=SimpleNamespace(get_at=lambda ea: "domain_global")
+        ),
+    )
+    assert scan_object._global_object_name(0x401000) == "domain_global"
+
+
+def test_allocator_name_uses_domain_names(monkeypatch):
+    from forge.api import scan_object
+
+    monkeypatch.setattr(
+        scan_object,
+        "_current_domain_database",
+        lambda required=False: SimpleNamespace(
+            names=SimpleNamespace(get_at=lambda ea: "malloc")
+        ),
+    )
+    assert scan_object._allocator_target_name(0x401000) == "malloc"
+
+
+def test_scan_root_function_name_uses_domain_function(monkeypatch):
+    from forge.api import scan_object
+
+    monkeypatch.setattr(
+        scan_object,
+        "_current_domain_database",
+        lambda required=False: SimpleNamespace(
+            functions=SimpleNamespace(
+                get_at=lambda ea: SimpleNamespace(name="domain_root")
+            )
+        ),
+    )
+    assert scan_object._scan_root_function_name(0x401000) == "domain_root"
+
+
+def test_call_argument_root_name_uses_domain_function(monkeypatch):
+    from forge.api import scan_object
+
+    monkeypatch.setattr(
+        scan_object,
+        "_current_domain_database",
+        lambda required=False: SimpleNamespace(
+            functions=SimpleNamespace(
+                get_at=lambda ea: SimpleNamespace(name="domain_call_root")
+            )
+        ),
+    )
+    assert scan_object._scan_root_function_name(0x401000) == "domain_call_root"
+

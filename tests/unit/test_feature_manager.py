@@ -76,3 +76,19 @@ def test_load_feature_propagates_import_errors(monkeypatch):
 
     with pytest.raises(ImportError, match=r"cannot import forge\.features\.broken"):
         manager.load_feature("forge.features.broken")
+
+
+def test_load_features_skips_unavailable_optional_feature(monkeypatch, tmp_path):
+    manager = FeatureManager(root=tmp_path)
+    monkeypatch.setattr(
+        manager,
+        "iter_feature_module_names",
+        lambda: iter(["forge.features.optional"]),
+    )
+    monkeypatch.setattr(
+        manager,
+        "load_feature",
+        lambda _name: (_ for _ in ()).throw(RuntimeError("requires netnode")),
+    )
+    manager.load_features()
+    assert manager._features == {}

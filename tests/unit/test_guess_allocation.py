@@ -20,23 +20,6 @@ hexrays_api = import_module("forge.api.hexrays")
 if not hasattr(hexrays_api, "find_expr_address"):
     hexrays_api.find_expr_address = lambda *_args, **_kwargs: 0
 
-visitor_api = import_module("forge.api.visitor")
-
-
-class _DummyRecursiveUpwardsObjectVisitor:
-    def __init__(self, cfunc, obj, data=None, skip_until_object=False, visited=None):
-        self._cfunc = cfunc
-        self.parents = []
-        self._skip = skip_until_object
-        self._init_obj = obj
-
-    def parent_expr(self):
-        return None
-
-    def get_line(self):
-        return ""
-
-visitor_api.RecursiveUpwardsObjectVisitor = _DummyRecursiveUpwardsObjectVisitor
 
 from forge.api.scan_object import ObjectType
 
@@ -88,13 +71,13 @@ def test_guess_allocation_records_heap_assignment(monkeypatch):
     monkeypatch.setattr(
         guess_allocation_module.MemoryAllocationObject,
         "create",
-        lambda _cfunc, _expr: SimpleNamespace(ea=0x401010),
+        lambda _cfunc, _expr: SimpleNamespace(ea=0x401010, size=32),
     )
     monkeypatch.setattr(visitor, "get_line", lambda: "v1 = calloc(...)")
 
     visitor._manipulate(SimpleNamespace(), obj)
 
-    assert visitor._data == [[0x401010, "v1", "v1 = calloc(...)", "HEAP"]]
+    assert visitor._data == [[0x401010, "v1", "v1 = calloc(...)", "HEAP", 32, None]]
 
 
 def test_guess_allocation_skips_when_parent_expression_is_missing(monkeypatch):
@@ -111,3 +94,449 @@ def test_guess_allocation_skips_when_parent_expression_is_missing(monkeypatch):
     visitor._manipulate(SimpleNamespace(), obj)
 
     assert visitor._data == []
+
+
+@pytest.fixture
+def _real_hexrays(monkeypatch):
+    """Real forge.api.hexrays module so call-time imports resolve (facade
+    pattern from test_forge_api)."""
+    import sys as _sys
+    from importlib import util as _util
+    from pathlib import Path
+
+    hexrays_path = (
+        Path(__file__).resolve().parents[2] / "src" / "forge" / "api" / "hexrays.py"
+    )
+    spec = _util.spec_from_file_location("forge.api.hexrays", hexrays_path)
+    assert spec is not None and spec.loader is not None
+    module = _util.module_from_spec(spec)
+    saved = _sys.modules.get("forge.api.hexrays")
+    _sys.modules["forge.api.hexrays"] = module
+    spec.loader.exec_module(module)
+    yield module
+    if saved is not None:
+        _sys.modules["forge.api.hexrays"] = saved
+    else:
+        _sys.modules.pop("forge.api.hexrays", None)
+
+
+def test_guess_allocation_follows_helper_callee_for_allocation(monkeypatch, _real_hexrays):
+    """I.25: a non-allocator helper assignment resolves through a one-level
+    decompile of the callee: `return vec = malloc(...)` gives a HEAP row
+    tagged with the callee EA."""
+    import ida_funcs
+
+    cfunc = SimpleNamespace(
+        entry_ea=0x401000,
+        body=SimpleNamespace(find_parent_of=lambda expr: None),
+    )
+    obj = SimpleNamespace(id=ObjectType.local_variable, ea=0x5000, name="items")
+
+    visitor = guess_allocation_module.GuessAllocationVisitor(cfunc, obj)
+    monkeypatch.setattr(
+        guess_allocation_module,
+        "ctype",
+        SimpleNamespace(asg=1, ref=2, ret=3, call=5),
+    )
+    monkeypatch.setattr(visitor, "parent_expr", lambda: SimpleNamespace(op=1, y=SimpleNamespace(
+        op=5, x=SimpleNamespace(obj_ea=0x402000)
+    )))
+    monkeypatch.setattr(visitor, "get_line", lambda: "items = MakeArray(...)")
+
+    def _fake_create(_cfunc, _expr):
+        called_for = getattr(getattr(_expr, "x", None), "obj_ea", None)
+        if called_for == 0x402000:  # MakeArray itself is not an allocator
+            return None
+        return SimpleNamespace(ea=0x401200, size=64)
+
+    monkeypatch.setattr(
+        guess_allocation_module.MemoryAllocationObject, "create", _fake_create
+    )
+    monkeypatch.setattr(
+        ida_funcs, "get_func", lambda ea: SimpleNamespace(start_ea=0x402000), raising=False
+    )
+    monkeypatch.setattr(
+        _real_hexrays,
+        "decompile",
+        lambda ea: SimpleNamespace(
+            treeitems=[
+                SimpleNamespace(to_specific_type=None, op=3, x=SimpleNamespace(ea=0x402010)),
+                SimpleNamespace(
+                    to_specific_type=None,
+                    op=1,
+                    x=SimpleNamespace(ea=0x402010),
+                    y=SimpleNamespace(op=5, x=SimpleNamespace(obj_ea=0x5000)),
+                ),
+                SimpleNamespace(to_specific_type=None, op=3, x=SimpleNamespace(ea=0x402020)),
+            ]
+        ),
+    )
+
+    visitor._manipulate(SimpleNamespace(), obj)
+
+    # the matching return; the unrelated return is skipped
+    assert visitor._data == [
+        [0x401200, "items", "items = MakeArray(...)", "HEAP", 64, 0x402000]
+    ]
+
+
+def test_guess_allocation_callee_matches_define_then_return_by_var_index(monkeypatch, _real_hexrays):
+    """O1: ``node = calloc(...); ...; return node;`` — the return and the
+    assignment are different instructions with different EAs; lvar-index
+    matching finds the allocation (EA-only matching returned no row live)."""
+    import ida_funcs
+
+    cfunc = SimpleNamespace(
+        entry_ea=0x401000,
+        body=SimpleNamespace(find_parent_of=lambda expr: None),
+    )
+    obj = SimpleNamespace(id=ObjectType.local_variable, ea=0x5000, name="grid")
+
+    visitor = guess_allocation_module.GuessAllocationVisitor(cfunc, obj)
+    monkeypatch.setattr(
+        guess_allocation_module,
+        "ctype",
+        SimpleNamespace(asg=1, ref=2, ret=3, call=5),
+    )
+    monkeypatch.setattr(
+        visitor,
+        "parent_expr",
+        lambda: SimpleNamespace(op=1, y=SimpleNamespace(op=5, x=SimpleNamespace(obj_ea=0x402000))),
+    )
+    monkeypatch.setattr(visitor, "get_line", lambda: "grid = MakeGrid(...)")
+
+    def _fake_create(_cfunc, _expr):
+        called_for = getattr(getattr(_expr, "x", None), "obj_ea", None)
+        if called_for == 0x402000:  # MakeGrid is not an allocator
+            return None
+        return SimpleNamespace(ea=0x401200, size=76)
+
+    v = SimpleNamespace(idx=7)
+    monkeypatch.setattr(
+        guess_allocation_module.MemoryAllocationObject, "create", _fake_create
+    )
+    monkeypatch.setattr(
+        ida_funcs, "get_func", lambda ea: SimpleNamespace(start_ea=0x402000), raising=False
+    )
+    monkeypatch.setattr(
+        _real_hexrays,
+        "decompile",
+        lambda ea: SimpleNamespace(
+            treeitems=[
+                # unrelated return first (different var index)
+                SimpleNamespace(
+                    to_specific_type=None,
+                    op=3,
+                    x=SimpleNamespace(ea=0x403000, v=SimpleNamespace(idx=9)),
+                ),
+                # the defining assignment: EA differs from the return's
+                SimpleNamespace(
+                    to_specific_type=None,
+                    op=1,
+                    x=SimpleNamespace(ea=0x404040, v=v),
+                    y=SimpleNamespace(op=5, x=SimpleNamespace(obj_ea=0x5000)),
+                ),
+                # the actual return: `return node;`
+                SimpleNamespace(
+                    to_specific_type=None,
+                    op=3,
+                    x=SimpleNamespace(ea=0x404048, v=v),
+                ),
+            ]
+        ),
+    )
+
+    visitor._manipulate(SimpleNamespace(), obj)
+
+    assert visitor._data == [
+        [0x401200, "grid", "grid = MakeGrid(...)", "HEAP", 76, 0x402000]
+    ]
+
+
+def test_guess_allocation_callee_alias_chain_two_hops(monkeypatch, _real_hexrays):
+    """E.22: `return v` where `v = w` and `w = calloc(...)` — the direct
+    return match misses (the RHS is a plain var), the ≤2-hop alias chain
+    finds the calloc inside the helper."""
+    import ida_funcs
+
+    cfunc = SimpleNamespace(
+        entry_ea=0x401000,
+        body=SimpleNamespace(find_parent_of=lambda expr: None),
+    )
+    obj = SimpleNamespace(id=ObjectType.local_variable, ea=0x5000, name="row")
+
+    visitor = guess_allocation_module.GuessAllocationVisitor(cfunc, obj)
+    monkeypatch.setattr(
+        guess_allocation_module,
+        "ctype",
+        SimpleNamespace(asg=1, ref=2, ret=3, call=5, var=4),
+    )
+    monkeypatch.setattr(
+        visitor,
+        "parent_expr",
+        lambda: SimpleNamespace(op=1, y=SimpleNamespace(op=5, x=SimpleNamespace(obj_ea=0x402000))),
+    )
+    monkeypatch.setattr(visitor, "get_line", lambda: "row = chain_node_new(...)")
+
+    def _fake_create(_cfunc, _expr):
+        called_for = getattr(getattr(_expr, "x", None), "obj_ea", None)
+        if called_for == 0x6000:  # the calloc inside the helper
+            return SimpleNamespace(ea=0x401300, size=40)
+        return None
+
+    monkeypatch.setattr(
+        guess_allocation_module.MemoryAllocationObject, "create", _fake_create
+    )
+    monkeypatch.setattr(
+        ida_funcs, "get_func", lambda ea: SimpleNamespace(start_ea=0x402000), raising=False
+    )
+    v = SimpleNamespace(idx=7)
+    w = SimpleNamespace(idx=9)
+    monkeypatch.setattr(
+        _real_hexrays,
+        "decompile",
+        lambda ea: SimpleNamespace(
+            treeitems=[
+                # `return v;` — no direct allocator assignment for v
+                SimpleNamespace(
+                    to_specific_type=None,
+                    op=3,
+                    x=SimpleNamespace(ea=0x404048, v=v),
+                ),
+                # `v = w;` — hop 1: a plain var move
+                SimpleNamespace(
+                    to_specific_type=None,
+                    op=1,
+                    x=SimpleNamespace(ea=0x404010, v=v),
+                    y=SimpleNamespace(op=4, v=w),
+                ),
+                # `w = calloc(...);` — hop 2: the real allocation
+                SimpleNamespace(
+                    to_specific_type=None,
+                    op=1,
+                    x=SimpleNamespace(ea=0x404020, v=w),
+                    y=SimpleNamespace(op=5, x=SimpleNamespace(obj_ea=0x6000)),
+                ),
+            ]
+        ),
+    )
+
+    visitor._manipulate(SimpleNamespace(), obj)
+
+    assert visitor._data == [
+        [0x401300, "row", "row = chain_node_new(...)", "HEAP", 40, 0x402000]
+    ]
+
+
+
+def test_guess_allocation_callee_cast_return_ignores_unrelated_var_moves(monkeypatch, _real_hexrays):
+    """Regression (review 2026-09-07): `return (T *)b;` surfaces a cast node
+    with v=None/ea=0, so the alias hop must reduce it to the var under the
+    cast and refuse to match when neither an lvar index nor a nonzero EA is
+    available. Unconstrained matching let the FIRST `x = <single var>` move
+    (`tmp = a`) win regardless of variable, attributing a's allocator
+    assignment to b's return."""
+    import ida_funcs
+
+    cfunc = SimpleNamespace(
+        entry_ea=0x401000,
+        body=SimpleNamespace(find_parent_of=lambda expr: None),
+    )
+    obj = SimpleNamespace(id=ObjectType.local_variable, ea=0x5000, name="row")
+
+    visitor = guess_allocation_module.GuessAllocationVisitor(cfunc, obj)
+    monkeypatch.setattr(
+        guess_allocation_module,
+        "ctype",
+        SimpleNamespace(asg=1, ref=2, ret=3, call=5, var=4, cast=6),
+    )
+    monkeypatch.setattr(
+        visitor,
+        "parent_expr",
+        lambda: SimpleNamespace(op=1, y=SimpleNamespace(op=5, x=SimpleNamespace(obj_ea=0x402000))),
+    )
+    monkeypatch.setattr(visitor, "get_line", lambda: "row = helper(...)")
+
+    def _fake_create(_cfunc, _expr):
+        called_for = getattr(getattr(_expr, "x", None), "obj_ea", None)
+        if called_for == 0x6000:  # only a's calloc is a real allocator
+            return SimpleNamespace(ea=0x401300, size=40)
+        return None
+
+    monkeypatch.setattr(
+        guess_allocation_module.MemoryAllocationObject, "create", _fake_create
+    )
+    monkeypatch.setattr(
+        ida_funcs, "get_func", lambda ea: SimpleNamespace(start_ea=0x402000), raising=False
+    )
+    tmp = SimpleNamespace(idx=7)
+    a = SimpleNamespace(idx=5)
+    b = SimpleNamespace(idx=9)
+    monkeypatch.setattr(
+        _real_hexrays,
+        "decompile",
+        lambda ea: SimpleNamespace(
+            treeitems=[
+                # unrelated var move: `tmp = a;` — must NOT match the return
+                SimpleNamespace(
+                    to_specific_type=None,
+                    op=1,
+                    x=SimpleNamespace(ea=0x404010, v=tmp),
+                    y=SimpleNamespace(op=4, v=a),
+                ),
+                # `a = calloc(...);` — a's own allocator assignment
+                SimpleNamespace(
+                    to_specific_type=None,
+                    op=1,
+                    x=SimpleNamespace(ea=0x404020, v=a),
+                    y=SimpleNamespace(op=5, x=SimpleNamespace(obj_ea=0x6000)),
+                ),
+                # `return (T *)b;` — cast node carries no v/ea identity
+                SimpleNamespace(
+                    to_specific_type=None,
+                    op=3,
+                    x=SimpleNamespace(op=6, v=None, ea=0, x=SimpleNamespace(op=4, v=b)),
+                ),
+            ]
+        ),
+    )
+
+    visitor._manipulate(SimpleNamespace(), obj)
+
+    assert visitor._data == []
+
+def test_guess_allocation_callee_pointer_return_fallback_row(monkeypatch, _real_hexrays):
+    """E.22: the helper's return is pointer-typed but the allocation is not
+    provable — a HEAP row with size_hint None + callee is still emitted."""
+    import ida_funcs
+
+    cfunc = SimpleNamespace(
+        entry_ea=0x401000,
+        body=SimpleNamespace(find_parent_of=lambda expr: None),
+    )
+    obj = SimpleNamespace(id=ObjectType.local_variable, ea=0x5000, name="node")
+
+    visitor = guess_allocation_module.GuessAllocationVisitor(cfunc, obj)
+    monkeypatch.setattr(
+        guess_allocation_module,
+        "ctype",
+        SimpleNamespace(asg=1, ref=2, ret=3, call=5, var=4),
+    )
+    monkeypatch.setattr(
+        visitor,
+        "parent_expr",
+        lambda: SimpleNamespace(op=1, y=SimpleNamespace(op=5, x=SimpleNamespace(obj_ea=0x402000))),
+    )
+    monkeypatch.setattr(visitor, "get_line", lambda: "node = chain_node_new(...)")
+    monkeypatch.setattr(
+        guess_allocation_module,
+        "find_expr_address",
+        lambda _cexpr, _parents: 0x402000,
+    )
+    monkeypatch.setattr(
+        guess_allocation_module.MemoryAllocationObject,
+        "create",
+        lambda _cfunc, _expr: None,
+    )
+    monkeypatch.setattr(
+        ida_funcs, "get_func", lambda ea: SimpleNamespace(start_ea=0x402000), raising=False
+    )
+    ptr_type = SimpleNamespace(is_ptr=lambda: True)
+    monkeypatch.setattr(
+        _real_hexrays,
+        "decompile",
+        lambda ea: SimpleNamespace(
+            treeitems=[
+                SimpleNamespace(
+                    to_specific_type=None,
+                    op=3,
+                    x=SimpleNamespace(ea=0x404040, type=ptr_type),
+                )
+            ]
+        ),
+    )
+
+    visitor._manipulate(SimpleNamespace(), obj)
+
+    assert visitor._data == [
+        [0x402000, "node", "node = chain_node_new(...)", "HEAP", None, 0x402000]
+    ]
+
+
+def test_guess_allocation_callee_descent_failure_degrades_to_no_row(monkeypatch, _real_hexrays):
+    """I.25: a broken callee decompile must not crash the visitor."""
+    import ida_funcs
+
+    cfunc = SimpleNamespace(
+        entry_ea=0x401000,
+        body=SimpleNamespace(find_parent_of=lambda expr: None),
+    )
+    obj = SimpleNamespace(id=ObjectType.local_variable, ea=0x5000, name="items")
+
+    visitor = guess_allocation_module.GuessAllocationVisitor(cfunc, obj)
+    monkeypatch.setattr(
+        guess_allocation_module,
+        "ctype",
+        SimpleNamespace(asg=1, ref=2, ret=3, call=5),
+    )
+    monkeypatch.setattr(
+        visitor,
+        "parent_expr",
+        lambda: SimpleNamespace(op=1, y=SimpleNamespace(op=5, x=SimpleNamespace(obj_ea=0x402000))),
+    )
+    monkeypatch.setattr(
+        guess_allocation_module.MemoryAllocationObject,
+        "create",
+        lambda _cfunc, _expr: None,
+    )
+    monkeypatch.setattr(
+        ida_funcs, "get_func", lambda ea: SimpleNamespace(start_ea=0x402000), raising=False
+    )
+    monkeypatch.setattr(
+        _real_hexrays,
+        "decompile",
+        lambda ea: (_ for _ in ()).throw(RuntimeError("boom")),
+    )
+
+    visitor._manipulate(SimpleNamespace(), obj)
+
+    assert visitor._data == []
+
+
+def test_facade_guess_allocation_surface_size_hint_and_callee(monkeypatch, _real_hexrays):
+    """I.24/I.25: facade rows carry size_hint/callee from the visitor rows."""
+    import forge_api
+    from forge.features.guess_allocation.guess_allocation import (
+        GuessAllocationVisitor as _RealVisitor,
+    )
+
+    rows_payload = [[0x401200, "v1", "v1 = f()", "HEAP", 64, 0x402000]]
+    monkeypatch.setattr(
+        _real_hexrays, "decompile", lambda ea: SimpleNamespace(entry_ea=0x401000), raising=False
+    )
+    monkeypatch.setattr(
+        forge_api,
+        "_resolve_scan_root",
+        lambda cfunc, **kw: SimpleNamespace(id=1, name="v1"),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        _RealVisitor,
+        "__init__",
+        lambda self, *a, **k: setattr(self, "_data", rows_payload),
+        raising=False,
+    )
+    monkeypatch.setattr(_RealVisitor, "process", lambda self: None, raising=False)
+
+    rows = forge_api.guess_allocation(0x401000, var_name="v1")
+
+    assert rows == [
+        {
+            "ea": 0x401200,
+            "var": "v1",
+            "line": "v1 = f()",
+            "kind": "HEAP",
+            "size_hint": 64,
+            "callee": 0x402000,
+        }
+    ]

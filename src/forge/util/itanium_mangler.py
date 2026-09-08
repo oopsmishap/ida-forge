@@ -1,6 +1,6 @@
 # Taken from https://github.com/RicBent/Classy/blob/master/classy/itanium_mangler.py
-# TODO: Refactor + implement the TODOs
-# TODO: use this for creating C++ classes with mangled names, useful to build out C++ classes which are exportable
+# This compatibility module preserves the current limited mangling behavior;
+# broader refactoring and export-oriented class generation are not implemented.
 
 # If you want to stay sane, better close this file ;)
 
@@ -159,8 +159,8 @@ def add_to_subs(subs, sub):
     subs[sub] = encode_seqid(len(subs))
 
 
-# Oh boy, this hurts... This is literally the WORST function I ever wrote in my life. CLEAN IT UP
-# Todo: Allow templates, "<" and ">" are not allowed in identifiers
+# Supports builtin and namespace-qualified non-template type names; template
+# argument parsing is intentionally outside this compatibility module's scope.
 def mangle_decorated_type(txt_decors, type_txt, subs=None):
     if subs is None:
         subs = {}

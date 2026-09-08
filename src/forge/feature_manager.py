@@ -6,7 +6,7 @@ from collections.abc import Iterator
 from pathlib import Path
 from types import ModuleType
 
-from forge.util.logging import log_debug
+from forge.util.logging import log_debug, log_warning
 
 
 class FeatureManager:
@@ -20,10 +20,16 @@ class FeatureManager:
         self._feature_root = root or Path(__file__).resolve().parent / "features"
 
     def load_features(self) -> None:
-        """Load every feature module discovered under the feature root."""
+        """Load every feature, isolating unavailable optional capabilities."""
         log_debug(f'Loading features from: "{self._feature_root}"')
         for module_name in self.iter_feature_module_names():
-            self.load_feature(module_name)
+            try:
+                self.load_feature(module_name)
+            except (ImportError, RuntimeError) as exc:
+                # A failed import leaves a partially-initialized module in
+                # sys.modules; drop it so a later reload starts clean.
+                sys.modules.pop(module_name, None)
+                log_warning(f'Skipping unavailable feature "{module_name}": {exc}')
 
     def iter_feature_module_names(self) -> Iterator[str]:
         """Yield importable feature module names in deterministic order."""

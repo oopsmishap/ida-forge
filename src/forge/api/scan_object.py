@@ -8,8 +8,55 @@ import ida_hexrays
 import ida_name
 import idaapi
 
+from forge.api.domain import current_database as _current_domain_database
+from forge.api.domain import sdk_fallback as _sdk_fallback
+from forge.api.domain import try_domain_method as _try_domain_method
 from forge.api.hexrays import ctype, get_member_name
 from forge.util.logging import log_debug
+
+
+def _domain_name_or_short_name(ea: int, capability: str, label: str) -> str:
+
+    handled, name = _try_domain_method(
+        _current_domain_database(required=False),
+        "names",
+        "get_at",
+        ea,
+        capability=capability,
+        unavailable_reason=f"ida-domain database/name lookup unavailable for {label}",
+        failure_reason=f"ida-domain {label} name lookup failed",
+        exceptions=(Exception,),
+    )
+    if handled:
+        return name or ""
+    return ida_name.get_short_name(ea)
+
+
+def _global_object_name(ea: int) -> str:
+    return _domain_name_or_short_name(ea, "names.global_object", "global object")
+
+
+def _allocator_target_name(ea: int) -> str:
+    return _domain_name_or_short_name(ea, "names.allocator", "allocator")
+
+
+def _scan_root_function_name(ea: int) -> str:
+
+    handled, function = _try_domain_method(
+        _current_domain_database(required=False),
+        "functions",
+        "get_at",
+        ea,
+        capability="functions.scan_root_name",
+        unavailable_reason="ida-domain scan-root function lookup unavailable on this build/session",
+        failure_reason="ida-domain scan-root function lookup failed",
+        exceptions=(Exception,),
+    )
+    if handled and function is not None:
+        name = getattr(function, "name", None)
+        if name:
+            return name
+    return getattr(ida_funcs, "get_func_name", lambda value: f"sub_{value:x}")(ea)
 
 TYPE_IGNORED_TOKENS = {"const", "volatile", "struct", "class", "union", "&"}
 
@@ -104,11 +151,45 @@ def _type_name_matches(tinfo, expected_name: str) -> bool:
     return _type_identity_key(tinfo.dstr()) == _type_identity_key(expected_name)
 
 
+def _safe_struct_name(tinfo):
+    """Return a non-void struct name suitable for use as a StructureReferenceObject id.
+
+    Hexrays' ``tinfo.dstr()`` of ``void *``'s pointee, of a ``void`` lvar, or of any
+    integral scalar returns ``"void"`` (or one of the IDA integral aliases like
+    ``_BYTE``/``_QWORD``).  Treating those as struct names produces ``struct void { ... }``
+    later in the pack path, which the IDA parser rejects with ``"Void type is forbidden here"``
+    and a modal "Bad declaration" dialog per affected site.  Returning ``None`` lets the
+    caller fall back to the base object so the row stores no struct reference at all.
+    """
+    if tinfo is None:
+        return None
+    try:
+        name = tinfo.dstr()
+    except Exception:  # noqa: BLE001 — degraded tinfo on a void/integral alias
+        return None
+    if not name:
+        return None
+    stripped = name.strip()
+    # bare 'void' / 'void &' / 'void *' / 'void[N]' / 'const void *' / typedefs thereof.
+    # Head tokens may be qualifiers ('const', 'volatile') so match any token == 'void'
+    # AND the bracketed-array variant.
+    tokens = stripped.split()
+    if "void" in tokens or "nullptr" in tokens:
+        return None
+    if stripped.startswith(("void[", "void ")):
+        return None
+    # integral aliases produced by Hexrays for non-UDT members
+    if stripped in {"_BYTE", "_WORD", "_DWORD", "_QWORD", "_OWORD"}:
+        return None
+    if stripped.startswith(("_BYTE[", "_WORD[", "_DWORD[", "_QWORD[", "_OWORD[")):
+        return None
+    return stripped
+
+
 def _strip_casts_and_refs(expr):
     while expr is not None and hasattr(expr, "op") and expr.op in (ctype.cast, ctype.ref):
         expr = expr.x
     return expr
-
 
 
 def _extract_offset_expression(expr, offset: int = 0, scale: int = 1, ctype_ops=None):
@@ -209,12 +290,57 @@ def _get_struct_tinfo(tinfo):
     return tinfo
 
 
+def resolve_lvar_init_alloc_size(cfunc, target_index: int):
+    """Walk the cfunc looking for ``lvar[target_index] = <allocator>(...)``
+    and return the allocator's folded size, or ``None`` if no tracked
+    allocator initializes this lvar (R3.13).
+    """
+    if target_index < 0:
+        return None
+    if not hasattr(ida_hexrays, "ctree_parentee_t"):
+        return None
+    from forge.api.hexrays import ctype as _ctype
+    var_op = getattr(_ctype, "var", None)
+    asg_op = getattr(_ctype, "asg", None)
+    if var_op is None or asg_op is None:
+        return None
+
+    class _Finder(ida_hexrays.ctree_parentee_t):
+        def __init__(self):
+            ida_hexrays.ctree_parentee_t.__init__(self)
+            self.alloc = None
+
+        def visit_expr(self, cexpr):
+            if getattr(cexpr, "op", None) != asg_op:
+                return 0
+            x = getattr(cexpr, "x", None)
+            if (
+                getattr(x, "op", None) == var_op
+                and hasattr(x, "v")
+                and getattr(x.v, "idx", -1) == target_index
+            ):
+                rhs = getattr(cexpr, "y", None)
+                alloc = MemoryAllocationObject.create(cfunc, rhs)
+                if alloc is not None:
+                    self.alloc = alloc.size
+            return 0
+
+    finder = _Finder()
+    try:
+        body = getattr(cfunc, "body", None)
+        if body is not None:
+            finder.apply_to(body, None)
+    except Exception:  # noqa: BLE001 — best-effort
+        return None
+    return finder.alloc
+
+
 def _make_offset_scan_object(base_obj, offset: int):
     base_tinfo = _get_struct_tinfo(getattr(base_obj, "tinfo", None))
     if base_tinfo is None or offset == 0:
         return base_obj
 
-    struct_name = base_tinfo.dstr()
+    struct_name = _safe_struct_name(base_tinfo)
     if not struct_name:
         return base_obj
 
@@ -282,12 +408,21 @@ class ScanObject:
             self.scan_root_function_name = other.scan_root_function_name
 
     @staticmethod
-    def create(cfunc: ida_hexrays.cfunc_t, arg):
+    def create(cfunc: ida_hexrays.cfunc_t, arg, *, promote_root: bool = True):
         """
         Creates a ScanObject based on the given argument.
 
         :param cfunc: The cfunc_t object.
         :param arg: The argument to create a ScanObject from.
+        :param promote_root: When False, the returned object does NOT have
+            ``set_scan_root`` called on it (its root metadata stays
+            ``BADADDR``/``None``).  Pass False from any caller that creates
+            objects mid-walk to track references inside an existing scan root
+            without promoting the lvar to a new root — that promotion is what
+            causes the ``v0->field = v2`` LHS to be picked up as a separate
+            scan root when the scan is started on ``v2``.  Top-level scan
+            entry points (structure-builder actions, child-scan, guess-allocation)
+            pass True (the default).
         :return: The created ScanObject or None.
         """
         if isinstance(arg, ida_hexrays.ctree_item_t):
@@ -313,26 +448,33 @@ class ScanObject:
             result.ea = ScanObject.get_expression_address(cfunc, cexpr)
         elif cexpr.op == ctype.memptr:
             t = cexpr.x.type.get_pointed_object()
-            result = StructurePointerObject(t.dstr(), cexpr.m)
+            ptr_name = _safe_struct_name(t)
+            if ptr_name is None:
+                return None
+            result = StructurePointerObject(ptr_name, cexpr.m)
             result.name = get_member_name(t, cexpr.m)
         elif cexpr.op == ctype.memref:
             t = cexpr.x.type
-            result = StructureReferenceObject(t.dstr(), cexpr.m)
+            ref_name = _safe_struct_name(t)
+            if ref_name is None:
+                return None
+            result = StructureReferenceObject(ref_name, cexpr.m)
             result.name = get_member_name(t, cexpr.m)
         elif cexpr.op == ctype.obj:
             result = GlobalVariableObject(cexpr.obj_ea)
-            result.name = ida_name.get_short_name(cexpr.obj_ea)
+            result.name = _global_object_name(cexpr.obj_ea)
         else:
             return None
 
         result.tinfo = cexpr.type
         result.ea = ScanObject.get_expression_address(cfunc, cexpr)
         result.func_ea = getattr(cfunc, "entry_ea", idaapi.BADADDR)
-        result.set_scan_root(
-            cfunc.entry_ea,
-            expression_ea=result.ea,
-            function_name=getattr(ida_funcs, "get_func_name", lambda ea: f"sub_{ea:x}")(cfunc.entry_ea),
-        )
+        if promote_root:
+            result.set_scan_root(
+                cfunc.entry_ea,
+                expression_ea=result.ea,
+                function_name=_scan_root_function_name(cfunc.entry_ea),
+            )
 
         return result
 
@@ -377,15 +519,21 @@ class VariableObject(ScanObject):
     Represents a local variable in HexRays decompiled code.
     """
 
-    def __init__(self, lvar: ida_hexrays.lvar_t, index: int):
+    def __init__(self, lvar: ida_hexrays.lvar_t, index: int, *, alloc_size: int | None = None):
         super().__init__()
         self.lvar = lvar
         self.tinfo = lvar.type()
         self.name = lvar.name
         self.index = index
+        # Known allocation size for this lvar's initializing call (e.g.
+        # ``v0 = calloc(1u, 0x38u)`` -> 0x38).  ``None`` means unknown.
+        # ``alloc_size`` is consulted by the visitor's transitive-closure
+        # pass so two lvars linked through a phi (``v4 = v0; v4 = v2;``)
+        # only merge when their alloc sizes agree (R3.12 — separate
+        # allocations of different sizes must not be folded together).
+        self.alloc_size = alloc_size
         self.id = ObjectType.local_variable
         log_debug(f"Creating VariableObject {self.name}, {self.tinfo.dstr()}")
-
 
     def is_target(self, cexpr: ida_hexrays.cexpr_t) -> bool:
         """
@@ -546,7 +694,7 @@ class CallArgumentObject(ScanObject):
         result.tinfo = ida_hexrays.cfunc_type(cfunc)
         result.set_scan_root(
             cfunc.entry_ea,
-            function_name=getattr(ida_funcs, "get_func_name", lambda ea: f"sub_{ea:x}")(cfunc.entry_ea),
+            function_name=_scan_root_function_name(cfunc.entry_ea),
         )
         return result
 
@@ -573,9 +721,7 @@ class ReturnedObject(ScanObject):
         log_debug(f"Creating ReturnedObject {self.__func_ea}")
 
     def is_target(self, cexpr: ida_hexrays.cexpr_t) -> bool:
-        """
-        Checks if expression is a call and its object address is the same as the function address
-        """
+        """Check whether expression calls this function."""
         if cexpr.op != ctype.call or not hasattr(cexpr, "x") or cexpr.x is None:
             return False
         return getattr(cexpr.x, "obj_ea", idaapi.BADADDR) == self.__func_ea
@@ -583,10 +729,10 @@ class ReturnedObject(ScanObject):
 
 
 class MemoryAllocationObject(ScanObject):
-    def __init__(self, name: str, size: int):
+    def __init__(self, name: str, size: int | None):
         super().__init__()
         self.name = name
-        self.size = size
+        self.size = size  # None: allocator size could not be folded
         self.id = ObjectType.memory_allocator
         log_debug(f"Creating MemoryAllocationObject {self.name}, {self.size}")
 
@@ -625,17 +771,41 @@ class MemoryAllocationObject(ScanObject):
         return normalized
 
     @staticmethod
-    def _extract_numeric_argument(args, index: int) -> int:
+    def _extract_numeric_argument(args, index: int) -> int | None:
         if index < 0 or index >= len(args):
-            return 0
+            return None
 
         expr = args[index]
         while expr is not None and getattr(expr, "op", None) == ctype.cast:
             expr = getattr(expr, "x", None)
 
-        if expr is not None and getattr(expr, "op", None) == ctype.num:
+        if expr is None:
+            return None
+
+        op = getattr(expr, "op", None)
+        if op == ctype.num:
             return expr.numval()
-        return 0
+
+        # Fold constant arithmetic so `calloc(2, 0x20)`-style chains resolve:
+        # size = n * m / n + m / n - m, recursing through casts. A single
+        # non-constant operand makes the whole expression unknown.
+        for folded_op, combine in (
+            (getattr(ctype, "mul", None), lambda a, b: a * b),
+            (getattr(ctype, "add", None), lambda a, b: a + b),
+            (getattr(ctype, "sub", None), lambda a, b: a - b),
+        ):
+            if folded_op is not None and op == folded_op:
+                left = MemoryAllocationObject._extract_numeric_argument(
+                    [getattr(expr, "x", None)], 0
+                )
+                right = MemoryAllocationObject._extract_numeric_argument(
+                    [getattr(expr, "y", None)], 0
+                )
+                if left is None or right is None:
+                    return None
+                return combine(left, right)
+
+        return None
 
     @classmethod
     def _resolve_size(cls, allocator_name: str, args) -> int | None:
@@ -646,11 +816,17 @@ class MemoryAllocationObject(ScanObject):
 
         if allocator_name in _PRODUCT_SIZE_ALLOCATORS:
             left_index, right_index = _PRODUCT_SIZE_ALLOCATORS[allocator_name]
-            return cls._extract_numeric_argument(
-                args, left_index
-            ) * cls._extract_numeric_argument(args, right_index)
+            left = cls._extract_numeric_argument(args, left_index)
+            right = cls._extract_numeric_argument(args, right_index)
+            if left is None or right is None:
+                return None
+            return left * right
 
         return None
+
+    @staticmethod
+    def _is_allocator_name(allocator_name: str) -> bool:
+        return allocator_name in _SINGLE_SIZE_ALLOCATORS or allocator_name in _PRODUCT_SIZE_ALLOCATORS
 
     @staticmethod
     def create(cfunc: ida_hexrays.cfunc_t, cexpr: ida_hexrays.cexpr_t):
@@ -665,21 +841,23 @@ class MemoryAllocationObject(ScanObject):
         call_expr = MemoryAllocationObject._unwrap_call_expression(cexpr)
         if call_expr is None:
             return None
-
-        raw_func_name = ida_name.get_short_name(
+        raw_func_name = _allocator_target_name(
             getattr(call_expr.x, "obj_ea", idaapi.BADADDR)
         )
         allocator_name = MemoryAllocationObject._normalize_allocator_name(raw_func_name)
-        size = MemoryAllocationObject._resolve_size(allocator_name, getattr(call_expr, "a", ()))
-        if size is None:
+        if not MemoryAllocationObject._is_allocator_name(allocator_name):
             return None
+
+        # An allocator whose size could not be folded to a constant is still
+        # an allocation — size None distinguishes "unknown" from a real 0.
+        size = MemoryAllocationObject._resolve_size(allocator_name, getattr(call_expr, "a", ()))
 
         result = MemoryAllocationObject(raw_func_name or allocator_name, size)
         result.ea = ScanObject.get_expression_address(cfunc, call_expr)
         result.set_scan_root(
             cfunc.entry_ea,
             expression_ea=result.ea,
-            function_name=getattr(ida_funcs, "get_func_name", lambda ea: f"sub_{ea:x}")(cfunc.entry_ea),
+            function_name=_scan_root_function_name(cfunc.entry_ea),
         )
         return result
 

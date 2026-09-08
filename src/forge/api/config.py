@@ -4,15 +4,36 @@ from copy import deepcopy
 from pathlib import Path
 from typing import Any, ClassVar
 
-import ida_diskio
-import toml  # still needed for writing; tomllib is read-only
-
-try:  # stdlib tomllib on Python 3.11+ (IDA 9.x ships 3.12)
+try:
     import tomllib
-except ImportError:  # Python 3.9/3.10 read via the `toml` package
+except ModuleNotFoundError:  # pragma: no cover - Python 3.10
     tomllib = None
 
+from forge.api.domain import current_database
+
+try:
+    import ida_diskio
+except ImportError:  # pragma: no cover - outside IDA
+    ida_diskio = None
+
 from forge.util.logging import log_debug, log_error
+
+
+def _toml_write_backend():
+    """The write backend — the ``toml`` package, imported only when needed.
+
+    Deliberately lazy: headless workers (idalib) may lack the package and
+    only ever *read* config; a hard top-level import made the whole plugin
+    unimportable there (2026-08-13, O1 live pass).
+    """
+    try:
+        import toml
+    except ImportError as exc:
+        raise RuntimeError(
+            "writes to forge.toml need the 'toml' package; install it or "
+            "read-only mode (reads use stdlib tomllib)"
+        ) from exc
+    return toml
 
 
 def _load_toml_file(path: Path) -> dict:
@@ -21,15 +42,38 @@ def _load_toml_file(path: Path) -> dict:
         with path.open("rb") as f:  # tomllib requires binary mode
             return tomllib.load(f)
     with path.open("r", encoding="utf-8") as f:
-        return toml.load(f)
+        return _load_toml_file_legacy(f)
+
+
+def _load_toml_file_legacy(f) -> dict:
+    return _toml_read_fallback().load(f)
+
+
+def _toml_read_fallback():
+    try:
+        import toml
+    except ImportError as exc:  # pragma: no cover — 3.9/3.10 without toml
+        raise RuntimeError("reading forge.toml needs tomllib or the 'toml' package") from exc
+    return toml
 
 
 def _dump_toml_file(path: Path, data: dict) -> None:
     """Persist a dict to a TOML file via the ``toml`` package (no stdlib dumper)."""
+    toml = _toml_write_backend()
     with path.open("w", encoding="utf-8") as f:
         toml.dump(data, f)
 
 ConfigDict = dict[str, Any]
+
+def _domain_user_idadir() -> str | None:
+    """Return Domain's configured user directory when available."""
+    try:
+        domain_db = current_database(required=False)
+    except Exception:  # noqa: BLE001 — config remains usable outside IDA
+        return None
+    metadata = getattr(domain_db, "metadata", None) if domain_db is not None else None
+    user_dir = getattr(metadata, "user_idadir", None)
+    return str(user_dir) if user_dir else None
 
 
 class ConfigBase:
@@ -39,13 +83,14 @@ class ConfigBase:
     default_config: ClassVar[ConfigDict] = {}
 
     def __init__(self, config_name: str):
-        if not self.name:
-            raise ValueError("Config class must define a name attribute.")
-
+        user_dir = _domain_user_idadir()
+        if user_dir is None and ida_diskio is not None:
+            user_dir = ida_diskio.get_user_idadir()
+        if user_dir is None:
+            user_dir = str(Path.home() / ".idapro")
+        self._config_path = Path(user_dir) / "cfg" / f"{config_name}.toml"
         self._config_name = config_name
-        self._config_path = Path(ida_diskio.get_user_idadir()) / "cfg" / f"{config_name}.toml"
         self._config: ConfigDict = self._load_config()
-
     def _load_config(self) -> ConfigDict:
         """Load the full configuration file."""
         try:

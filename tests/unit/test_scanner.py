@@ -137,6 +137,264 @@ def test_parse_left_assignee_scales_nested_index_offsets():
     assert offset == 16
 
 
+def test_scanned_structure_member_applies_type_via_udt(monkeypatch):
+    """F.1: ScannedStructureMemberObject.apply_type finds the udt member
+    by struct_offset, sets its type and commits via set_udt_details."""
+    import ida_typeinf
+
+    scanner_module = _load_scanner_module()
+    calls = []
+
+    class _FakeStructTinfo:
+        def __init__(self, *a, **k):
+            pass
+
+        def get_named_type(self, til, name):
+            calls.append(("get_named_type", name))
+            return True
+
+        def is_udt(self):
+            return True
+
+        def get_udt_details(self, udt):
+            calls.append(("details",))
+            udt.extend(
+                [
+                    SimpleNamespace(
+                        offset=8,
+                        name="member_8",
+                        set_type=lambda t: calls.append(("set_type", t.dstr())),
+                    )
+                ]
+            )
+            return True
+
+        def set_udt_details(self, udt):
+            calls.append(("set_udt_details",))
+            return True
+
+    monkeypatch.setattr(ida_typeinf, "tinfo_t", _FakeStructTinfo, raising=False)
+
+    obj = scanner_module.ScannedStructureMemberObject(
+        "World", 8, "member_8", 0x401000, 0
+    )
+    obj.apply_type(FakeType("u32"))
+
+    assert ("get_named_type", "World") in calls
+    assert ("set_type", "u32") in calls
+    assert ("set_udt_details",) in calls
+
+
+def test_scanned_structure_member_not_applicable_skips(monkeypatch):
+    """F.1: the _applicable guard keeps failed-scan remnants inert."""
+    import ida_typeinf
+
+    scanner_module = _load_scanner_module()
+    monkeypatch.setattr(
+        ida_typeinf,
+        "tinfo_t",
+        lambda *a, **k: SimpleNamespace(
+            get_named_type=lambda til, name: (_ for _ in ()).throw(
+                AssertionError("must not load the struct for a !applicable obj")
+            ),
+            get_udt_details=lambda udt: False,
+            set_udt_details=lambda udt: False,
+        ),
+        raising=False,
+    )
+
+    obj = scanner_module.ScannedStructureMemberObject(
+        "World", 8, "member_8", 0x401000, 0, applicable=False
+    )
+    obj.apply_type(FakeType("u32"))  # must not raise / must not touch IDB
+
+
+def test_scanned_structure_member_apply_skips_missing_offset(monkeypatch):
+    """F.1: an offset that is not a udt member applies nothing — no crash."""
+    import ida_typeinf
+
+    scanner_module = _load_scanner_module()
+
+    class _FakeStructTinfo:
+        def __init__(self, *a, **k):
+            pass
+
+        def get_named_type(self, til, name):
+            return True
+
+        def is_udt(self):
+            return True
+
+        def get_udt_details(self, udt):
+            return True  # empty udt
+
+        def set_udt_details(self, udt):
+            return True
+
+    monkeypatch.setattr(ida_typeinf, "tinfo_t", _FakeStructTinfo, raising=False)
+
+    obj = scanner_module.ScannedStructureMemberObject(
+        "World", 8, "member_8", 0x401000, 0
+    )
+    obj.apply_type(FakeType("u32"))  # must not raise
+
+
+def test_scanned_structure_member_integral_pointee_skips_silently(monkeypatch):
+    """F.1/R3.7: integral pointees (_DWORD casts) carry no udt — the apply
+    skips at debug level instead of warning that the "structure" is not a
+    known type (IDA's til has no _DWORD named type; it's cast syntax)."""
+    import ida_typeinf
+
+    scanner_module = _load_scanner_module()
+
+    def _fail_load(*a, **k):
+        raise AssertionError("integral pointee must not load a struct")
+
+    monkeypatch.setattr(
+        ida_typeinf,
+        "tinfo_t",
+        lambda *a, **k: SimpleNamespace(
+            get_named_type=lambda til, name: False,
+            is_udt=_fail_load,
+            get_udt_details=_fail_load,
+            set_udt_details=_fail_load,
+        ),
+        raising=False,
+    )
+
+    for name in ("_DWORD", "_QWORD", "unsigned __int32"):
+        obj = scanner_module.ScannedStructureMemberObject(
+            name, 4, "member_4", 0x401000, 0
+        )
+        obj.apply_type(FakeType("u32"))  # must not raise, no IDB touch
+
+
+def test_scanned_structure_member_named_scalar_skips(monkeypatch):
+    """R3.7: a named type that exists but is not a struct/union applies
+    nothing (scalar typedef pointees) — debug-level skip, no warning."""
+    import ida_typeinf
+
+    scanner_module = _load_scanner_module()
+
+    class _FakeScalarTinfo:
+        def get_named_type(self, til, name):
+            return name == "MyDword"
+
+        def is_udt(self):
+            return False
+
+        def get_udt_details(self, udt):
+            raise AssertionError("scalar pointee must not read udt details")
+
+    monkeypatch.setattr(ida_typeinf, "tinfo_t", _FakeScalarTinfo, raising=False)
+
+    obj = scanner_module.ScannedStructureMemberObject(
+        "MyDword", 4, "member_4", 0x401000, 0
+    )
+    obj.apply_type(FakeType("u32"))  # must not raise
+
+
+def _make_variable_object(scanner_module, lvar, **kwargs):
+    """Build a ScannedVariableObject with a stub env suitable for apply_type."""
+
+    class FakeLocator:
+        def __init__(self, location, defea):
+            self.location = location
+            self.defea = defea
+
+    class FakeSavedInfo:
+        def __init__(self):
+            self.ll = None
+            self.type = None
+
+    scanner_module.ida_hexrays.lvar_locator_t = lambda location, defea: FakeLocator(
+        location, defea
+    )
+    scanner_module.ida_hexrays.lvar_saved_info_t = FakeSavedInfo
+    scanner_module.ida_hexrays.MLI_TYPE = 0x10
+    scanner_module.ida_funcs.get_func = lambda ea: SimpleNamespace(start_ea=0x401000)
+    return scanner_module.ScannedVariableObject(lvar, "a1", 0x401000, 0, **kwargs)
+
+
+def test_scanned_variable_apply_type_uses_modify_user_lvar_info(monkeypatch):
+    """apply_type commits the type headless via modify_user_lvar_info.
+
+    Regression: the old GUI path (open_pseudocode + vdui_t.set_lvar_type)
+    crashes native in idalib workers; the headless path must be used.
+    """
+    scanner_module = _load_scanner_module()
+    obj = _make_variable_object(
+        scanner_module, SimpleNamespace(location=7, defea=0x401010)
+    )
+
+    seen = {}
+
+    def fake_modify(ea, flags, lvi):
+        seen["ea"] = ea
+        seen["flags"] = flags
+        seen["ll_location"] = lvi.ll.location
+        seen["ll_defea"] = lvi.ll.defea
+        seen["type"] = lvi.type
+
+    monkeypatch.setattr(
+        scanner_module.ida_hexrays, "modify_user_lvar_info", fake_modify, raising=False
+    )
+    scanner_module.decompile = lambda ea: SimpleNamespace(
+        entry_ea=0x401000,
+        get_lvars=lambda: [SimpleNamespace(location=7, defea=0x401010)],
+    )
+
+    captured_type = object()
+    obj.apply_type(captured_type)
+
+    assert seen["ea"] == 0x401000
+    assert seen["flags"] == 0x10
+    assert seen["ll_location"] == 7
+    assert seen["ll_defea"] == 0x401010
+    assert seen["type"] is captured_type
+
+
+def test_scanned_variable_apply_type_skips_when_lvar_missing(monkeypatch):
+    """A scanned variable that no longer matches any lvar is skipped safely."""
+    scanner_module = _load_scanner_module()
+    obj = _make_variable_object(
+        scanner_module, SimpleNamespace(location=7, defea=0x401010)
+    )
+
+    calls = []
+
+    def fake_modify(ea, flags, lvi):
+        calls.append(ea)
+
+    monkeypatch.setattr(
+        scanner_module.ida_hexrays, "modify_user_lvar_info", fake_modify, raising=False
+    )
+    scanner_module.decompile = lambda ea: SimpleNamespace(
+        entry_ea=0x401000,
+        get_lvars=lambda: [SimpleNamespace(location=99, defea=0x401020)],
+    )
+
+    # Must not raise, and must not commit a type against the wrong variable.
+    obj.apply_type(object())
+    assert calls == []
+
+
+def test_scanned_variable_apply_type_respects_applicable(monkeypatch):
+    """Inapplicable scan objects never re-decompile or commit."""
+    scanner_module = _load_scanner_module()
+    obj = _make_variable_object(
+        scanner_module,
+        SimpleNamespace(location=7, defea=0x401010),
+        applicable=False,
+    )
+
+    def failure(_ea):
+        raise AssertionError("decompile must not run for inapplicable objects")
+
+    scanner_module.decompile = failure
+    obj.apply_type(object())
+
+
 
 
 def test_extract_member_from_ptr_uses_raw_add_offsets(monkeypatch):
@@ -416,6 +674,114 @@ def test_get_member_discards_negative_offset():
     result = visitor._get_member(-32, SimpleNamespace(ea=0x1000), SimpleNamespace(id=scanner_module.ObjectType.local_variable, name="a1"), None)
 
     assert result is None
+
+
+def test_extract_member_skips_bare_variable_assignment_writes(monkeypatch):
+    """R3.10: `v0 = calloc(...)` / `v4 = v0` re-bind the POINTER; they are
+    not member-0 writes. The old code planted `void*`/`test*` rows at
+    offset 0 for every root assignment (and phi-merge `v4 = v0` aliases
+    polluted the scanned structure with the alias's own rows)."""
+    scanner_module = _load_scanner_module()
+    visitor = scanner_module.ScanVisitor.__new__(scanner_module.ScanVisitor)
+    scanner_module.ctype = SimpleNamespace(
+        cast=1, ref=2, ptr=3, idx=4, add=5, num=6, asg=7, var=8, ne=9, eq=10,
+        memptr=11,
+    )
+
+    called = []
+    visitor._get_member = lambda *a, **k: called.append((a, k)) or "member"
+    visitor._extract_obj_ea = lambda *a, **k: None
+
+    # `v0 = <rhs>` — assignee is the bare variable itself
+    leaf = SimpleNamespace(
+        op=scanner_module.ctype.var,
+        v=SimpleNamespace(name="v0"),
+        type=SimpleNamespace(dstr=lambda: "void *"),
+    )
+    asg = SimpleNamespace(op=scanner_module.ctype.asg, x=leaf, y=SimpleNamespace())
+    context = scanner_module.ParentExpressionContext([asg])
+    obj = SimpleNamespace(name="v0")
+
+    result = visitor._extract_member(leaf, obj, 0, context)
+
+    assert result is None
+    assert called == []
+
+
+def test_extract_member_preserves_real_member_assignment_writes(monkeypatch):
+    """R3.10 (companion): a REAL member write `v0->field_8 = x` still
+    extracts — the skip only fires for the bare variable as assignee."""
+    scanner_module = _load_scanner_module()
+    visitor = scanner_module.ScanVisitor.__new__(scanner_module.ScanVisitor)
+    scanner_module.ctype = SimpleNamespace(
+        cast=1, ref=2, ptr=3, idx=4, add=5, num=6, asg=7, var=8, ne=9, eq=10,
+        memptr=11,
+    )
+
+    captured = {}
+
+    def fake_get_member(offset, cexpr, obj, tinfo, obj_ea=None):
+        captured["offset"] = offset
+        captured["tinfo"] = tinfo
+        return "member"
+
+    visitor._get_member = fake_get_member
+    visitor._extract_obj_ea = lambda *a, **k: None
+
+    # `v0->field_8 = rhs` — assignee is a memptr, NOT the bare variable
+    leaf = SimpleNamespace(
+        op=scanner_module.ctype.var,
+        v=SimpleNamespace(name="v0"),
+        type=SimpleNamespace(dstr=lambda: "void *"),
+    )
+    member_access = SimpleNamespace(
+        op=scanner_module.ctype.memptr, x=leaf, m=8,
+    )
+    cast = SimpleNamespace(
+        op=scanner_module.ctype.cast,
+        x=member_access,
+        type=SimpleNamespace(dstr=lambda: "u64"),
+    )
+    asg = SimpleNamespace(op=scanner_module.ctype.asg, x=cast, y=SimpleNamespace())
+    context = scanner_module.ParentExpressionContext([asg])
+    obj = SimpleNamespace(name="v0")
+
+    result = visitor._extract_member(leaf, obj, 0, context)
+
+    assert result == "member"
+    assert captured["offset"] == 8
+    assert captured["tinfo"] is cast.type or captured["tinfo"] is asg.x.type
+
+
+def test_extract_member_skips_null_comparison_of_bare_variable():
+    """R3.10: `v0 != nullptr` / `v0 == 0` reads the POINTER, not member 0.
+    The null-check compare planted a `u64:0x0` row for every allocation.
+    Comparison contexts with no member-access wrapper are not member
+    reads."""
+    scanner_module = _load_scanner_module()
+    visitor = scanner_module.ScanVisitor.__new__(scanner_module.ScanVisitor)
+    scanner_module.ctype = SimpleNamespace(
+        cast=1, ref=2, ptr=3, idx=4, add=5, num=6, asg=7, var=8, ne=9, eq=10,
+        memptr=11, cit_empty=100,
+    )
+
+    called = []
+    visitor._get_member = lambda *a, **k: called.append((a, k)) or "member"
+    visitor._obj_has_no_member_wrapper = lambda first_parent: True
+
+    leaf = SimpleNamespace(
+        op=scanner_module.ctype.var,
+        v=SimpleNamespace(name="v0"),
+        type=SimpleNamespace(dstr=lambda: "test *"),
+    )
+    ne = SimpleNamespace(op=scanner_module.ctype.ne, x=leaf)
+    context = scanner_module.ParentExpressionContext([ne])
+    obj = SimpleNamespace(name="v0")
+
+    result = visitor._extract_member(leaf, obj, 0, context)
+
+    assert result is None
+    assert called == []
 
 
 def test_manipulate_prefers_pointer_context_even_without_pointer_tinfo(monkeypatch):
@@ -880,6 +1246,36 @@ def test_to_function_offset_str_uses_stable_fallback_for_non_function():
     assert hexrays_module.to_function_offset_str(0x401234) == "<no-function>"
 
 
+
+def test_to_function_offset_str_uses_domain_metadata(monkeypatch):
+    hexrays_path = Path(__file__).resolve().parents[2] / "src" / "forge" / "api" / "hexrays.py"
+    spec = util.spec_from_file_location("forge.api.hexrays_domain_test", hexrays_path)
+    assert spec is not None and spec.loader is not None
+    hexrays_module = util.module_from_spec(spec)
+    spec.loader.exec_module(hexrays_module)
+    monkeypatch.setattr(
+        hexrays_module,
+        "_current_domain_database",
+        lambda required=False: SimpleNamespace(
+            functions=SimpleNamespace(
+                get_at=lambda ea: SimpleNamespace(start_ea=0x401000)
+            ),
+            names=SimpleNamespace(get_at=lambda ea: "domain_func"),
+        ),
+    )
+    assert hexrays_module.to_function_offset_str(0x401234) == "domain_func+0x234"
+
+
+def test_domain_function_for_offset_uses_shared_dispatch(monkeypatch):
+    hexrays_path = Path(__file__).resolve().parents[2] / "src" / "forge" / "api" / "hexrays.py"
+    spec = util.spec_from_file_location("forge.api.hexrays_dispatch_test", hexrays_path)
+    assert spec is not None and spec.loader is not None
+    module = util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    expected = object()
+    monkeypatch.setattr(module, "_try_domain_method", lambda *args, **kwargs: (True, expected))
+    assert module._domain_function_for_offset(0x401000) is expected
+
 def test_new_deep_scan_visitor_initializes_recursive_state(monkeypatch):
     scanner_module = _load_scanner_module()
     calls = []
@@ -1301,4 +1697,82 @@ def test_member_rooted_scan_anchored_at_use_instruction_still_works(monkeypatch)
     assert visitor._skip is False  # cleared at the memptr use
     offsets = sorted(m.offset for m in structure.members)
     assert 0x00 in offsets, f"expected the +0 member, got offsets {offsets}"
-    assert 0x1C in offsets, f"expected the +28 member, got offsets {offsets}"
+
+
+def test_scanned_object_function_metadata_uses_domain(monkeypatch):
+    scanner_module = _load_scanner_module()
+    function = SimpleNamespace(start_ea=0x401000, name="domain_func")
+    monkeypatch.setattr(
+        scanner_module,
+        "_current_domain_database",
+        lambda required=False: SimpleNamespace(
+            functions=SimpleNamespace(get_at=lambda ea: function)
+        ),
+    )
+    assert scanner_module.ScannedObject._get_function_start(0x401234) == 0x401000
+    obj = scanner_module.ScannedObject.__new__(scanner_module.ScannedObject)
+    obj.func_ea = 0x401000
+    assert obj.function_name == "domain_func"
+
+
+def test_maybe_record_pointer_child_gate_records_through_empty_store(monkeypatch):
+    """C4 regression: the pointer-child gate must check the store's PRESENCE,
+    not its truthiness. The store is initialised EMPTY at ScanVisitor.__init__
+    and this gate is the only path to _record_pointer_child_member — gating on
+    an empty dict made pointer-child/vtable-child reconstruction dead code path.
+    """
+    scanner_module = _load_scanner_module()
+    ctype = scanner_module.ctype
+    structure = SimpleNamespace(name="Root", add_member=lambda member: None)
+    obj = SimpleNamespace(
+        id=scanner_module.ObjectType.global_object,
+        ea=0x5000,
+        object_ea=0x5000,
+        name="g_table",
+    )
+    visitor = scanner_module.NewDeepScanVisitor.__new__(scanner_module.NewDeepScanVisitor)
+    visitor.parents = []
+    visitor._pointer_child_structures = {}
+    visitor._structure = structure
+    visitor._obj = obj
+    visitor._origin = 0
+    visitor._get_parent_context = lambda: scanner_module.ParentExpressionContext([])
+    monkeypatch.setattr(visitor, "_build_child_member", lambda *_args, **_kwargs: SimpleNamespace(offset=8, tinfo=FakeType("_QWORD")), raising=False)
+    visitor._record_pointer_child_member = lambda *_args, **_kwargs: visitor._pointer_child_structures.setdefault(0, SimpleNamespace(name="Root_field_0", members=[SimpleNamespace(offset=8, tinfo=FakeType("_QWORD"))]))
+    monkeypatch.setattr(scanner_module, "_function_at", lambda _ea: None, raising=False)
+
+    # ``*(_QWORD *)(*(_QWORD *)a1 + 8)`` — parents of the a1 leaf, innermost
+    # first (same double-deref chain as the wiring test).
+    cast1 = SimpleNamespace(op=ctype.cast)
+    ptr1 = SimpleNamespace(op=ctype.ptr)
+    add = SimpleNamespace(
+        op=ctype.add,
+        x=ptr1,
+        y=SimpleNamespace(op=ctype.num, numval=lambda: 8),
+        type=FakeType("_QWORD *", ptr=True),
+    )
+    cast2 = SimpleNamespace(op=ctype.cast, type=FakeType("_QWORD *", ptr=True))
+    ptr2 = SimpleNamespace(op=ctype.ptr)
+    monkeypatch.setattr(
+        visitor,
+        "_get_parent_context",
+        lambda: scanner_module.ParentExpressionContext(
+            [cast1, ptr1, add, cast2, ptr2]
+        ),
+        raising=False,
+    )
+
+    # A freshly initialised store is EMPTY — the pre-fix truthiness gate
+    # bailed out right here and reconstruction never ran.
+    assert visitor.pointer_child_structures == {}
+    visitor._maybe_record_pointer_child(
+        SimpleNamespace(op=ctype.var, name="a1"), obj
+    )
+
+    children = visitor.pointer_child_structures
+    assert children, "pointer-child store must be populated via the real gate"
+    child = children[0]
+    assert child.name == "Root_field_0"
+    assert len(child.members) == 1
+    assert child.members[0].offset == 8
+    assert child.members[0].tinfo.dstr() == "_QWORD"

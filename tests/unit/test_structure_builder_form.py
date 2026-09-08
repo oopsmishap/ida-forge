@@ -5,6 +5,8 @@ import io
 from importlib import import_module
 from types import SimpleNamespace
 
+import pytest
+
 from forge.api.structure import Structure
 
 hexrays_api = import_module("forge.api.hexrays")
@@ -16,6 +18,19 @@ scanner_api.NewShallowScanVisitor = type("NewShallowScanVisitor", (), {})
 form_module = import_module("forge.features.structure_builder.form")
 child_scan_module = import_module("forge.features.structure_builder.child_scan")
 structure_module = import_module("forge.api.structure")
+
+
+@pytest.fixture(autouse=True)
+def _fresh_catalog():
+    """The form now shares the process-wide catalog (I.28); each test starts
+    from an empty, event-free catalog."""
+    from forge.api.store import catalog
+
+    catalog.events.clear()
+    catalog.clear()
+    yield
+    catalog.events.clear()
+    catalog.clear()
 
 
 class _FakeLineEdit:
@@ -212,6 +227,43 @@ def test_on_close_resets_cached_ui_state(monkeypatch):
     assert structure_form.ui is None
     assert structure_form.layout is None
     assert structure_form._shortcut_actions == []
+
+
+
+def test_show_resubscribes_to_catalog_after_reset(monkeypatch):
+    """The form is a module-level singleton: after OnClose->reset drops the
+    catalog subscription, a re-show must re-subscribe or the form stops
+    seeing headless catalog mutations (I.28)."""
+    from forge.api.store import catalog
+
+    structure_form = _make_form(monkeypatch)
+    structure_form.reset()
+    assert structure_form.reload_structure_list not in catalog.events
+
+    structure_form.show()
+
+    assert structure_form.reload_structure_list in catalog.events
+
+
+def test_register_structure_models_fires_one_catalog_notification(monkeypatch):
+    """A hierarchy commit registers all models inside one catalog
+    transaction: a single snapshot + change notification, not one per
+    structure (which was O(N) serializations and N tree rebuilds)."""
+    from forge.api.store import catalog as store_catalog
+
+    structure_form = _make_form(monkeypatch)
+    notifications = []
+    monkeypatch.setattr(
+        store_catalog, "notify_changed", lambda: notifications.append(1)
+    )
+    models = [Structure(f"child_{i}") for i in range(4)]
+
+    registered = structure_form._register_structure_models(models)
+
+    assert tuple(registered) == tuple(models)
+    for model in models:
+        assert store_catalog[model.name] is model
+    assert notifications == [1]
 
 
 def test_get_selected_rows_handles_stale_table_after_reload(monkeypatch):
@@ -671,7 +723,7 @@ def test_create_structure_treats_none_as_cancel(monkeypatch):
     created = structure_form.create_structure(None)
 
     assert created is None
-    assert structure_form.structures == {}
+    assert list(structure_form.structures) == []
     assert structure_form.current_structure is None
 
 
@@ -695,7 +747,7 @@ def test_prompt_create_structure_treats_none_as_cancel(monkeypatch):
     created = structure_form.prompt_create_structure()
 
     assert created is None
-    assert structure_form.structures == {}
+    assert list(structure_form.structures) == []
     assert structure_form.current_structure is None
 
 
@@ -709,26 +761,43 @@ def test_prompt_create_structure_auto_names_blank_and_whitespace(monkeypatch):
     second = structure_form.prompt_create_structure()
 
     assert first is not None
-    assert first.name == "auto_struct_001"
     assert first.is_auto_named is True
     assert second is not None
-    assert second.name == "auto_struct_002"
     assert second.is_auto_named is True
-    assert list(structure_form.structures) == ["auto_struct_001", "auto_struct_002"]
+    # Auto-names are unique short-guid names: never the generic "Structure".
+    assert first.name.startswith("structure_")
+    assert first.name != "Structure"
+    assert second.name.startswith("structure_")
+    assert second.name != first.name
+    assert list(structure_form.structures) == [first.name, second.name]
     assert structure_form.current_structure is second
 
 
-def test_create_structure_skips_taken_auto_names_deterministically(monkeypatch):
+def test_create_structure_auto_name_skips_taken_guid(monkeypatch):
+    """An auto-created structure never collides with an existing manual name,
+    even when a user already chose a ``structure_``-prefixed name."""
     structure_form = _make_form(monkeypatch)
-    structure_form.create_structure("auto_struct_001")
     structure_form.create_structure("manual")
 
     created = structure_form.create_structure("  ")
 
     assert created is not None
-    assert created.name == "auto_struct_002"
+    assert created.name.startswith("structure_")
+    assert created.name not in structure_form.structures or structure_form.structures[created.name] is created
     assert created.is_auto_named is True
     assert structure_form.structures["manual"].is_auto_named is False
+
+
+def test_create_structure_auto_name_is_unique_across_many(monkeypatch):
+    """Many auto-named structures get distinct names."""
+    structure_form = _make_form(monkeypatch)
+    names = {
+        created.name
+        for _ in range(20)
+        if (created := structure_form.create_structure("  ")) is not None
+    }
+    assert len(names) == 20
+    assert all(name.startswith("structure_") for name in names)
 
 
 def test_structure_renamed_clears_auto_named_flag(monkeypatch):
@@ -747,9 +816,56 @@ def test_structure_renamed_clears_auto_named_flag(monkeypatch):
 
     assert auto_named.name == "Inventory"
     assert auto_named.is_auto_named is False
-    assert "auto_struct_001" not in structure_form.structures
+    assert "Structure" not in structure_form.structures
     assert structure_form.structures["Inventory"] is auto_named
     assert fake_filter.cleared is True
+
+
+def test_structure_renamed_autonamed_no_stale_lookup_with_reload(monkeypatch):
+    """Regression: renaming an auto-named structure must not emit
+    'Structure <name> does not exist!'. Each catalog mutation (self.structures
+    IS the catalog) fires reload_structure_list re-entrantly; the object's
+    name must be updated before the dict is mutated so the reloads never read
+    a stale name that is already gone from the store."""
+    from forge.api.store import catalog
+
+    structure_form = _make_form(monkeypatch)
+    warnings = []
+    monkeypatch.setattr(form_module, "log_warning", lambda m, *a, **k: warnings.append(m), raising=False)
+
+    # Simulate the GUI's catalog-change hook: a tree reload observes
+    # current_structure by name, exactly as _current_tree_structure ->
+    # set_structure would. It must never read the pre-rename name.
+    stale = []
+
+    def reload_listener():
+        cs = structure_form.current_structure
+        if cs is not None and cs.name not in structure_form.structures:
+            stale.append(cs.name)
+
+    catalog.events.append(reload_listener)
+
+    auto_named = structure_form.create_structure(" ")
+    assert auto_named is not None
+    old_name = auto_named.name
+    structure_form.current_structure = auto_named
+
+    fake_filter = _FakeFilter()
+    structure_form.ui = SimpleNamespace(
+        input_name=_FakeLineEdit("Inventory"),
+        input_filter=fake_filter,
+    )
+
+    structure_form.structure_renamed()
+
+    # No reload ever read the removed old name (previously leaked as
+    # "Structure Structure does not exist!").
+    assert stale == []
+    assert not any(old_name in w for w in warnings)
+    assert auto_named.name == "Inventory"
+    assert auto_named.is_auto_named is False
+    assert old_name not in structure_form.structures
+    assert structure_form.structures["Inventory"] is auto_named
 
 def test_structure_renamed_syncs_created_type_name_when_canonical(monkeypatch):
     structure_form = _make_form(monkeypatch)
@@ -924,6 +1040,62 @@ def test_structure_table_finalize_blocks_unresolved_children(monkeypatch):
     ]
 
 
+def test_structure_table_finalize_uses_headless_commit(monkeypatch):
+    """The form's default Create Type path commits via the headless core
+    (no C-preview/overwrite-confirm dialogs)."""
+    structure_form = _make_form(monkeypatch)
+    structure = structure_form.create_structure("Parent")
+    assert structure is not None
+    structure.add_member(_FakeMember(0x0, 8, type_name="u32", name="count"))
+    structure_form.current_structure = structure
+
+    captured: list = []
+    monkeypatch.setattr(
+        structure,
+        "create_type_if_ready",
+        lambda structures_by_name, **kwargs: captured.append(
+            (structures_by_name, kwargs)
+        )
+        or object(),
+    )
+
+    structure_form.structure_table_finalize()
+
+    assert len(captured) == 1
+    _, kwargs = captured[0]
+    assert kwargs["headless"] is True
+
+
+def test_structure_table_finalize_with_preview_uses_pack_structure(monkeypatch):
+    """The opt-in 'Create Type (Edit Declaration)' path keeps the editable
+    dialog, routing through pack_structure with the unresolved-children
+    guard preserved."""
+    structure_form = _make_form(monkeypatch)
+    structure = structure_form.create_structure("Parent")
+    assert structure is not None
+    structure.add_member(_FakeMember(0x0, 8, type_name="u32", name="count"))
+    structure_form.current_structure = structure
+
+    pack_calls: list = []
+    monkeypatch.setattr(
+        structure,
+        "pack_structure",
+        lambda *args, **kwargs: pack_calls.append((args, kwargs)) or object(),
+    )
+    create_calls: list = []
+    monkeypatch.setattr(
+        structure,
+        "create_type_if_ready",
+        lambda *args, **kwargs: create_calls.append(True) or object(),
+    )
+
+    structure_form.structure_table_finalize_with_preview()
+
+    assert pack_calls == [((), {})]
+    # The preview path must not invoke the (now-headless) create_type_if_ready.
+    assert create_calls == []
+
+
 def test_structure_table_resolve_clears_stale_selection_after_refresh(monkeypatch):
     structure_form = _make_form(monkeypatch)
 
@@ -994,20 +1166,23 @@ def test_create_child_types_creates_direct_children_in_offset_order(monkeypatch)
     )
 
     created: list[str] = []
+    created_kwargs: list[dict] = []
     monkeypatch.setattr(
         child_a,
         "create_type_if_ready",
-        lambda structures_by_name, **kwargs: created.append("ChildA") or object(),
+        lambda structures_by_name, **kwargs: created.append("ChildA") or created_kwargs.append(kwargs) or object(),
     )
     monkeypatch.setattr(
         child_b,
         "create_type_if_ready",
-        lambda structures_by_name, **kwargs: created.append("ChildB") or object(),
+        lambda structures_by_name, **kwargs: created.append("ChildB") or created_kwargs.append(kwargs) or object(),
     )
 
     structure_form.create_child_types()
 
     assert created == ["ChildA", "ChildB"]
+    # Dialog-free headless commit path.
+    assert all(kwargs.get("headless") is True for kwargs in created_kwargs)
     assert warnings == [
         "Linked child structure Missing does not exist."
     ]
@@ -1043,15 +1218,20 @@ def test_create_type_subtree_creates_children_before_parent(monkeypatch):
     structure_form.current_structure = parent
 
     created: list[str] = []
+    created_kwargs: list[dict] = []
     monkeypatch.setattr(
         structure_module.Structure,
         "create_type_if_ready",
-        lambda self, structures_by_name, **kwargs: created.append(self.name) or object(),
+        lambda self, structures_by_name, **kwargs: created.append(self.name) or created_kwargs.append(kwargs) or object(),
     )
 
     structure_form.create_type_subtree()
 
     assert created == ["Grandchild", "ChildB", "ChildC", "Parent"]
+    # Dialog-free headless commit across the whole subtree.
+    assert created_kwargs and all(
+        kwargs.get("headless") is True for kwargs in created_kwargs
+    )
 
 
 def test_update_action_states_enables_child_type_actions_for_child_relationships(
@@ -1164,7 +1344,9 @@ def test_scan_child_structure_auto_creates_child_and_records_metadata(monkeypatc
 
     def fake_execute(child_structure, built_plan):
         assert built_plan is plan
-        assert child_structure.main_offset == member.offset
+        # child structures are stored child-local (main_offset 0); the
+        # The scanned member's absolute origin travels via plan.source_base.
+        assert child_structure.main_offset == 0
         child_structure.add_member(_FakeMember(0, 4, type_name="u32", name="value"))
         return True
 
@@ -1172,10 +1354,13 @@ def test_scan_child_structure_auto_creates_child_and_records_metadata(monkeypatc
 
     structure_form.scan_child_structure()
 
-    child = structure_form.structures["auto_struct_001"]
+    child = next(
+        s for s in structure_form.structures.values() if s.is_auto_named
+    )
+    assert child.name.startswith("structure_")
     assert structure_form.current_structure is child
     assert child.is_auto_named is True
-    assert child.main_offset == 0x30
+    assert child.main_offset == 0
     assert child.provenance.kind == "child_scan"
     assert child.provenance.root_object_name == "Parent.child_ptr"
     assert child.provenance.source_member_offset == 0x30
@@ -1404,7 +1589,7 @@ def test_build_structure_table_debug_csv_falls_back_for_root_labels_and_lines(mo
     csv_text = structure_form._build_structure_table_debug_csv()
     rows = list(csv.reader(io.StringIO(csv_text)))
 
-    row = dict(zip(rows[0], rows[1]))
+    row = dict(zip(rows[0], rows[1], strict=False))
 
     assert row["scan_location_count"] == "1"
     assert row["scan_locations"] == "child_func@0x401234"
@@ -1460,7 +1645,7 @@ def test_build_structure_table_debug_csv_reads_simpleline_line_text(monkeypatch)
 
     csv_text = structure_form._build_structure_table_debug_csv()
     rows = list(csv.reader(io.StringIO(csv_text)))
-    row = dict(zip(rows[0], rows[1]))
+    row = dict(zip(rows[0], rows[1], strict=False))
 
     assert row["scan_lines"] == "parent->child = value;"
     assert row["scan_root_lines"] == "if (ok) {"
@@ -1536,7 +1721,7 @@ def test_scan_child_structure_rolls_back_new_child_when_scan_finds_nothing(
 
     structure_form.scan_child_structure()
 
-    assert "auto_struct_001" not in structure_form.structures
+    assert "Structure" not in structure_form.structures
     assert structure_form.current_structure is parent
     assert parent.child_relationships == []
     assert member.linked_child_structure_name is None
@@ -1924,43 +2109,43 @@ def test_update_action_states_enables_child_scan_actions_for_scannable_member(mo
 
 
 
-def test_execute_child_scan_plan_enables_recursive_child_traversal(monkeypatch):
+def test_execute_child_scan_plan_builds_hierarchy_requests_with_source_base(monkeypatch):
+    """The plan executor groups seeded evidence into HierarchyScanRequests
+    carrying the plan's source_base, and delegates to the hierarchy runner."""
     structure_form = _make_form(monkeypatch)
     child = structure_form.create_structure("Child")
     assert child is not None
-    child.main_offset = 0x30
 
     plan = SimpleNamespace(
         function_eas=(0x401000,),
         scan_object=SimpleNamespace(name="child_ptr", id="member"),
         scan_variables=(SimpleNamespace(func_ea=0x401000, ea=0x402000),),
+        source_base=0x30,
     )
     captured = {}
 
+    def fake_hierarchy_scan(structure, requests, *, max_depth):
+        captured["structure"] = structure
+        captured["requests"] = list(requests)
+        captured["max_depth"] = max_depth
+        return object()
+
+    monkeypatch.setattr(structure_form, "_run_deep_hierarchy_scan", fake_hierarchy_scan)
     monkeypatch.setattr(
         structure_form,
         "_prepare_scan_cfunc",
         lambda _ea: SimpleNamespace(entry_ea=0x401000),
     )
 
-    class FakeVisitor:
-        def __init__(self, cfunc, origin, obj, structure, recurse_calls=False, skip_until_object=True):
-            captured["args"] = (
-                cfunc.entry_ea,
-                origin,
-                obj.name,
-                obj.ea,
-                structure.name,
-                recurse_calls,
-            )
-
-        def process(self):
-            return None
-
-    monkeypatch.setattr(child_scan_module, "NewDeepScanVisitor", FakeVisitor)
-
     assert structure_form._execute_child_scan_plan(child, plan) is True
-    assert captured["args"] == (0x401000, 0x30, "child_ptr", 0x402000, "Child", True)
+    assert captured["structure"] is child
+    assert captured["max_depth"] is None
+    requests = captured["requests"]
+    assert len(requests) == 1
+    assert requests[0].cfunc.entry_ea == 0x401000
+    assert requests[0].obj.name == "child_ptr"
+    assert requests[0].obj.ea == 0x402000
+    assert requests[0].source_base == 0x30
 
 
 def test_execute_child_scan_plan_runs_for_each_scan_location(monkeypatch):
@@ -1976,6 +2161,7 @@ def test_execute_child_scan_plan_runs_for_each_scan_location(monkeypatch):
             SimpleNamespace(func_ea=0x401000, ea=0x402000, name="root_a"),
             SimpleNamespace(func_ea=0x401000, ea=0x402010, name="root_b"),
         ),
+        source_base=0x30,
     )
 
     monkeypatch.setattr(
@@ -1994,29 +2180,25 @@ def test_execute_child_scan_plan_runs_for_each_scan_location(monkeypatch):
 
     captured = []
 
-    class FakeVisitor:
-        def __init__(self, cfunc, origin, obj, structure, recurse_calls=False, skip_until_object=True):
+    def fake_hierarchy_scan(structure, requests, *, max_depth):
+        for request in requests:
             captured.append(
                 (
-                    cfunc.entry_ea,
-                    origin,
-                    obj.ea,
-                    obj.func_ea,
-                    obj.name,
-                    structure.name,
-                    recurse_calls,
+                    request.cfunc.entry_ea,
+                    request.source_base,
+                    request.obj.ea,
+                    request.obj.func_ea,
+                    request.obj.name,
                 )
             )
+        return object()
 
-        def process(self):
-            return None
-
-    monkeypatch.setattr(child_scan_module, "NewDeepScanVisitor", FakeVisitor)
+    monkeypatch.setattr(structure_form, "_run_deep_hierarchy_scan", fake_hierarchy_scan)
 
     assert structure_form._execute_child_scan_plan(child, plan) is True
     assert captured == [
-        (0x401000, 0x30, 0x402000, 0x401000, "child_ptr", "Child", True),
-        (0x401000, 0x30, 0x402010, 0x401000, "child_ptr", "Child", True),
+        (0x401000, 0x30, 0x402000, 0x401000, "child_ptr"),
+        (0x401000, 0x30, 0x402010, 0x401000, "child_ptr"),
     ]
 
 
@@ -2078,7 +2260,6 @@ def test_execute_child_scan_plan_normalizes_legacy_scan_variables(monkeypatch):
     structure_form = _make_form(monkeypatch)
     child = structure_form.create_structure("Child")
     assert child is not None
-    child.main_offset = 0x30
 
     legacy_lvar = SimpleNamespace(location="stack", defea=0x1234)
     legacy_scan_variable = SimpleNamespace(
@@ -2094,6 +2275,7 @@ def test_execute_child_scan_plan_normalizes_legacy_scan_variables(monkeypatch):
             id=import_module("forge.api.scan_object").ObjectType.structure_reference,
         ),
         scan_variables=(legacy_scan_variable,),
+        source_base=0x30,
     )
 
     monkeypatch.setattr(
@@ -2104,41 +2286,37 @@ def test_execute_child_scan_plan_normalizes_legacy_scan_variables(monkeypatch):
 
     captured = {}
 
-    class FakeVisitor:
-        def __init__(self, cfunc, origin, obj, structure, recurse_calls=False, skip_until_object=True):
-            captured["args"] = (
-                cfunc.entry_ea,
-                origin,
-                getattr(obj, "name", None),
-                getattr(obj, "ea", None),
-                getattr(obj, "id", None),
-                getattr(obj, "lvar", None),
-                structure.name,
-                recurse_calls,
-            )
+    def fake_hierarchy_scan(_structure, requests, *, max_depth):
+        captured["requests"] = list(requests)
+        captured["max_depth"] = max_depth
+        return object()
 
-        def process(self):
-            return None
-
-    monkeypatch.setattr(child_scan_module, "NewDeepScanVisitor", FakeVisitor)
+    monkeypatch.setattr(structure_form, "_run_deep_hierarchy_scan", fake_hierarchy_scan)
 
     assert structure_form._execute_child_scan_plan(child, plan) is True
-    assert captured["args"][0:4] == (0x401000, 0x30, "child_ptr", 0x402000)
-    assert captured["args"][4] == import_module("forge.api.scan_object").ObjectType.structure_reference
-    assert captured["args"][5] is None
-    assert captured["args"][6:] == ("Child", True)
+    requests = captured["requests"]
+    assert len(requests) == 1
+    request = requests[0]
+    assert request.cfunc.entry_ea == 0x401000
+    assert request.source_base == 0x30
+    assert getattr(request.obj, "name", None) == "child_ptr"
+    assert getattr(request.obj, "ea", None) == 0x402000
+    assert getattr(request.obj, "id", None) == import_module(
+        "forge.api.scan_object"
+    ).ObjectType.structure_reference
+    assert getattr(request.obj, "lvar", None) is None
 
 def test_execute_child_scan_plan_prefers_inferred_child_roots(monkeypatch):
     structure_form = _make_form(monkeypatch)
     child = structure_form.create_structure("Child")
     assert child is not None
-    child.main_offset = 0x30
 
     inferred_root = SimpleNamespace(name="child_var", ea=0x500123, func_ea=0x402000)
     plan = SimpleNamespace(
         function_eas=(0x401000,),
         scan_object=SimpleNamespace(name="child_ptr", id="member"),
         scan_variables=(SimpleNamespace(func_ea=0x401000, ea=0x402000),),
+        source_base=0x30,
     )
 
     monkeypatch.setattr(
@@ -2154,24 +2332,18 @@ def test_execute_child_scan_plan_prefers_inferred_child_roots(monkeypatch):
 
     captured = {}
 
-    class FakeVisitor:
-        def __init__(self, cfunc, origin, obj, structure, recurse_calls=False, skip_until_object=True):
-            captured["args"] = (
-                cfunc.entry_ea,
-                origin,
-                obj.name,
-                obj.ea,
-                structure.name,
-                recurse_calls,
-            )
+    def fake_hierarchy_scan(_structure, requests, *, max_depth):
+        captured["requests"] = list(requests)
+        return object()
 
-        def process(self):
-            return None
-
-    monkeypatch.setattr(child_scan_module, "NewDeepScanVisitor", FakeVisitor)
+    monkeypatch.setattr(structure_form, "_run_deep_hierarchy_scan", fake_hierarchy_scan)
 
     assert structure_form._execute_child_scan_plan(child, plan) is True
-    assert captured["args"] == (0x402000, 0x30, "child_var", 0x500123, "Child", True)
+    requests = captured["requests"]
+    assert len(requests) == 1
+    assert requests[0].cfunc.entry_ea == 0x402000
+    assert requests[0].obj is inferred_root
+    assert requests[0].source_base == 0x30
 
 
 
@@ -2246,52 +2418,6 @@ def test_member_scan_tinfo_validates_and_warns(monkeypatch):
         is None
     )
     assert len(warnings) == 2
-
-
-def test_scan_evidence_in_function_falls_back_to_seeded_root(monkeypatch):
-    structure_form = _make_form(monkeypatch)
-    child = structure_form.create_structure("Child")
-    child.main_offset = 0x30
-
-    cfunc = SimpleNamespace(entry_ea=0x401000)
-    plan = SimpleNamespace(scan_object=SimpleNamespace(name="plan_root"))
-    seen = []
-
-    class FakeVisitor:
-        def __init__(self, cfunc, origin, obj, structure, recurse_calls=False, skip_until_object=True):
-            seen.append((cfunc, origin, obj, structure, recurse_calls))
-
-        def process(self):
-            return None
-
-    monkeypatch.setattr(
-        structure_form,
-        "_seed_scan_object_from_evidence",
-        lambda plan_object, scan_variable: SimpleNamespace(name="seeded", func_ea=0x401000),
-    )
-    monkeypatch.setattr(
-        structure_form,
-        "_infer_child_scan_roots",
-        lambda _cfunc, seeded: (),  # no inferred roots -> seeded fallback
-    )
-    monkeypatch.setattr(
-        structure_form,
-        "_prepare_scan_cfunc",
-        lambda _ea: None,  # root function missing -> reuse evidence cfunc
-    )
-
-    result = structure_form._scan_evidence_in_function(
-        child, cfunc, [SimpleNamespace(name="evidence")], plan, FakeVisitor
-    )
-
-    assert result is True
-    assert len(seen) == 1
-    _cfunc, origin, obj, structure, recurse = seen[0]
-    assert _cfunc is cfunc
-    assert origin == 0x30
-    assert obj.name == "seeded"
-    assert structure is child
-    assert recurse is True
 
 
 def test_build_child_scan_inference_seed_recovers_descendant_parent_member_anchors(
@@ -2547,12 +2673,12 @@ def test_execute_child_scan_plan_falls_back_to_seeded_member_when_inference_fail
     structure_form = _make_form(monkeypatch)
     child = structure_form.create_structure("Child")
     assert child is not None
-    child.main_offset = 0x30
 
     plan = SimpleNamespace(
         function_eas=(0x401000,),
         scan_object=SimpleNamespace(name="child_ptr", id="member"),
         scan_variables=(SimpleNamespace(func_ea=0x401000, ea=0x402000),),
+        source_base=0x30,
     )
     warnings = []
 
@@ -2574,24 +2700,19 @@ def test_execute_child_scan_plan_falls_back_to_seeded_member_when_inference_fail
 
     captured = {}
 
-    class FakeVisitor:
-        def __init__(self, cfunc, origin, obj, structure, recurse_calls=False, skip_until_object=True):
-            captured["args"] = (
-                cfunc.entry_ea,
-                origin,
-                obj.name,
-                obj.ea,
-                structure.name,
-                recurse_calls,
-            )
+    def fake_hierarchy_scan(_structure, requests, *, max_depth):
+        captured["requests"] = list(requests)
+        return object()
 
-        def process(self):
-            return None
-
-    monkeypatch.setattr(child_scan_module, "NewDeepScanVisitor", FakeVisitor)
+    monkeypatch.setattr(structure_form, "_run_deep_hierarchy_scan", fake_hierarchy_scan)
 
     assert structure_form._execute_child_scan_plan(child, plan) is True
-    assert captured["args"] == (0x401000, 0x30, "child_ptr", 0x402000, "Child", True)
+    requests = captured["requests"]
+    assert len(requests) == 1
+    assert requests[0].cfunc.entry_ea == 0x401000
+    assert requests[0].obj.name == "child_ptr"
+    assert requests[0].obj.ea == 0x402000
+    assert requests[0].source_base == 0x30
     assert any(
         "fell back to seeded member evidence" in message
         for message, _display in warnings
@@ -2601,6 +2722,10 @@ def test_execute_child_scan_plan_falls_back_to_seeded_member_when_inference_fail
 
 
 def test_scan_child_structure_uses_absolute_member_origin(monkeypatch):
+    """Embedded children scan the parent buffer: the plan carries the
+    member's absolute origin as source_base (the hierarchy session re-bases
+    observations by subtracting it), and the child structure itself is
+    stored child-local (main_offset 0)."""
     structure_form = _make_form(monkeypatch)
     parent = structure_form.create_structure("Parent")
     assert parent is not None
@@ -2609,32 +2734,20 @@ def test_scan_child_structure_uses_absolute_member_origin(monkeypatch):
     member.tinfo = SimpleNamespace(is_ptr=lambda: False, is_udt=lambda: False)
     member.scanned_variables = [SimpleNamespace(func_ea=0x401000, ea=0x402000, name="root")]
     structure_form.current_structure = parent
-    # is_legal_type is bound module-level (line 13) before import_module;
+    # is_legal_type is bound module-level before import_module;
     # patching form_module would target a name form no longer holds.
     monkeypatch.setattr(child_scan_module, "is_legal_type", lambda _tinfo: True, raising=False)
-
-    plan = child_scan_module.ChildScanPlan(
-        scan_object=SimpleNamespace(name="child_ptr"),
-        function_eas=(0x401000,),
-        relation_kind="embedded",
-        root_object_name="Parent.child_ptr",
-        root_object_ea=0x402000,
-        root_function_ea=0x401000,
-        has_multiple_roots=False,
+    monkeypatch.setattr(
+        child_scan_module.ChildScanMixin,
+        "_parent_type_exists_in_idb",
+        staticmethod(lambda name: True),
     )
-    monkeypatch.setattr(structure_form, "get_selected_member", lambda: member)
-    monkeypatch.setattr(structure_form, "_build_child_scan_plan", lambda _member, show_warnings=False: plan)
-    def fake_execute(child_structure, _plan):
-        child_structure.add_member(_FakeMember(0, 4, type_name="u32", name="value"))
-        return True
 
-    monkeypatch.setattr(structure_form, "_execute_child_scan_plan", fake_execute)
+    plan = structure_form._build_child_scan_plan(member, show_warnings=True)
 
-    structure_form.scan_child_structure()
-
-    child = structure_form.structures["auto_struct_001"]
-    assert child.main_offset == 0xD08
-
+    assert plan is not None
+    assert plan.relation_kind == "embedded"
+    assert plan.source_base == 0xD08
 
 
 def test_link_child_structure_materializes_pointer_and_inline_member_types(monkeypatch):
@@ -3029,16 +3142,19 @@ def test_member_child_link_normalization_clears_stale_links(monkeypatch):
 
 
 def test_make_unique_structure_name_copy_collision_loop(monkeypatch):
-    """G10: 'Copy N' naming increments past every existing collision."""
+    """G10/I.28: catalog.unique_name 'Copy N' naming increments past every
+    existing collision."""
+    from forge.api.store import catalog as _catalog
+
     structure_form = _make_form(monkeypatch)
     for name in ("Foo", "Foo Copy", "Foo Copy 2", "Foo Copy 3"):
         structure_form.create_structure(name)
 
-    assert structure_form._make_unique_structure_name("Foo") == "Foo Copy 4"
-    assert structure_form._make_unique_structure_name("Bar") == "Bar"
+    assert _catalog.unique_name("Foo") == "Foo Copy 4"
+    assert _catalog.unique_name("Bar") == "Bar"
 
     structure_form.create_structure("Foo Copy 5")
-    assert structure_form._make_unique_structure_name("Foo") == "Foo Copy 4"
+    assert _catalog.unique_name("Foo") == "Foo Copy 4"
 
 
 def test_propagate_child_scan_seed_unresolvable_parent_arg_is_noop(monkeypatch):
@@ -3205,15 +3321,20 @@ def test_nudge_into_collision_with_unselected_member_is_rejected(monkeypatch):
 
 
 def test_on_close_clears_structure_models(monkeypatch):
-    """T4.4: closing the form drops the in-memory scan models."""
+    """T4.4/I.28: closing the form drops the cached UI/scan state but keeps
+    the shared catalog — headless structures outlive the form."""
     structure_form = _make_form(monkeypatch)
     structure_form.create_structure("Foo")
     structure_form.current_structure = structure_form.structures["Foo"]
+    structure_form.parent = object()
+    structure_form.ui = SimpleNamespace(tbl_structure=object(), tree_structures=object())
 
     structure_form.OnClose(None)
 
-    assert structure_form.structures == {}
+    assert list(structure_form.structures) == ["Foo"]
     assert structure_form.current_structure is None
+    assert structure_form.ui is None
+    assert structure_form.parent is None
 
 
 def test_configure_table_edit_triggers_combine_int_values(monkeypatch):

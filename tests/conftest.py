@@ -77,6 +77,15 @@ class _DummyTInfo:
     def get_named_type(self, *args, **kwargs):
         return True
 
+    def get_numbered_type(self, *args, **kwargs):
+        return False
+
+    def is_udt(self):
+        return False
+
+    def get_udt_details(self, *args, **kwargs):
+        return False
+
     def dstr(self):
         return self._name
 
@@ -140,6 +149,15 @@ _stub_module(
     BTF_UINT32=0,
     BTF_UINT64=0,
     get_idati=lambda: object(),
+    get_ordinal_count=lambda idati: 0,
+    get_numbered_type_name=lambda idati, ordinal: "",
+    get_type_ordinal=lambda idati, name: -1,
+    apply_tinfo=lambda *args, **kwargs: True,
+    TINFO_DEFINITE=0,
+    print_tinfo=lambda *args, **kwargs: 0,
+    PRTYPE_MULTI=0,
+    PRTYPE_TYPE=0,
+    PRTYPE_SEMI=0,
     parse_decl=lambda *args, **kwargs: False,
     import_type=lambda *args, **kwargs: 0,
     PT_TYP=0,
@@ -195,10 +213,21 @@ _stub_module(
     create_typedef=lambda *args, **kwargs: None,
     init_hexrays_plugin=lambda: True,
     open_pseudocode=lambda *args, **kwargs: None,
+    mark_cfunc_dirty=lambda *args, **kwargs: None,
+    modify_user_lvar_info=lambda *args, **kwargs: True,
+    lvar_saved_info_t=lambda *args, **kwargs: types.SimpleNamespace(ll=None, type=None),
+    lvar_locator_t=lambda location, defea: types.SimpleNamespace(location=location, defea=defea),
+    MLI_TYPE=0x08,
+    OPF_NEW_WINDOW=2,
     cfunc_type=lambda *args, **kwargs: object(),
     Hexrays_Hooks=_DummyHexraysHooks,
     ctree_item_t=type("ctree_item_t", (), {}),
     ctree_parentee_t=type("ctree_parentee_t", (), {}),
+    ctree_visitor_t=type(
+        "ctree_visitor_t",
+        (),
+        {"__init__": lambda self, *a, **k: None, "apply_to": lambda self, *a, **k: None},
+    ),
     cfunc_t=type("cfunc_t", (), {}),
     cexpr_t=type("cexpr_t", (), {}),
     lvar_t=type("lvar_t", (), {}),
@@ -220,6 +249,12 @@ _stub_module(
     get_segm_name=lambda *_args: "",
     get_func_attr=lambda ea, _attr: ea,
     get_name=lambda ea: f"sub_{ea:x}",
+    get_inf_attr=lambda *_args, **_kwargs: 0,
+    INF_SHORT_DN=0,
+    # E1: parse_declaration / parse_user_tinfo fall back to idc.parse_decl
+    # (ida_idaapi.idc_parse_decl does not exist on IDA 9.4); None means
+    # "could not parse", matching the real module's failure mode.
+    parse_decl=lambda *args, **kwargs: None,
 )
 
 _stub_module("ida_auto")
@@ -308,6 +343,24 @@ def _qt_flag_value(flag):
     return int(getattr(flag, "value", flag))
 
 
+def _qt_combined_flags(*flags, flags_type=None):
+    combined = 0
+    for flag in flags:
+        if flag is None:
+            continue
+        value = getattr(flag, "value", flag)
+        try:
+            combined |= int(value)
+        except (TypeError, ValueError):
+            continue
+    if callable(flags_type):
+        try:
+            return flags_type(combined)
+        except (TypeError, ValueError):
+            pass
+    return combined
+
+
 _stub_module(
     "forge.util.qt",
     QtCore=_DummyQtNamespace(),
@@ -319,6 +372,7 @@ _stub_module(
     else widget.exec_(*args, **kwargs),
     qt_item_flags=_qt_item_flags,
     qt_flag_value=_qt_flag_value,
+    qt_combined_flags=_qt_combined_flags,
 )
 def _collect_ctree_items_near_ea(cfunc, ea: int, *, exhaustive: bool = False):
     """Faithful behavioral double of hexrays.collect_ctree_items_near_ea.
@@ -388,6 +442,7 @@ _stub_module(
     read_pointer=lambda *args, **kwargs: 0,
     is_code=lambda *args, **kwargs: False,
     is_imported=lambda *args, **kwargs: False,
+    is_legal_type=lambda *args, **kwargs: True,
     decompile=lambda *args, **kwargs: None,
     get_line=lambda *args, **kwargs: "",
     find_expr_address=lambda *args, **kwargs: 0,
@@ -396,14 +451,49 @@ _stub_module(
     get_argument=lambda *args, **kwargs: (None, 0),
     get_argument_index=lambda *args, **kwargs: 0,
     get_funcs_calling_address=lambda *args, **kwargs: set(),
+    get_funcs_referencing_address=lambda *args, **kwargs: set(),
     to_hex=lambda value: hex(value),
     create_udt_padding_member=lambda *args, **kwargs: None,
     collect_ctree_items_near_ea=_collect_ctree_items_near_ea,
     to_function_offset_str=lambda ea: f"sub_{ea:x}+0x0",
+    iter_returned_exprs=lambda *args, **kwargs: iter(()),
 )
 _stub_module("forge.api.types", types=types.SimpleNamespace(width=8), import_type=lambda *args, **kwargs: 0)
-_stub_module("forge.api.scanner", NewDeepScanVisitor=type("NewDeepScanVisitor", (), {}))
-_stub_module("forge.api.visitor", FunctionTouchVisitor=type("FunctionTouchVisitor", (), {}))
+_stub_module(
+    "forge.api.scanner",
+    NewDeepScanVisitor=type("NewDeepScanVisitor", (), {}),
+    NewShallowScanVisitor=type("NewShallowScanVisitor", (), {}),
+)
+
+
+class _StubRecursiveUpwardsObjectVisitor:
+    """Functional double matching the real base's surface.
+
+    ``GuessAllocationVisitor`` (and any test constructing it) inherits this
+    when the real ``forge.api.visitor`` module is stubbed, so the double
+    must store the constructor state and expose ``parent_expr``/``get_line``
+    exactly like the real base. Lives here — not in individual test files —
+    so every collection order sees the same shape.
+    """
+
+    def __init__(self, cfunc, obj, data=None, skip_until_object=False, visited=None):
+        self._cfunc = cfunc
+        self.parents = []
+        self._skip = skip_until_object
+        self._init_obj = obj
+
+    def parent_expr(self):
+        return None
+
+    def get_line(self):
+        return ""
+
+
+_stub_module(
+    "forge.api.visitor",
+    FunctionTouchVisitor=type("FunctionTouchVisitor", (), {}),
+    RecursiveUpwardsObjectVisitor=_StubRecursiveUpwardsObjectVisitor,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -422,3 +512,20 @@ def _purge_user_config_dir():
         shutil.rmtree(_user_ida_dir)
     _user_ida_dir.mkdir(parents=True, exist_ok=True)
     yield
+@pytest.fixture
+def fake_ida_domain(monkeypatch):
+    """Install a minimal Domain module for adapter routing tests."""
+
+    class FakeDatabase:
+        current = None
+        calls = []
+
+        @classmethod
+        def open(cls, *args, **kwargs):
+            cls.calls.append((args, kwargs))
+            return cls.current
+
+    module = types.ModuleType("ida_domain")
+    module.Database = FakeDatabase
+    monkeypatch.setitem(sys.modules, "ida_domain", module)
+    return FakeDatabase
