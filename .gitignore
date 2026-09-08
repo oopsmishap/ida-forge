@@ -164,4 +164,9 @@ cython_debug/
 # LLM
 .agent/*
 scripts/*
+!scripts/r3_gap_probe.py
+!scripts/domain_clean_binary_smoke.py
+!scripts/domain_integration_scenario.py
+!scripts/domain_performance_probe.py
+!scripts/domain_member_udt_commit_smoke.py
 .scratch*
