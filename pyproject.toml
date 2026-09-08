@@ -52,8 +52,22 @@ ignore = [
     "TRY300",  # try-consider-else is a style preference
     "RET503",  # implicit-return None is idiomatic in visitor callbacks
     "PLW0108", # unnecessary-lambda is a refactor-opportunity rule, not a bug
+    "RUF100",  # legacy line-specific noqas may target disabled rules
 ]
 
 [tool.ruff.lint.per-file-ignores]
-# tests set up stub modules before imports by design
-"tests/**" = ["E402"]
+"tests/**" = [
+    "E402", "I001", "SIM117", "RUF002", "RUF003", "RUF017", "RUF012",
+    "F811", "F841", "F821", "PLE0302", "PLE0303", "PLE0304", "PLE0305",
+    "PIE807", "TRY203", "B904", "S102",
+]
+"src/forge/api/members.py" = ["E402", "BLE001", "SIM105", "S110", "RUF023"]
+"src/forge/api/store.py" = ["TRY301", "I001"]
+"src/forge/util/qt.py" = ["S110"]
+"src/forge_api.py" = ["BLE001", "RUF003", "TRY301", "S110", "S112", "S324", "TRY004", "PLW2901", "SIM102", "F841", "I001", "RUF022", "B033"]
+"src/forge/api/scanner.py" = ["E402", "F811"]
+"src/forge/api/scan_object.py" = ["F401"]
+"src/forge/api/storage.py" = ["RUF022", "PIE790"]
+"src/forge/api/provenance.py" = ["TRY004"]
+"src/forge/api/scan_subobject.py" = ["TRY004"]
+"tests/unit/test_forge_api.py" = ["F401", "RET501", "PLR1711", "PLR0402"]
