@@ -26,6 +26,9 @@ class FeatureManager:
             try:
                 self.load_feature(module_name)
             except (ImportError, RuntimeError) as exc:
+                # A failed import leaves a partially-initialized module in
+                # sys.modules; drop it so a later reload starts clean.
+                sys.modules.pop(module_name, None)
                 log_warning(f'Skipping unavailable feature "{module_name}": {exc}')
 
     def iter_feature_module_names(self) -> Iterator[str]:

@@ -115,7 +115,13 @@ def qt_combined_flags(*flags, flags_type=None):
     """
     combined = 0
     for flag in flags:
-        combined |= qt_flag_value(flag)
+        try:
+            combined |= qt_flag_value(flag)
+        except (TypeError, ValueError):
+            # A member whose value cannot be coerced to int is skipped —
+            # mirrors the test-stub tolerance so one bad flag cannot crash
+            # GUI setup.
+            continue
 
     if callable(flags_type):
         try:
